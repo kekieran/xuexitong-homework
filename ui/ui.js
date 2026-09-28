@@ -24,6 +24,7 @@ const drafts = new Map(), dirty = new Map(), timers = new Map(), saving = new Ma
 const draftChanges = new Map();
 let loginPhase = 'form', loginError = '';
 let fillPhase = 'check', fillResult = null;
+let accountMenuOpen = false;
 
 /* ---------- Small helpers ---------- */
 const ICONS = {
@@ -560,47 +561,57 @@ function renderAccount() {
   box.replaceChildren();
   const a = S.auth || {state: 'checking', sites: {}};
   const loggingIn = S.job.busy && S.job.action === 'login';
-  if (loggingIn || a.state === 'checking') {
-    const row = el('div', 'account-row'), avatar = el('div', 'avatar off'), text = el('div', 'account-text');
+  const checking = loggingIn || a.state === 'checking';
+  const loggedIn = a.state === 'logged_in';
+  const username = a.credentials?.username?.trim();
+  const row = el('button', 'account-row'), avatar = el('div', 'avatar' + (loggedIn ? '' : ' off')),
+    text = el('div', 'account-text');
+  row.type = 'button';
+  row.id = 'account-button';
+  row.setAttribute('aria-haspopup', 'menu');
+  row.setAttribute('aria-controls', 'account-menu');
+  row.setAttribute('aria-expanded', String(accountMenuOpen));
+  if (checking) {
     avatar.append(icon('loader'));
     text.append(el('strong', '', loggingIn ? '正在登录…' : '正在检查登录'));
-    if (loggingIn && S.job.message && S.job.message !== '正在处理…') text.append(el('small', '', S.job.message));
-    row.append(avatar, text);
-    box.append(row);
-    return;
+    text.append(el('small', '', loggingIn && S.job.message !== '正在处理…' ? S.job.message : '请稍候'));
+    row.disabled = true;
+  } else {
+    avatar.textContent = loggedIn ? '学' : '未';
+    text.append(el('strong', '', loggedIn ? (username || '作业通账号') : '登录作业通'));
+    text.append(el('small', '', loggedIn ? '作业通' : everLoggedIn() ? '登录已失效' : '尚未登录'));
+    row.onclick = e => { e.stopPropagation(); toggleAccountMenu(); };
   }
-  if (a.state === 'logged_in') {
-    const row = el('div', 'account-row'), avatar = el('div', 'avatar', '学'), text = el('div', 'account-text');
-    const small = el('small');
-    small.append(el('span', 'dot ok'), document.createTextNode('两个站点均已登录'));
-    text.append(el('strong', '', '作业通已登录'), small);
-    const again = btn('', 'btn-ghost btn-sm icon-only', openLogin, 'user');
-    again.title = '重新登录';
-    again.setAttribute('aria-label', '重新登录');
-    again.disabled = S.job.busy;
-    row.append(avatar, text, again);
-    box.append(row);
-    return;
-  }
-  const cta = el('div', 'login-cta'), title = el('strong'), sites = el('span', 'sites');
-  title.append(icon(everLoggedIn() ? 'alert' : 'lock'), document.createTextNode(everLoggedIn() ? '登录已失效' : '尚未登录'));
-  for (const [id, name] of Object.entries(SITES)) {
-    const s = el('span', 'site');
-    s.append(el('span', 'dot ' + (a.sites?.[id] ? 'ok' : 'bad')), document.createTextNode(name));
-    sites.append(s);
-  }
-  const login = btn('登录作业通', 'btn-primary btn-block', openLogin);
-  login.disabled = S.job.busy;
-  if (S.job.busy) login.title = '请等待当前操作完成';
-  cta.append(title, sites, login);
-  box.append(cta);
+  if (!checking) row.append(icon('chevron', 'account-chevron'));
+  row.prepend(avatar, text);
+  box.append(row);
+  renderAccountMenu();
+}
+function renderAccountMenu() {
+  const menu = $('#account-menu'), a = S.auth || {state: 'checking', sites: {}};
+  menu.hidden = !accountMenuOpen;
+  menu.setAttribute('role', 'menu');
+  const username = a.credentials?.username?.trim();
+  $('#account-menu-name').textContent = username || (a.state === 'logged_in' ? '作业通账号' : '作业助手');
+  $('#account-menu-state').textContent = a.state === 'logged_in' ? '作业通已登录' : everLoggedIn() ? '登录已失效' : '尚未登录';
+  $('#account-login-state').textContent = a.state === 'logged_in' ? '重新登录' : '登录';
+}
+function toggleAccountMenu() {
+  accountMenuOpen = !accountMenuOpen;
+  renderAccount();
+  if (accountMenuOpen) $('#account-login-button').focus({preventScroll: true});
+}
+function closeAccountMenu() {
+  if (!accountMenuOpen) return;
+  accountMenuOpen = false;
+  renderAccount();
 }
 function everLoggedIn() {
   try { return localStorage.getItem('homework-ever-logged-in') === '1'; } catch { return false; }
 }
 function renderReminderRow() {
   const r = S.reminder, small = $('#reminder-next');
-  $('#reminder-label').textContent = '提醒';
+  $('#reminder-label').textContent = '作业提醒';
   small.textContent = !r ? '读取中…' : r.enabled ? (r.next_check ? '下次 ' + stamp(r.next_check) : '每天 ' + r.times.join(' · ')) : '已关闭';
   small.classList.toggle('off', !!r && !r.enabled);
 }
@@ -1917,7 +1928,9 @@ $('#search').oninput = renderList;
 $('#search').onkeydown = e => { if (e.key === 'Escape') { e.target.value = ''; renderList(); } };
 $('#refresh').onclick = () => startAction('refresh');
 $('#back').onclick = () => setView('list');
-$('#reminder-button').onclick = () => { renderReminder(); $('#reminder-dialog').showModal(); };
+$('#account-login-button').onclick = () => { closeAccountMenu(); openLogin(); };
+$('#reminder-button').onclick = () => { closeAccountMenu(); renderReminder(); $('#reminder-dialog').showModal(); };
+$('#account-exit-button').onclick = () => { closeAccountMenu(); $('#exit-dialog').showModal(); };
 $('#exit-cancel').onclick = () => $('#exit-dialog').close();
 $('#exit-confirm').onclick = exitApp;
 $('#image-close').onclick = () => $('#image-dialog').close();
@@ -1935,11 +1948,19 @@ $('#detail').addEventListener('click', e => {
 });
 $('#detail').addEventListener('scroll', () => document.querySelector('.qnav')?.classList.toggle('stuck', $('#detail').scrollTop > 180), {passive: true});
 document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && accountMenuOpen && !document.querySelector('dialog[open]')) {
+    closeAccountMenu();
+    $('#account-button')?.focus();
+    return;
+  }
   if (e.key === '/' && !e.ctrlKey && !e.metaKey && !/^(INPUT|TEXTAREA)$/.test(document.activeElement?.tagName) && !document.querySelector('dialog[open]')) {
     e.preventDefault();
     setView('list');
     $('#search').focus();
   }
+});
+document.addEventListener('click', e => {
+  if (accountMenuOpen && !e.target.closest('.side-foot')) closeAccountMenu();
 });
 window.addEventListener('online', () => { S.online = true; renderStatus(); });
 window.addEventListener('offline', () => { S.online = false; renderStatus(); });

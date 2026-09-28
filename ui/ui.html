@@ -47,18 +47,30 @@
     <nav id="assignment-list" class="assignment-list" aria-label="作业"></nav>
 
     <div class="side-foot">
-      <div class="sync-line" aria-live="polite"><span id="sync-time">正在读取本地作业…</span></div>
-      <div id="account" class="account"></div>
-      <div class="foot-rows">
-        <button id="ai-settings-button" class="foot-row" type="button">
-          <span data-icon="sparkle"></span>
-          <span class="foot-text"><span>AI 设置</span><small id="ai-model-label">未配置</small></span>
-        </button>
-        <button id="reminder-button" class="foot-row" type="button">
-          <span data-icon="bell"></span>
-          <span class="foot-text"><span id="reminder-label">提醒</span><small id="reminder-next">读取中…</small></span>
-        </button>
+      <div id="account-menu" class="account-menu" hidden>
+        <div class="account-menu-card">
+          <div class="account-menu-head">
+            <strong id="account-menu-name">作业通</strong>
+            <span id="account-menu-state">正在检查登录</span>
+          </div>
+          <div class="account-menu-items">
+            <button id="account-login-button" class="account-menu-item" type="button">
+              <span data-icon="user"></span><span class="menu-label">账号与登录</span><small id="account-login-state">检查中…</small>
+            </button>
+            <button id="ai-settings-button" class="account-menu-item" type="button">
+              <span data-icon="sparkle"></span><span class="menu-label">AI 设置</span><small id="ai-model-label">未配置</small>
+            </button>
+            <button id="reminder-button" class="account-menu-item" type="button">
+              <span data-icon="bell"></span><span class="menu-label" id="reminder-label">作业提醒</span><small id="reminder-next">读取中…</small>
+            </button>
+          </div>
+          <div class="account-menu-meta sync-line" aria-live="polite"><span id="sync-time">正在读取本地作业…</span></div>
+          <button id="account-exit-button" class="account-menu-item account-menu-exit" type="button">
+            <span data-icon="logout"></span><span class="menu-label">退出助手</span>
+          </button>
+        </div>
       </div>
+      <div id="account" class="account"></div>
     </div>
   </aside>
 

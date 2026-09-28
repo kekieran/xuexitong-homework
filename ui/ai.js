@@ -236,7 +236,7 @@ window.HomeworkAI = (() => {
     if (!dialog.open) dialog.showModal();
   }
 
-  $('#ai-settings-button').onclick = openSettings;
+  $('#ai-settings-button').onclick = () => { closeAccountMenu(); openSettings(); };
   api('/api/ai/settings').then(value => { config = value; updateLabel(); if (record()) renderDock(record()); }).catch(() => {});
   function jobChanged(previous, next) {
     if (previous.busy && previous.action === 'ai' && !next.busy && next.action === 'ai') settling.add(canonicalKey(next.key));
