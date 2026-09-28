@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="app-token" content="__APP_TOKEN__">
+<title>学习通作业助手</title>
+<link rel="stylesheet" href="/ui.css">
+<script src="/workspace.js" defer></script>
+<script src="/ui.js" defer></script>
+<script src="/ai.js" defer></script>
+</head>
+<body>
+<div id="app" class="app" data-view="list">
+
+  <aside class="sidebar" aria-label="作业导航">
+    <div class="side-head">
+      <div class="brand">
+        <svg class="spark" viewBox="0 0 24 24" aria-hidden="true"><g stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M12 3v6.2"/><path d="M12 14.8V21"/><path d="M3 12h6.2"/><path d="M14.8 12H21"/><path d="M5.6 5.6l4.4 4.4"/><path d="M14 14l4.4 4.4"/><path d="M18.4 5.6L14 10"/><path d="M10 14l-4.4 4.4"/></g></svg>
+        <span class="brand-name">作业助手</span>
+      </div>
+      <button id="refresh" class="btn btn-ghost icon-only" type="button" title="刷新作业" aria-label="刷新作业"></button>
+    </div>
+
+    <nav class="side-nav" aria-label="主导航">
+      <button id="home" class="nav-item" type="button"><span data-icon="home"></span><span>首页</span></button>
+    </nav>
+
+    <div class="side-tools">
+      <label class="search">
+        <span data-icon="search"></span>
+        <input id="search" type="search" placeholder="搜索课程或作业" aria-label="搜索课程或作业" autocomplete="off">
+        <kbd aria-hidden="true">/</kbd>
+      </label>
+      <div class="tabs" role="tablist" aria-label="作业分组">
+        <button class="tab" role="tab" data-group="active" type="button">待完成<span class="tab-count" id="count-active">0</span></button>
+        <button class="tab" role="tab" data-group="review" type="button">待核实<span class="tab-count" id="count-review">0</span></button>
+        <button class="tab" role="tab" data-group="history" type="button">历史<span class="tab-count" id="count-history">0</span></button>
+      </div>
+      <div id="subfilters" class="subfilters" hidden></div>
+      <div id="workspace-filters" class="workspace-filters" hidden>
+        <label class="mini-select"><span class="sr-only">作答进度</span><select id="progress-filter"><option value="all">全部进度</option><option value="unstarted">未作答</option><option value="partial">部分作答</option><option value="complete">已写完</option><option value="unread">题目待读取</option></select></label>
+        <label class="mini-select"><span class="sr-only">截止范围</span><select id="due-filter"><option value="all">全部时间</option><option value="today">今天截止</option><option value="within_3_days">3 天内截止</option><option value="within_7_days">7 天内截止</option></select></label>
+      </div>
+    </div>
+
+    <nav id="assignment-list" class="assignment-list" aria-label="作业"></nav>
+
+    <div class="side-foot">
+      <div class="sync-line" aria-live="polite"><span id="sync-time">正在读取本地作业…</span></div>
+      <div id="account" class="account"></div>
+      <div class="foot-rows">
+        <button id="ai-settings-button" class="foot-row" type="button">
+          <span data-icon="sparkle"></span>
+          <span class="foot-text"><span>AI 设置</span><small id="ai-model-label">未配置</small></span>
+        </button>
+        <button id="reminder-button" class="foot-row" type="button">
+          <span data-icon="bell"></span>
+          <span class="foot-text"><span id="reminder-label">提醒</span><small id="reminder-next">读取中…</small></span>
+        </button>
+      </div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <button id="back" class="btn btn-ghost back" type="button"><span data-icon="back"></span>列表</button>
+      <button id="home-top" class="btn btn-ghost home-top" type="button"><span data-icon="home"></span>首页</button>
+      <div id="crumb" class="crumb"></div>
+      <div id="top-save" class="save-pill" role="status" hidden></div>
+    </header>
+    <div id="banners" class="banners" aria-live="polite"></div>
+    <section id="detail" class="detail" aria-label="作业详情"></section>
+    <div id="dock" class="dock" hidden></div>
+  </main>
+</div>
+
+<div id="toasts" class="toasts" aria-live="polite"></div>
+
+<dialog id="login-dialog" class="sheet" aria-labelledby="login-title">
+  <div class="sheet-body" id="login-body"></div>
+</dialog>
+
+<dialog id="ai-settings-dialog" class="sheet sheet-wide" aria-labelledby="ai-settings-title">
+  <div class="sheet-body" id="ai-settings-body"></div>
+</dialog>
+
+<dialog id="ai-result-dialog" class="sheet" aria-labelledby="ai-result-title">
+  <div class="sheet-body" id="ai-result-body"></div>
+</dialog>
+
+<dialog id="fill-dialog" class="sheet sheet-wide" aria-labelledby="fill-title">
+  <div class="sheet-body" id="fill-body"></div>
+</dialog>
+
+<dialog id="reminder-dialog" class="sheet" aria-labelledby="reminder-title">
+  <div class="sheet-body" id="reminder-body"></div>
+</dialog>
+
+<dialog id="assignment-settings-dialog" class="sheet" aria-labelledby="assignment-settings-title">
+  <div class="sheet-body" id="assignment-settings-body"></div>
+</dialog>
+
+<dialog id="assignment-manage-dialog" class="sheet" aria-labelledby="assignment-manage-title">
+  <div class="sheet-body" id="assignment-manage-body"></div>
+</dialog>
+
+<dialog id="exit-dialog" class="sheet sheet-narrow" aria-labelledby="exit-title">
+  <div class="sheet-body">
+    <h2 id="exit-title" class="sheet-title">退出助手？</h2>
+    <p class="sheet-text">退出后不再提醒作业，需要时从桌面入口重新打开。</p>
+    <div class="sheet-actions">
+      <button id="exit-cancel" class="btn" type="button">取消</button>
+      <button id="exit-confirm" class="btn btn-danger" type="button">保存并退出</button>
+    </div>
+  </div>
+</dialog>
+
+<dialog id="image-dialog" class="viewer" aria-label="查看题目图片">
+  <div class="viewer-bar">
+    <span class="viewer-hint">点击图片切换原始大小</span>
+    <button id="image-close" class="btn btn-ghost icon-only" type="button" aria-label="关闭图片"></button>
+  </div>
+  <div class="viewer-stage"><img id="image-large" alt="题目图片"></div>
+</dialog>
+</body>
+</html>
