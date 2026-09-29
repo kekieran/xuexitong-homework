@@ -781,9 +781,9 @@ def notify(title, message):
     else:
         subprocess.Popen(['msg.exe', os.environ.get('USERNAME', '*'), '/TIME:300', title + '\n' + message[:900]], creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
 
-def ensure_chrome(url=None, app=False):
+def ensure_chrome(url=None, app=False, window_size=None):
     port = urlsplit(CHAOXING_CDP_URL).port or 9222
-    args = runtime.browser_args(url, app=app, port=port)
+    args = runtime.browser_args(url, app=app, port=port, window_size=window_size)
     subprocess.Popen(args, creationflags=getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0))
 
 LOGIN_TARGET_ID = None

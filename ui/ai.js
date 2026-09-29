@@ -1,8 +1,8 @@
 'use strict';
 /* AI UI uses the existing controls; requests and keys stay in the local backend. */
 window.HomeworkAI = (() => {
-  let config = null, selected = null, newProvider = 'openai';
-  const edits = new Map();
+  let config = null, selected = null, newProvider = 'openai', settingsNotice = null;
+  const deleteTimers = new Map();
   const settling = new Set();
   const settingsDialog = $('#ai-settings-dialog');
 
@@ -13,128 +13,105 @@ window.HomeworkAI = (() => {
   async function openSettings() {
     try {
       config = await api('/api/ai/settings');
-      selected = config.active;
+      selected = null;
+      settingsNotice = null;
       renderSettings();
       if (!settingsDialog.open) settingsDialog.showModal();
     } catch (e) { toast(e.message, 'error'); }
   }
   function renderSettings() {
-    const body = $('#ai-settings-body'), saved = config.profiles[selected];
-    const provider = saved?.provider || newProvider;
-    const editKey = selected || 'new-' + provider;
-    const current = {...(saved || {...config.presets[provider], model: '', has_key: false, name: ''}), ...edits.get(editKey)};
+    const body = $('#ai-settings-body'), editingNew = selected === '__new__', saved = !editingNew && selected ? config.profiles[selected] : null;
     body.replaceChildren(closeButton(settingsDialog), el('div', 'sheet-eyebrow', 'AI'));
     const title = el('h2', 'sheet-title', 'AI 设置'); title.id = 'ai-settings-title';
     body.append(title, el('p', 'ai-settings-subtitle', '保存常用模型，随时切换。'));
-    const layout = el('div', 'ai-settings-layout'), library = el('section', 'ai-library');
-    library.setAttribute('aria-label', '已保存的 AI 配置');
+    const library = el('section', 'ai-config-list-page'); library.setAttribute('aria-label', '已保存的 AI 配置');
     const libraryHead = el('div', 'ai-library-head');
     libraryHead.append(el('h3', '', `我的配置 · ${Object.keys(config.profiles).length}`));
-    const add = btn('添加配置', 'btn-sm', () => { selected = null; newProvider = 'openai'; renderSettings(); }, 'plus');
+    const add = btn('添加配置', 'btn-sm', () => { selected = '__new__'; newProvider = 'openai'; settingsNotice = null; renderSettings(); }, 'plus');
     add.id = 'ai-add-profile'; add.disabled = S.job.busy;
     libraryHead.append(add); library.append(libraryHead);
-    const list = el('div', 'ai-profile-list');
-    for (const [id, item] of Object.entries(config.profiles)) {
-      const card = el('div', 'ai-profile-card' + (id === selected ? ' selected' : ''));
+    const list = el('div', 'ai-config-list');
+    if (editingNew) list.append(profileCard('__new__', null));
+    for (const [id, item] of Object.entries(config.profiles)) list.append(profileCard(id, item));
+    if (!list.children.length) list.append(el('div', 'ai-library-empty', '还没有配置\n添加一个常用模型开始使用'));
+    library.append(list); body.append(library);
+    function profileCard(id, item) {
+      const expanded = id === selected, card = el('article', 'ai-profile-card' + (expanded ? ' expanded' : id === config.active ? ' active' : ''));
       card.dataset.profile = id;
-      const edit = btn('', 'ai-profile-edit', () => { selected = id; renderSettings(); });
-      edit.setAttribute('aria-label', '编辑 ' + item.name);
-      edit.replaceChildren(el('strong', '', item.name), el('span', '', `${config.presets[item.provider].name} · ${item.model}`));
-      edit.disabled = S.job.busy;
-      const bottom = el('div', 'ai-profile-bottom');
-      bottom.append(el('span', 'ai-profile-state', item.ready ? '已配置' : '待完善'));
-      const use = btn(id === config.active ? '使用中' : '使用', 'btn-sm' + (id === config.active ? ' ai-current' : ''), async () => {
-        use.disabled = true;
-        try { config = await api('/api/ai/settings', {id, activate: true}); updateLabel(); renderSettings(); }
-        catch (e) { toast(e.message, 'error'); use.disabled = false; }
-      });
-      use.setAttribute('aria-label', (id === config.active ? '正在使用 ' : '使用 ') + item.name);
-      use.disabled = S.job.busy || !item.ready || id === config.active;
-      bottom.append(use); card.append(edit, bottom); list.append(card);
+      const head = el('div', 'ai-card-head'), toggle = btn('', 'ai-card-toggle', () => { selected = selected === id ? null : id; settingsNotice = null; renderSettings(); });
+      toggle.disabled = S.job.busy;
+      const main = el('div', 'ai-card-main');
+      if (item) main.append(el('strong', '', item.name), el('span', '', `${config.presets[item.provider]?.name || '自定义'} · ${item.model || '未填写模型'}`));
+      else main.append(el('strong', '', '新建 AI 配置'), el('span', '', '填写后保存并使用'));
+      toggle.setAttribute('aria-label', item ? '编辑 ' + item.name : '编辑新配置');
+      toggle.append(main); head.append(toggle);
+      const actions = el('div', 'ai-card-actions');
+      if (item && id === config.active) actions.append(el('span', 'ai-active-badge', '使用中'));
+      else if (item) {
+        const use = btn('使用', 'btn-sm', async () => {
+          use.disabled = true;
+          try { config = await api('/api/ai/settings', {id, activate: true}); updateLabel(); settingsNotice = {text: '已切换使用配置', tone: 'ok'}; renderSettings(); }
+          catch (e) { toast(e.message, 'error'); use.disabled = false; }
+        });
+        use.setAttribute('aria-label', '使用 ' + item.name);
+        use.disabled = S.job.busy || !item.ready; actions.append(use);
+      }
+      if (item) {
+        const remove = btn('', 'btn-quiet icon-only ai-delete', async () => {
+          if (remove.dataset.confirm !== 'yes') {
+            remove.dataset.confirm = 'yes'; remove.replaceChildren(el('span', '', '确认删除'));
+            const timer = setTimeout(() => { remove.dataset.confirm = ''; remove.replaceChildren(icon('trash')); deleteTimers.delete(id); }, 3000);
+            deleteTimers.set(id, timer); return;
+          }
+          remove.disabled = true; clearTimeout(deleteTimers.get(id)); deleteTimers.delete(id);
+          try { config = await api('/api/ai/settings', {id, remove: true}); selected = null; updateLabel(); settingsNotice = {text: '配置已删除', tone: 'ok'}; renderSettings(); }
+          catch (e) { toast(e.message, 'error'); remove.disabled = false; }
+        }, 'trash');
+        remove.setAttribute('aria-label', '删除 ' + item.name); remove.title = '删除配置'; actions.append(remove);
+      } else {
+        actions.append(btn('取消', 'btn-sm', () => { selected = null; renderSettings(); }));
+      }
+      head.append(actions); card.append(head);
+      if (expanded) card.append(profileEditor(id, item));
+      return card;
     }
-    if (!Object.keys(config.profiles).length) list.append(el('div', 'ai-library-empty', '还没有配置\n添加一个常用模型开始使用'));
-    library.append(list);
-    const editor = el('section', 'ai-config-editor');
-    editor.append(el('h3', 'ai-editor-title', saved ? '编辑配置' : '添加配置'));
-    layout.append(library, editor); body.append(layout);
-    const providers = el('div', 'ai-providers'); providers.setAttribute('role', 'tablist'); providers.setAttribute('aria-label', 'AI 平台');
-    for (const [id, item] of Object.entries(config.presets)) {
-      const tab = btn(item.name, 'ai-provider', () => { newProvider = id; renderSettings(); });
-      tab.setAttribute('role', 'tab'); tab.setAttribute('aria-selected', String(id === provider));
-      tab.disabled = !!saved || S.job.busy;
-      providers.append(tab);
+    function profileEditor(id, saved) {
+      const provider = saved?.provider || newProvider;
+      const current = {...(saved || {...config.presets[provider], model: '', has_key: false, name: ''})};
+      const editor = el('div', 'ai-inline-editor');
+      const providers = el('div', 'ai-providers'); providers.setAttribute('role', 'tablist'); providers.setAttribute('aria-label', 'AI 平台');
+      for (const [providerId, item] of Object.entries(config.presets)) {
+        const tab = btn(item.name, 'ai-provider', () => { newProvider = providerId; renderSettings(); });
+        tab.setAttribute('role', 'tab'); tab.setAttribute('aria-selected', String(providerId === provider)); tab.disabled = !!saved || S.job.busy; providers.append(tab);
+      }
+      editor.append(providers);
+      const form = el('form', 'ai-inline-form'); form.autocomplete = 'off';
+      const field = (label, input, idName, extra = '') => { input.id = idName; const row = el('label', 'form-field ' + extra); row.append(el('span', '', label), input); return row; };
+      const name = el('input', 'input'); name.maxLength = 80; name.value = current.name || ''; name.placeholder = '例如：日常作答';
+      const model = el('input', 'input'); model.required = true; model.value = current.model || ''; model.placeholder = '服务商提供的模型名称';
+      const secret = el('input', 'input'); secret.type = 'password'; secret.autocomplete = 'new-password'; secret.spellcheck = false; secret.placeholder = current.has_key ? '已保存，留空不修改' : provider === 'custom' ? '本机服务可留空' : '填写 API 密钥'; secret.required = !current.has_key && provider !== 'custom';
+      const protocol = el('select', 'input'); for (const [protocolId, label] of Object.entries(config.protocols)) { const option = el('option', '', label); option.value = protocolId; protocol.append(option); } protocol.value = current.protocol; protocol.disabled = provider !== 'custom';
+      const address = el('input', 'input'); address.type = 'url'; address.required = true; address.value = current.base_url || ''; address.readOnly = provider !== 'custom'; address.placeholder = 'https://example.com/v1';
+      const grid = el('div', 'ai-form-grid'); grid.append(field('模型名称', model, 'ai-model'), field('API 密钥', secret, 'ai-api-key'), field('配置名称', name, 'ai-profile-name'), field('接口类型', protocol, 'ai-protocol'), field('接口地址', address, 'ai-base-url', 'ai-form-wide')); form.append(grid);
+      const visionRow = el('label', 'ai-checkbox'); const vision = el('input'); vision.type = 'checkbox'; vision.checked = !!current.vision; visionRow.append(vision, el('span', '', '模型支持识图')); form.append(visionRow);
+      const note = el('div', 'ai-note'); note.append(icon('info'), el('span', '', '密钥只保存在本机，测试连接会调用你填写的接口。')); form.append(note);
+      const status = el('p', 'ai-config-status' + (settingsNotice?.tone ? ' ' + settingsNotice.tone : '')); status.id = 'ai-config-message'; status.setAttribute('role', 'status'); if (settingsNotice) status.textContent = settingsNotice.text; form.append(status);
+      const actions = el('div', 'ai-form-actions'), test = btn('测试连接', '', async () => { if (!form.reportValidity() || !(await persist())) return; settingsNotice = {text: '正在测试连接…', tone: ''}; renderSettings(); if (await startAction('ai-test')) {} }), save = btn('保存并使用', 'btn-primary'); save.type = 'submit';
+      actions.append(test, save); form.append(actions); editor.append(form);
+      async function persist() {
+        save.disabled = test.disabled = true; settingsNotice = null;
+        const payload = {provider, name: name.value.trim() || model.value.trim(), protocol: protocol.value, base_url: address.value.trim(), model: model.value.trim(), api_key: secret.value.trim(), vision: vision.checked, ...(saved ? {id} : {create: true})};
+        secret.value = '';
+        try { config = await api('/api/ai/settings', payload); selected = config.active; updateLabel(); settingsNotice = {text: '已保存', tone: 'ok'}; renderSettings(); return true; }
+        catch (e) { settingsNotice = {text: e.message, tone: 'error'}; status.textContent = e.message; status.classList.add('error'); return false; }
+        finally { payload.api_key = ''; save.disabled = test.disabled = false; }
+      }
+      form.onsubmit = async e => { e.preventDefault(); if (form.reportValidity()) await persist(); };
+      if (S.job.busy) form.querySelectorAll('button, input, select').forEach(control => control.disabled = true);
+      return editor;
     }
-    editor.append(providers);
-    const form = el('form'); form.autocomplete = 'off';
-    const field = (label, input, id) => {
-      input.id = id;
-      const row = el('label', 'form-field'); row.append(el('span', '', label), input); form.append(row); return input;
-    };
-    const name = field('配置名称', el('input', 'input'), 'ai-profile-name');
-    name.value = current.name || ''; name.maxLength = 80; name.placeholder = '例如：日常作答、复杂题目（选填）';
-    const model = field('模型名称', el('input', 'input'), 'ai-model');
-    model.required = true; model.value = current.model; model.placeholder = '填写服务商提供的模型名称';
-    const secret = field('API 密钥', el('input', 'input'), 'ai-api-key');
-    secret.type = 'password'; secret.autocomplete = 'new-password'; secret.spellcheck = false;
-    secret.value = current.apiKey || '';
-    secret.placeholder = current.has_key ? '已保存，留空不修改' : provider === 'custom' ? '无鉴权的本机服务可留空' : '填写 API 密钥';
-    secret.required = !current.has_key && provider !== 'custom';
-    const protocol = field('接口类型', el('select', 'input'), 'ai-protocol');
-    for (const [id, label] of Object.entries(config.protocols)) {
-      const option = el('option', '', label); option.value = id; protocol.append(option);
-    }
-    protocol.value = current.protocol; protocol.disabled = provider !== 'custom';
-    const address = field('接口地址', el('input', 'input'), 'ai-base-url');
-    address.type = 'url'; address.required = true; address.value = current.base_url; address.readOnly = provider !== 'custom';
-    address.placeholder = 'https://example.com/v1';
-    const visionRow = el('label', 'ai-checkbox'), vision = el('input'); vision.type = 'checkbox'; vision.id = 'ai-vision'; vision.checked = current.vision;
-    visionRow.append(vision, el('span', '', '模型支持识图')); form.append(visionRow);
-    const note = el('div', 'ai-note'); note.append(icon('info'), el('span', '', '密钥加密保存在本机。测试连接和作答会调用 API，费用由服务商收取。'));
-    form.append(note);
-    const error = el('p', 'ai-config-status'); error.id = 'ai-config-message'; error.setAttribute('role', 'status'); form.append(error);
-    const actions = el('div', 'sheet-actions');
-    const remove = btn('删除配置', 'btn-quiet', async () => {
-      if (remove.dataset.confirm !== 'yes') { remove.dataset.confirm = 'yes'; remove.querySelector('span').textContent = '确认删除'; return; }
-      remove.disabled = true;
-      try { config = await api('/api/ai/settings', {id: selected, remove: true}); edits.delete(editKey); selected = config.active; updateLabel(); renderSettings(); }
-      catch (e) { error.classList.add('error'); error.textContent = e.message; }
-      finally { remove.disabled = false; }
-    });
-    remove.hidden = !saved;
-    const save = btn('保存并使用', 'btn-primary'); save.type = 'submit';
-    const test = btn('测试连接', '', async () => {
-      if (!form.reportValidity() || !(await persist())) return;
-      $('#ai-config-message').className = 'ai-config-status';
-      $('#ai-config-message').textContent = '正在测试连接…';
-      if (await startAction('ai-test')) renderSettings();
-    });
-    test.title = '发送一次测试请求';
-    actions.append(remove, test, save); form.append(actions); editor.append(form);
-    async function persist() {
-      save.disabled = test.disabled = true; error.textContent = '';
-      const payload = {provider, name: name.value.trim() || model.value.trim(), protocol: protocol.value, base_url: address.value.trim(), model: model.value.trim(), api_key: secret.value.trim(), vision: vision.checked,
-        ...(saved ? {id: selected} : {create: true})};
-      secret.value = '';
-      if (edits.has(editKey)) edits.get(editKey).apiKey = '';
-      try {
-        config = await api('/api/ai/settings', payload);
-        edits.delete(editKey);
-        selected = config.active;
-        payload.api_key = '';
-        updateLabel(); renderSettings();
-        $('#ai-config-message').textContent = '已保存';
-        $('#ai-config-message').classList.add('ok');
-        return true;
-      } catch (e) { error.classList.add('error'); error.textContent = e.message; return false; }
-      finally { payload.api_key = ''; save.disabled = test.disabled = false; }
-    }
-    form.onsubmit = async e => { e.preventDefault(); if (form.reportValidity()) await persist(); };
-    const keepEdit = () => edits.set(editKey, {name: name.value, model: model.value, apiKey: secret.value,
-      base_url: address.value, protocol: protocol.value, vision: vision.checked});
-    form.addEventListener('input', keepEdit); form.addEventListener('change', keepEdit);
-    if (S.job.busy) form.querySelectorAll('button').forEach(b => b.disabled = true);
   }
-  settingsDialog.addEventListener('close', () => { edits.clear(); const key = $('#ai-api-key'); if (key) key.value = ''; });
+  settingsDialog.addEventListener('close', () => { selected = null; settingsNotice = null; const key = $('#ai-api-key'); if (key) key.value = ''; });
 
   function taskButton(r) {
     if (!r || r.group === 'history') return null;
@@ -198,6 +175,7 @@ window.HomeworkAI = (() => {
   async function jobDone(job) {
     if (job.action === 'ai-test') {
       const message = $('#ai-config-message');
+      settingsNotice = {text: job.message, tone: job.result?.error ? 'error' : 'ok'};
       if (message) message.textContent = job.message;
       if (settingsDialog.open) { renderSettings(); $('#ai-config-message').textContent = job.message; $('#ai-config-message').classList.add(job.result?.error ? 'error' : 'ok'); }
       else toast(job.message, job.result?.error ? 'error' : '');

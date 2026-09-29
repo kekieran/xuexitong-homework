@@ -123,12 +123,13 @@ def find_chrome(required=True):
     return find_browser(required)
 
 
-def browser_args(url=None, app=False, port=9222):
+def browser_args(url=None, app=False, port=9222, window_size=None):
     args = [str(find_browser()), '--remote-debugging-address=127.0.0.1',
             '--remote-debugging-port=' + str(port),
             '--no-proxy-server', '--user-data-dir=' + str(PROFILE_DIR), '--profile-directory=Default']
     if app:
-        args += ['--app=' + url, '--window-size=1440,980']
+        width, height = window_size or (1440, 980)
+        args += ['--app=' + url, f'--window-size={int(width)},{int(height)}']
     elif url:
         args += ['--new-window', url]
     return args

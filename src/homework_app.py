@@ -10,6 +10,7 @@ import secrets
 import threading
 import urllib.parse
 import urllib.request
+import uuid
 from datetime import datetime, timedelta
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -34,9 +35,15 @@ AUTH_LOCK = threading.Lock()
 AUTH = {"state": "checking", "sites": {"chaoxing": False, "school": False}}
 STOP = threading.Event()
 MAINTENANCE = threading.Event()
-REMINDER_HOURS = (12, 19)
+DEFAULT_REMINDER_TIMES = ()
+MAX_REMINDER_TIMES = 12
+REMINDER_WINDOW_SECONDS = 3 * 60
+REMINDER_INTERVAL_SECONDS = 20
 SETTINGS_LOCK = threading.Lock()
 SETTINGS = None
+REMINDER_LOCK = threading.Lock()
+REMINDER_EVENT = None
+APP_URL = ''
 
 def settings():
     global SETTINGS
@@ -44,19 +51,86 @@ def settings():
         SETTINGS = backend.read_json(SETTINGS_FILE, {"shown_slots": []})
     return SETTINGS
 
+def normalize_reminder_times(value):
+    if value is None:
+        value = DEFAULT_REMINDER_TIMES
+    if not isinstance(value, (list, tuple)):
+        raise ValueError('提醒时间格式不正确')
+    result = set()
+    for item in value:
+        if not isinstance(item, str) or len(item) != 5 or item[2] != ':' or not item[:2].isdigit() or not item[3:].isdigit():
+            raise ValueError('提醒时间格式不正确')
+        hour, minute = int(item[:2]), int(item[3:])
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError('提醒时间格式不正确')
+        result.add(f'{hour:02d}:{minute:02d}')
+    if len(result) > MAX_REMINDER_TIMES:
+        raise ValueError(f'提醒时间最多设置 {MAX_REMINDER_TIMES} 个')
+    return sorted(result)
+
+def reminder_event_snapshot():
+    with REMINDER_LOCK:
+        return dict(REMINDER_EVENT) if REMINDER_EVENT else None
+
+def next_reminder_at(now, times):
+    candidates = []
+    for value in times:
+        hour, minute = map(int, value.split(':'))
+        candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if candidate <= now:
+            candidate += timedelta(days=1)
+        candidates.append(candidate)
+    return min(candidates) if candidates else None
+
 def reminder_snapshot():
     with SETTINGS_LOCK:
-        enabled = settings().get("reminder_enabled", True) is not False
+        current = settings()
+        enabled = current.get('reminder_enabled', True) is not False
+        times = normalize_reminder_times(current.get('reminder_times'))
     now = datetime.now()
-    upcoming = [now.replace(hour=h, minute=0, second=0, microsecond=0) for h in REMINDER_HOURS]
-    upcoming = [t for t in upcoming if t > now] or [now.replace(hour=REMINDER_HOURS[0], minute=0, second=0, microsecond=0) + timedelta(days=1)]
-    return {"enabled": enabled, "times": [f"{h:02d}:00" for h in REMINDER_HOURS], "next_check": upcoming[0].isoformat(timespec="minutes") if enabled else None}
+    upcoming = next_reminder_at(now, times) if enabled else None
+    return {'enabled': enabled, 'times': times, 'max_times': MAX_REMINDER_TIMES,
+            'next_check': upcoming.isoformat(timespec='minutes') if upcoming else None,
+            'notification': '独立提醒小窗', 'event': reminder_event_snapshot()}
 
-def set_reminder(enabled):
+def set_reminder(enabled, times=None):
     with SETTINGS_LOCK:
-        settings()["reminder_enabled"] = bool(enabled)
-        backend.write_json(SETTINGS_FILE, settings())
+        current = settings()
+        current['reminder_enabled'] = bool(enabled)
+        if times is not None:
+            current['reminder_times'] = normalize_reminder_times(times)
+        elif 'reminder_times' not in current:
+            current['reminder_times'] = list(DEFAULT_REMINDER_TIMES)
+        backend.write_json(SETTINGS_FILE, current)
     return reminder_snapshot()
+
+def dismiss_reminder(event_id=None):
+    global REMINDER_EVENT
+    with REMINDER_LOCK:
+        if event_id is None or not REMINDER_EVENT or REMINDER_EVENT.get('id') == event_id:
+            REMINDER_EVENT = None
+    return {'ok': True}
+
+def build_reminder_event(records):
+    items = []
+    for record in records:
+        items.append({'course': record.get('course') or '未命名课程',
+                      'title': record.get('title') or '未命名作业',
+                      'deadline': record.get('deadline'),
+                      'deadline_kind': record.get('deadline_kind')})
+    return {'id': uuid.uuid4().hex, 'created_at': datetime.now().isoformat(timespec='seconds'),
+            'items': items}
+
+def show_reminder(records):
+    global REMINDER_EVENT
+    event = build_reminder_event(records)
+    with REMINDER_LOCK:
+        REMINDER_EVENT = event
+    if APP_URL:
+        try:
+            backend.ensure_chrome(APP_URL + '&mode=reminder', app=True, window_size=(420, 560))
+        except Exception as exc:
+            backend.log('提醒窗口打开失败：' + backend.safe_error(exc))
 
 def auth_snapshot():
     with AUTH_LOCK:
@@ -200,7 +274,8 @@ class Handler(BaseHTTPRequestHandler):
         url = urllib.parse.urlsplit(self.path)
         query = urllib.parse.parse_qs(url.query)
         if url.path == "/" and query.get("token") == [TOKEN] and self.headers.get("Host") == f"127.0.0.1:{self.server.server_port}":
-            self.send(303, b"", headers={"Location": "/", "Set-Cookie": f"{COOKIE}={TOKEN}; HttpOnly; SameSite=Strict; Path=/"})
+            location = "/?mode=reminder" if query.get('mode') == ['reminder'] else "/"
+            self.send(303, b"", headers={"Location": location, "Set-Cookie": f"{COOKIE}={TOKEN}; HttpOnly; SameSite=Strict; Path=/"})
             return
         if not self.allowed():
             self.send(403, {"error": "请从桌面启动入口打开助手"})
@@ -212,6 +287,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send(200, data, {"ui.html": "text/html", "ui.js": "text/javascript", "workspace.js": "text/javascript", "ai.js": "text/javascript", "ui.css": "text/css"}[name] + "; charset=utf-8")
             elif url.path == '/api/ai/settings':
                 self.send(200, homework_ai.public_settings())
+            elif url.path == '/api/reminder/current':
+                self.send(200, {'event': reminder_event_snapshot()})
             elif url.path == "/api/state":
                 self.send(200, dict(workspace_snapshot(), job=job_snapshot()))
             elif url.path == "/api/dashboard":
@@ -326,7 +403,9 @@ class Handler(BaseHTTPRequestHandler):
             elif url.path == "/api/reminder":
                 if not isinstance(payload.get("enabled"), bool):
                     raise ValueError("提醒开关格式不正确")
-                self.send(200, set_reminder(payload["enabled"]))
+                self.send(200, set_reminder(payload['enabled'], payload.get('times')))
+            elif url.path == "/api/reminder/dismiss":
+                self.send(200, dismiss_reminder(payload.get('id')))
             elif url.path == "/api/exit":
                 self.send(200, {"message": "助手已退出，提醒已停止"})
                 STOP.set()
@@ -337,25 +416,22 @@ class Handler(BaseHTTPRequestHandler):
             self.send(400, {"error": backend.safe_error(exc)})
 
 def reminder_loop():
-    while not STOP.wait(20):
+    while not STOP.wait(REMINDER_INTERVAL_SECONDS):
         now = datetime.now()
-        slot = now.strftime("%Y-%m-%d-%H")
         with SETTINGS_LOCK:
             current = settings()
+            times = normalize_reminder_times(current.get('reminder_times'))
             shown = current.setdefault("shown_slots", [])
-            if current.get("reminder_enabled", True) is False or now.hour not in REMINDER_HOURS or now.minute >= 3 or slot in shown or not start_job("refresh"):
+            slot = next((f'{now:%Y-%m-%d}-{value}' for value in times
+                         if 0 <= (now - now.replace(hour=int(value[:2]), minute=int(value[3:]), second=0, microsecond=0)).total_seconds() < REMINDER_WINDOW_SECONDS), None)
+            if current.get("reminder_enabled", True) is False or not slot or slot in shown:
                 continue
             shown.append(slot)
-            current["shown_slots"] = shown[-60:]
+            current["shown_slots"] = shown[-120:]
             backend.write_json(SETTINGS_FILE, current)
-        while job_snapshot()["busy"] and not STOP.wait(2):
-            pass
-        if STOP.is_set():
-            break
-        active = [r for r in backend.load_state().get("assignments", {}).values() if backend.record_group(r) == "active"]
+        active = backend.active_pending(backend.load_state())
         if active:
-            names = "、".join(r.get("title", "作业") for r in active[:3])
-            backend.notify("学习通作业提醒", f"还有 {len(active)} 项未截止、未提交作业：{names}")
+            show_reminder(active)
 
 def auth_watch_loop():
     if STOP.wait(3):
@@ -431,7 +507,9 @@ def main():
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     server.daemon_threads = True
     backend.PROGRESS = progress
+    global APP_URL
     url = f"http://127.0.0.1:{server.server_port}/?token={TOKEN}"
+    APP_URL = url
     backend.write_json(RUNTIME_FILE, {"url": url, "pid": os.getpid()})
     threading.Thread(target=reminder_loop, daemon=True).start()
     threading.Thread(target=auth_watch_loop, daemon=True).start()

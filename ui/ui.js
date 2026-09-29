@@ -2,6 +2,7 @@
 /* 学习通作业助手 · 前端 */
 const $ = s => document.querySelector(s);
 const token = $('meta[name="app-token"]').content;
+const REMINDER_MODE = new URLSearchParams(location.search).get('mode') === 'reminder';
 const GROUPS = {active: '待完成', review: '待核实', history: '历史'};
 const TYPES = {single: '单选题', multiple: '多选题', judgment: '判断题', blank: '填空题', essay: '简答题', upload: '附件题', unsupported: '未识别题型'};
 const SITES = {chaoxing: '学习通主站', school: '学校学习通'};
@@ -612,7 +613,7 @@ function everLoggedIn() {
 function renderReminderRow() {
   const r = S.reminder, small = $('#reminder-next');
   $('#reminder-label').textContent = '作业提醒';
-  small.textContent = !r ? '读取中…' : r.enabled ? (r.next_check ? '下次 ' + stamp(r.next_check) : '每天 ' + r.times.join(' · ')) : '已关闭';
+  small.textContent = !r ? '读取中…' : r.enabled ? reminderNextText(r) : '已关闭';
   small.classList.toggle('off', !!r && !r.enabled);
 }
 function renderSyncLine() {
@@ -1561,7 +1562,15 @@ function renderLogin() {
   const a = S.auth || {};
   if (loginPhase === 'running') {
     body.append(titled('login-title', '正在登录作业通'));
-    body.append(el('div', 'live', S.job.message || '正在处理…'));
+    body.append(el('p', 'sheet-text', '助手正在检查两个学习通站点，并只为尚未登录的站点补登录。这可能需要几十秒。'));
+    const steps = el('ol', 'steps');
+    for (const text of ['检查两个站点的登录状态', '为尚未登录的站点补登录', '确认两个站点均已登录']) {
+      const step = el('li', 'step now'), mark = el('span', 'step-mark');
+      mark.append(icon('loader'));
+      step.append(mark, el('span', '', text));
+      steps.append(step);
+    }
+    body.append(steps);
     const actions = el('div', 'sheet-actions');
     actions.append(btn('在后台继续', '', () => dialog.close()));
     body.append(actions);
@@ -1787,38 +1796,136 @@ function fillDone(job, key) {
 }
 
 /* ---------- Reminder & exit ---------- */
+function reminderSlots(r) {
+  const now = new Date();
+  return (r?.times || []).map(value => {
+    const [hour, minute] = value.split(':').map(Number);
+    const target = new Date(now);
+    target.setHours(hour, minute, 0, 0);
+    if (target <= now) target.setDate(target.getDate() + 1);
+    return {value, target, day: dayLabel(target)};
+  }).sort((a, b) => a.target - b.target);
+}
+function reminderNextText(r) {
+  const slots = reminderSlots(r);
+  if (!slots.length) return '今天的提醒时间已过 · 尚未设置下一次提醒';
+  const next = slots[0];
+  const todayCount = slots.filter(slot => slot.day === '今天').length;
+  const prefix = next.day === '今天' ? '今天' : '明天';
+  const passed = todayCount === 0 ? '今天的提醒时间已过；' : '';
+  return `${passed}${prefix} ${next.value} · ${left(next.target - Date.now())} · 今天还会提醒 ${todayCount} 次`;
+}
+function reminderSlotText(slot) {
+  return `${slot.day === '今天' ? '今天' : '明天'} · ${left(slot.target - Date.now())}`;
+}
+async function saveReminder(next, success = '') {
+  try {
+    S.reminder = await api('/api/reminder', next);
+    if (success) toast(success, 'ok');
+    renderReminder();
+    renderReminderRow();
+    return true;
+  } catch (e) {
+    toast('提醒设置未更改：' + e.message, 'error');
+    renderReminder();
+    return false;
+  }
+}
 function renderReminder() {
   const body = $('#reminder-body'), dialog = $('#reminder-dialog'), r = S.reminder;
   body.replaceChildren(closeButton(dialog), el('div', 'sheet-eyebrow', '本机提醒'));
-  body.append(titled('reminder-title', '每日作业提醒'));
+  body.append(titled('reminder-title', '作业提醒'));
   if (!r) { body.append(el('p', 'sheet-text', '正在读取提醒状态…')); return; }
   const row = el('div', 'switch-row'), text = el('div', 'sr-text'), sw = el('button', 'switch');
   text.append(el('strong', '', r.enabled ? '提醒已开启' : '提醒已关闭'));
-  if (r.enabled) text.append(el('small', '', '关闭窗口后仍会提醒'));
+  text.append(el('small', '', '助手运行期间有效：关掉页面仍会提醒；退出助手后停止'));
   sw.type = 'button';
   sw.setAttribute('role', 'switch');
   sw.setAttribute('aria-checked', String(r.enabled));
-  sw.setAttribute('aria-label', '每日作业提醒');
+  sw.setAttribute('aria-label', '作业提醒');
   sw.onclick = async () => {
     sw.disabled = true;
-    try {
-      S.reminder = await api('/api/reminder', {enabled: !r.enabled});
-      toast(S.reminder.enabled ? '每日提醒已开启' : '每日提醒已关闭', 'ok');
-    } catch (e) {
-      toast('提醒设置未更改：' + e.message, 'error');
-    }
-    renderReminder();
-    renderReminderRow();
+    await saveReminder({enabled: !r.enabled, times: r.times}, r.enabled ? '作业提醒已关闭' : '作业提醒已开启');
   };
   row.append(text, sw);
   body.append(row);
-  const kv = el('dl', 'kv');
-  kv.append(el('dt', '', '检查时间'), el('dd', '', '每天 ' + r.times.join(' · ')));
-  kv.append(el('dt', '', '下次检查'), el('dd', '', r.enabled && r.next_check ? stamp(r.next_check) : '—'));
-  kv.append(el('dt', '', '提醒内容'), el('dd', '', '未截止且未提交的作业'));
-  body.append(kv, el('div', 'divider'));
-  body.append(el('p', 'notice-title', '退出助手'));
-  body.append(btn('退出助手并停止提醒', 'btn-block btn-danger-ghost', () => { dialog.close(); $('#exit-dialog').showModal(); }, 'logout'));
+  if (!r.enabled) return;
+
+  const slots = reminderSlots(r);
+  const schedule = el('section', 'reminder-schedule'), head = el('div', 'reminder-section-head');
+  head.append(el('strong', '', '提醒时间'), el('span', '', `${(r.times || []).length} / ${r.max_times || 12}`));
+  schedule.append(head);
+  const list = el('div', 'reminder-time-list');
+  (r.times || []).forEach((value, index) => {
+    const item = el('div', 'reminder-time-item'), input = el('input', 'input');
+    input.type = 'time'; input.value = value; input.setAttribute('aria-label', `提醒时间 ${index + 1}`);
+    input.onchange = async () => {
+      const times = [...r.times]; times[index] = input.value;
+      await saveReminder({enabled: true, times}, '提醒时间已保存');
+    };
+    const meta = el('span', 'reminder-time-meta', reminderSlotText(slots.find(slot => slot.value === value) || {day: '今天', target: new Date()}));
+    const remove = btn('', 'btn-quiet icon-only', async () => {
+      const times = r.times.filter((_, i) => i !== index);
+      await saveReminder({enabled: true, times}, '提醒时间已删除');
+    }, 'trash');
+    remove.setAttribute('aria-label', `删除 ${value}`);
+    item.append(input, meta, remove); list.append(item);
+  });
+  if (!(r.times || []).length) list.append(el('p', 'reminder-empty', '还没有设置提醒时间。'));
+  schedule.append(list);
+  const add = btn('添加时间', 'btn-sm', async () => {
+    const used = new Set(r.times || []), candidates = ['08:30', '12:00', '19:00', '21:00'];
+    const value = candidates.find(item => !used.has(item)) || Array.from({length: 24}, (_, hour) => `${pad(hour)}:00`).find(item => !used.has(item));
+    if (!value) return;
+    await saveReminder({enabled: true, times: [...(r.times || []), value]}, '提醒时间已添加');
+  }, 'plus');
+  add.disabled = (r.times || []).length >= (r.max_times || 12);
+  schedule.append(add);
+  body.append(schedule);
+
+  const next = el('div', 'reminder-next-card');
+  next.append(el('strong', '', '下次提醒'), el('span', '', reminderNextText(r)));
+  body.append(next);
+}
+
+function reminderDateText(value) {
+  const d = parseDate(value);
+  if (!d) return '平台未设截止时间';
+  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${hm(d)} 截止 · ${left(Math.max(60000, d - Date.now()))}`;
+}
+function renderReminderWindow(event) {
+  const section = $('#reminder-window');
+  section.hidden = false;
+  section.replaceChildren();
+  const card = el('div', 'reminder-window-card'), head = el('div', 'reminder-window-head');
+  head.append(el('div', 'sheet-eyebrow', '本机提醒'));
+  const close = btn('', 'btn-quiet icon-only', async () => {
+    try { await api('/api/reminder/dismiss', {id: event?.id}); } catch {}
+    window.close();
+  }, 'x');
+  close.setAttribute('aria-label', '关闭提醒'); head.append(close); card.append(head);
+  const items = [...(event?.items || [])].sort((a, b) => (parseDate(a.deadline)?.getTime() || Infinity) - (parseDate(b.deadline)?.getTime() || Infinity));
+  card.append(titled('reminder-window-title', '该完成作业了'), el('p', 'reminder-window-summary', `共 ${items.length} 项未截止、未提交作业`));
+  const list = el('div', 'reminder-window-list');
+  for (const item of items.slice(0, 5)) {
+    const d = parseDate(item.deadline), row = el('article', 'reminder-window-item' + (d && d - Date.now() < 864e5 ? ' urgent' : ''));
+    row.append(el('strong', '', item.course || '未命名课程'), el('span', '', item.title || '未命名作业'), el('small', '', reminderDateText(item.deadline)));
+    list.append(row);
+  }
+  card.append(list);
+  if (items.length > 5) card.append(el('p', 'reminder-window-more', `还有 ${items.length - 5} 项未列出，可在助手里查看全部。`));
+  card.append(el('p', 'reminder-window-note', '关闭此窗口后，助手仍会继续按已设置的时间提醒。'));
+  section.append(card);
+}
+async function bootReminderWindow() {
+  document.body.classList.add('reminder-mode');
+  document.title = '作业提醒';
+  try {
+    const data = await api('/api/reminder/current');
+    renderReminderWindow(data.event);
+  } catch (e) {
+    renderReminderWindow({items: []});
+  }
 }
 async function exitApp() {
   const confirmBtn = $('#exit-confirm');
@@ -1974,10 +2081,11 @@ window.addEventListener('pagehide', () => {
 });
 document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') flushAll().catch(() => {}); });
 setInterval(() => {
-  if (!S.exited && !S.job.busy) {
+  if (!REMINDER_MODE && !S.exited && !S.job.busy) {
     renderReminderRow();
     // Local API only: update deadline groups and summaries without crawling.
     load().catch(() => { if (!S.key) renderWelcome(); });
   }
 }, 60000);
-boot().finally(poll);
+if (REMINDER_MODE) bootReminderWindow();
+else boot().finally(poll);

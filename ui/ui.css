@@ -510,6 +510,15 @@ dialog::backdrop{background:rgba(31,30,29,.3);backdrop-filter:blur(2px)}
 .settings-error:empty{display:none}
 .live{display:flex;align-items:center;gap:8px;margin-top:12px;font-size:13px;color:var(--text-2);padding:10px 12px;border-radius:var(--r-sm);background:var(--surface);border:1px solid var(--line)}
 .live .icon{color:var(--clay)}
+.steps{list-style:none;margin:18px 0 6px;padding:0;display:grid;gap:12px}
+.step{display:flex;align-items:center;gap:12px;font-size:13.5px;color:var(--muted)}
+.step-mark{width:24px;height:24px;border-radius:50%;display:grid;place-items:center;border:1.5px solid var(--line-strong);flex-shrink:0;color:var(--faint)}
+.step.now{color:var(--text)}
+.step.now .step-mark{border-color:var(--clay);color:var(--clay)}
+.step.done{color:var(--muted)}
+.step.done .step-mark{background:var(--ok);border-color:var(--ok);color:#fff}
+.step.fail .step-mark{background:var(--danger);border-color:var(--danger);color:#fff}
+.step-mark .icon{width:15px;height:15px}
 .result-hero{display:flex;align-items:center;gap:14px;margin:6px 0 10px}
 .result-hero .sheet-title{margin:0}
 .result-icon{width:44px;height:44px;border-radius:50%;display:grid;place-items:center;flex-shrink:0}
@@ -677,4 +686,74 @@ body.no-dock .toasts{bottom:24px}
   .up-side .flag{display:none}
   .hero-top{flex-wrap:wrap}
 }
+/* Shared text alignment */
+.banner{line-height:1.4}
+.list-section{line-height:1.35}
+.due{line-height:1.35}
+.fact{line-height:1.35}
+.deadline-strip{line-height:1.3}
+.deadline-strip>div{display:flex;align-items:center;flex-wrap:wrap;min-width:0;line-height:1.3}
+.deadline-strip strong{display:inline-flex;align-items:center;line-height:1.25}
+.deadline-strip span{display:inline-flex;align-items:center;line-height:1.35}
 @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
+
+/* Reminder settings and standalone reminder window */
+.reminder-schedule{margin-top:18px;padding-top:16px;border-top:1px solid var(--line)}
+.reminder-section-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px}
+.reminder-section-head strong{font-size:13.5px}
+.reminder-section-head span{font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums}
+.reminder-time-list{display:grid;gap:6px}
+.reminder-time-item{display:flex;align-items:center;gap:8px;min-width:0}
+.reminder-time-item .input{width:132px;padding:7px 10px;line-height:1.3}
+.reminder-time-meta{flex:1;min-width:0;font-size:12px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.reminder-time-item .icon-only{flex:0 0 32px;width:32px;height:32px}
+.reminder-empty{margin:4px 0 8px;color:var(--muted);font-size:12.5px}
+.reminder-next-card{display:flex;flex-direction:column;gap:2px;margin-top:18px;padding:11px 13px;border:1px solid var(--clay-ring);border-radius:var(--r);background:var(--clay-tint);color:var(--clay-deep)}
+.reminder-next-card strong{font-size:13px}
+.reminder-next-card span{font-size:12.5px}
+.reminder-window{min-height:100vh;padding:18px 16px;background:var(--bg)}
+.reminder-window-card{width:100%;max-width:388px;margin:0 auto;padding:20px 18px 16px;border:1px solid var(--line);border-radius:var(--r-lg);background:var(--surface);box-shadow:var(--shadow-lg)}
+.reminder-window-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:4px}
+.reminder-window-head .sheet-eyebrow{margin:0}
+.reminder-window-card .sheet-title{margin:4px 0 4px}
+.reminder-window-summary{margin:0 0 14px;color:var(--muted);font-size:13px}
+.reminder-window-list{display:grid;gap:8px}
+.reminder-window-item{display:grid;gap:2px;padding:10px 12px;border:1px solid var(--line);border-radius:var(--r);background:var(--surface)}
+.reminder-window-item.urgent{border-color:var(--clay-ring);background:var(--clay-tint)}
+.reminder-window-item strong{font-size:13px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.reminder-window-item span{font-size:13px;color:var(--text-2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.reminder-window-item small{font-size:11.5px;color:var(--muted);font-variant-numeric:tabular-nums}
+.reminder-window-more,.reminder-window-note{margin:12px 0 0;font-size:12px;color:var(--muted);line-height:1.5}
+.reminder-window-note{padding-top:10px;border-top:1px solid var(--line);font-size:11.5px;color:var(--faint)}
+body.reminder-mode{overflow:auto}
+body.reminder-mode>.app,body.reminder-mode>#toasts,body.reminder-mode>dialog{display:none!important}
+body.reminder-mode>.reminder-window{display:block!important}
+
+/* AI settings: one list, inline editor */
+#ai-settings-dialog{width:min(680px,calc(100vw - 24px));max-width:680px}
+#ai-settings-dialog .sheet-body{width:100%}
+.ai-config-list-page{min-width:0}
+.ai-config-list{display:grid;gap:8px;margin-top:8px}
+.ai-profile-card{background:var(--surface);border-color:var(--line-strong)}
+.ai-profile-card.expanded{border-color:var(--clay);background:var(--clay-tint)}
+.ai-card-head{display:flex;align-items:center;gap:8px;min-width:0;padding:9px 10px}
+.ai-card-toggle{display:flex;align-items:center;flex:1;min-width:0;padding:4px;border:0;background:none;text-align:left}
+.ai-card-toggle:hover{color:var(--clay-deep)}
+.ai-card-main{display:grid;gap:2px;min-width:0}
+.ai-card-main strong{font-size:14px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ai-card-main span{font-size:12px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ai-card-actions{display:flex;align-items:center;gap:6px;flex-shrink:0}
+.ai-active-badge{padding:3px 8px;border-radius:999px;background:var(--clay-soft);color:var(--clay-deep);font-size:11.5px;white-space:nowrap}
+.ai-delete[data-confirm="yes"]{width:auto;padding:4px 8px;color:var(--danger);font-size:12px}
+.ai-inline-editor{padding:0 14px 14px}
+.ai-inline-editor .ai-providers{margin:6px 0 14px}
+.ai-form-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px 10px}
+.ai-form-grid .form-field{margin-top:0}
+.ai-form-wide{grid-column:1/-1}
+.ai-form-actions{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:16px}
+.ai-form-actions .btn-primary{margin-left:auto}
+@media(max-width:700px){
+  #ai-settings-dialog{width:calc(100vw - 20px)}
+  .ai-form-grid{grid-template-columns:minmax(0,1fr)}
+  .ai-form-wide{grid-column:auto}
+}
