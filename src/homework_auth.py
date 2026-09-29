@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import ctypes
 import json
-from pathlib import Path
 import time
 from urllib.parse import quote, urlsplit
 

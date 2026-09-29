@@ -1,5 +1,6 @@
 """Incremental homework sync. No answer submission endpoints are used here."""
 from __future__ import annotations
+import base64
 import hashlib
 import html
 import json
@@ -12,16 +13,13 @@ import unicodedata
 import ctypes
 from contextlib import contextmanager
 from datetime import datetime, timedelta
-from pathlib import Path
 from urllib.parse import urljoin, urlsplit, parse_qs
 from playwright.sync_api import sync_playwright
 import homework_dom as dom
 import homework_runtime as runtime
 
-APP_DIR = runtime.APP_DIR
 DATA_DIR = runtime.DATA_DIR
 PROFILE_DIR = runtime.PROFILE_DIR
-CHROME_EXECUTABLE = runtime.find_browser(required=False)
 CHAOXING_CDP_URL = os.environ.get('CHAOXING_CDP_URL', 'http://127.0.0.1:9222')
 STATE_FILE = DATA_DIR / 'state.json'
 DRAFTS_FILE = DATA_DIR / 'answer_drafts.json'
@@ -29,7 +27,6 @@ OVERRIDES_FILE = DATA_DIR / 'assignment_overrides.json'
 _OVERRIDES_CACHE = (None, {})
 LOG_FILE = DATA_DIR / 'reminder.log'
 LATEST_FILE = DATA_DIR / 'latest_assignments.txt'
-UI_NOTIFICATION_FILE = DATA_DIR / 'ui_notification.json'
 CONTENT_DIR = DATA_DIR / 'homework_content'
 NOTICE_URL = 'https://notice.chaoxing.com/pc/notice/myNotice'
 NOTICE_API_URL = 'https://notice.chaoxing.com/pc/notice/getNoticeList'
@@ -39,6 +36,7 @@ CONNECTED_BROWSER = None
 BACKGROUND_CONTEXTS = {}
 PROGRESS = lambda message: None
 CONTENT_VERSION = 2
+TOAST_APP_ID = r'{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe'
 
 def now_iso():
     return datetime.now().isoformat(timespec='seconds')
@@ -775,11 +773,48 @@ def _check_once(headless=True, force_key=None, on_auth=None):
 def render_summary(items):
     return '\n'.join(f'{a.get("course")}｜{a.get("title")}｜{a.get("deadline") or "平台未设截止时间"}' for a in items) or '当前没有已确认仍可作答的待办作业。'
 
+def _native_toast(title, message):
+    """Show a Windows toast without opening a browser window or adding a dependency."""
+    if os.name != 'nt':
+        return False
+    heading = html.escape(str(title or '学习通作业助手')[:120], quote=True)
+    body = html.escape(str(message or '')[:1800], quote=True)
+    toast_xml = (
+        '<toast duration="short"><visual><binding template="ToastGeneric">'
+        f'<text>{heading}</text><text>{body}</text>'
+        '</binding></visual></toast>'
+    )
+    script = f"""
+$ErrorActionPreference = 'Stop'
+[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null
+[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] > $null
+$xml = [Windows.Data.Xml.Dom.XmlDocument]::new()
+$xml.LoadXml('{toast_xml.replace("'", "''")}')
+$toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{TOAST_APP_ID}').Show($toast)
+"""
+    encoded = base64.b64encode(script.encode('utf-16le')).decode('ascii')
+    try:
+        process = subprocess.Popen(
+            ['powershell.exe', '-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-EncodedCommand', encoded],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+        )
+        try:
+            return process.wait(timeout=12) == 0
+        except subprocess.TimeoutExpired:
+            process.kill()
+            return False
+    except OSError:
+        return False
+
+
 def notify(title, message):
-    if os.environ.get('CHAOXING_GUI') == '1':
-        write_json(UI_NOTIFICATION_FILE, {'title': title, 'message': message, 'created_at': now_iso()})
-    else:
-        subprocess.Popen(['msg.exe', os.environ.get('USERNAME', '*'), '/TIME:300', title + '\n' + message[:900]], creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+    if _native_toast(title, message):
+        return
+    # Keep a compatibility fallback for environments where PowerShell notifications are unavailable.
+    subprocess.Popen(['msg.exe', os.environ.get('USERNAME', '*'), '/TIME:300', title + '\n' + message[:900]], creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
 
 def ensure_chrome(url=None, app=False, window_size=None):
     port = urlsplit(CHAOXING_CDP_URL).port or 9222
