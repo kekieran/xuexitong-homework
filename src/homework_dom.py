@@ -88,6 +88,20 @@ def url_identity(url):
     except ValueError:
         return []
 
+
+# Keep the candidate URL order and identity inputs identical for navigation and
+# answer filling. Legacy field names remain part of the record contract.
+RECORD_URL_FIELDS = ('entry_url', 'answer_url', 'work_url', 'url', 'list_url')
+
+def record_urls(record):
+    return [record.get(field) for field in RECORD_URL_FIELDS if record.get(field)]
+
+def record_identities(record):
+    result = set(record.get('identities') or [])
+    for url in record_urls(record):
+        result.update(url_identity(url))
+    return result
+
 ALLOWED = set('p div span br strong b em i u sub sup ol ul li table thead tbody tr td th blockquote pre code h3 h4 img a audio video source math mi mn mo mrow mfrac msqrt mroot msub msup msubsup munder mover munderover mtable mtr mtd mtext semantics annotation'.split())
 DROP = {'script', 'style', 'input', 'textarea', 'button', 'iframe', 'object', 'embed', 'select'}
 
@@ -238,6 +252,12 @@ def parse_questions(markup, base_url='', asset=None):
             exact = ['answer' + qid + s for s in suffixes.split(',') if s]
             if exact and all(any(x.attrs.get('name') == name or x.attrs.get('id') == name for x in answers) for name in exact):
                 blank_names = exact
+        # Upload-only questions are commonly reported with an unknown type
+        # code, but their question container exposes a native file input.  Keep
+        # them distinct so saved attachments can be filled automatically.
+        has_file_input = any(x.tag == 'input' and x.attrs.get('type', '').lower() == 'file' for x in n.all())
+        if kind == 'unsupported' and has_file_input:
+            kind = 'upload'
         if kind in {'single', 'multiple'} and not options:
             kind = 'unsupported'
         fingerprint = [qid, code or kind, _content_fingerprint(stem, base_url), [(o['value'], o.pop('_fingerprint', o['text'])) for o in options], blank_names]

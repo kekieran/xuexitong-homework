@@ -84,40 +84,6 @@ def credential_info():
         return {'saved': False, 'username': ''}
 
 
-def _browser(playwright, *, start=True, silent=False):
-    if silent:
-        context = engine.open_context(playwright, headless=True)
-        return context.browser, context, True
-    try:
-        browser = playwright.chromium.connect_over_cdp(engine.CHAOXING_CDP_URL, timeout=1000)
-    except Exception:
-        if not start:
-            raise BrowserUnavailable('助手浏览器已关闭') from None
-        if silent:
-            context = playwright.chromium.launch_persistent_context(
-                str(engine.runtime.PROFILE_DIR), headless=True,
-                executable_path=str(engine.runtime.find_browser()),
-                viewport={'width': 1440, 'height': 960},
-                args=['--no-proxy-server', '--profile-directory=Default'])
-            engine.runtime.verify_browser_profile(context.browser)
-            return context.browser, context, True
-        engine.ensure_chrome()
-        browser = None
-        deadline = time.monotonic() + 12
-        while time.monotonic() < deadline:
-            try:
-                browser = playwright.chromium.connect_over_cdp(engine.CHAOXING_CDP_URL, timeout=500)
-                break
-            except Exception:
-                time.sleep(.25)
-        if browser is None:
-            raise RuntimeError('未能打开助手专用浏览器，请重新启动助手后重试登录')
-    engine.runtime.verify_browser_profile(browser)
-    if not browser.contexts:
-        raise RuntimeError('助手浏览器没有可用的登录会话')
-    return browser, browser.contexts[0], False
-
-
 def probe(context, platform: str, *, timeout=12000) -> bool:
     try:
         response = context.request.get(SITES[platform], timeout=timeout)

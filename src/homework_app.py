@@ -336,7 +336,8 @@ class Handler(BaseHTTPRequestHandler):
                     draft = payload["draft"]
                     if key != payload.get("key"):
                         merged = backend.load_draft(key)
-                        merged["answers"] = {**merged.get("answers", {}), **draft.get("answers", {})}
+                        merged["answers"] = backend.merge_draft_answers(
+                            merged.get("answers"), draft.get("answers"), incoming_wins=True)
                         old_text = draft.get("legacy_text", "")
                         if old_text and old_text not in merged.get("legacy_text", ""):
                             merged["legacy_text"] = (merged.get("legacy_text", "") + "\n\n" + old_text).strip()

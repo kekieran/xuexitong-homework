@@ -8,10 +8,7 @@ import homework_dom as dom
 
 
 def identities(record):
-    result = set(record.get('identities') or [])
-    for key in ('entry_url', 'answer_url', 'work_url', 'url', 'list_url'):
-        result.update(dom.url_identity(record.get(key) or ''))
-    return result
+    return dom.record_identities(record)
 
 
 def _serialize(node):
@@ -182,8 +179,7 @@ def resolve_work_page(context, record, fetch_html):
     School list metadata is applied from the unique matched row. Identity aliases
     are added only when that row and its server handler prove the relationship.
     """
-    urls = [record.get(k) for k in ('entry_url', 'answer_url', 'work_url', 'url', 'list_url')]
-    urls = list(dict.fromkeys(u for u in urls if u and dom.platform_url(u)))
+    urls = list(dict.fromkeys(u for u in dom.record_urls(record) if dom.platform_url(u)))
     if not urls or not identities(record):
         raise ValueError('尚未取得可验证的作业入口')
     seen = set()

@@ -286,6 +286,15 @@ def merge_record(records, candidate):
     record['last_seen'] = now_iso()
     return record
 
+
+def merge_draft_answers(base, incoming, *, incoming_wins=False):
+    """Merge answer maps with an explicit conflict policy."""
+    merged = dict(base or {})
+    for qid, answer in (incoming or {}).items():
+        if incoming_wins or qid not in merged:
+            merged[qid] = answer
+    return merged
+
 def reconcile_aliases(state):
     """Coalesce only identities proven by observed URL/form fields; preserve originals."""
     records = state['assignments']
@@ -340,9 +349,8 @@ def reconcile_aliases(state):
                     if source:
                         existing = load_draft(keep)
                         incoming = load_draft(remove)
-                        existing.setdefault('answers', {})
-                        for qid, answer in incoming.get('answers', {}).items():
-                            existing['answers'].setdefault(qid, answer)
+                        existing['answers'] = merge_draft_answers(
+                            existing.get('answers'), incoming.get('answers'))
                         if incoming.get('legacy_text') and incoming['legacy_text'] != existing.get('legacy_text'):
                             existing['legacy_text'] = (existing.get('legacy_text', '') + '\n\n' + incoming['legacy_text']).strip()
                         existing.setdefault('merged_drafts', {})[remove] = source
@@ -729,7 +737,7 @@ def _check_once(headless=True, force_key=None, on_auth=None):
                     valid = record.get('content_version') == CONTENT_VERSION and bool(record.get('questions'))
                     checked = parse_datetime(record.get('metadata_checked_at'))
                     due = record.get('metadata_needs_check') or not checked or datetime.now() - checked > timedelta(hours=6)
-                    if not force_key and record.get('content_error') and attempted and datetime.now() - attempted < timedelta(minutes=30) and not record.get('metadata_needs_check') and not entry_upgrade:
+                    if not force_key and record.get('content_error') and attempted and datetime.now() - attempted < timedelta(minutes=30) and not record.get('metadata_needs_check') and not identity_probe and not entry_upgrade:
                         stats['cache_hits'] += 1
                         continue
                     if not force_key and not record.get('metadata_needs_check') and not identity_probe and not entry_upgrade and ((valid and not due) or (not valid and attempted and datetime.now() - attempted < timedelta(minutes=30))):

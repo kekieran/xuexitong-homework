@@ -275,6 +275,21 @@ function discardHistoryDraft(key) {
     try { localStorage.removeItem('homework-recovery:' + old); } catch {}
   }
 }
+function removeAttachmentFromRecovery(key, qid, fileId) {
+  const keys = [...new Set([key, ...Object.keys(S.aliases).filter(k => canonicalKey(k) === key)])];
+  for (const recoveryKey of keys) {
+    const storageKey = 'homework-recovery:' + recoveryKey;
+    try {
+      const saved = JSON.parse(localStorage.getItem(storageKey) || 'null');
+      const answer = saved?.draft?.answers?.[qid];
+      if (!answer?.files?.length) continue;
+      const files = answer.files.filter(file => file.id !== fileId);
+      if (files.length === answer.files.length) continue;
+      answer.files = files;
+      localStorage.setItem(storageKey, JSON.stringify(saved));
+    } catch {}
+  }
+}
 function persistRecovery(key) {
   try {
     localStorage.setItem('homework-recovery:' + key, JSON.stringify({draft: draftPayload(key), savedAt: Date.now()}));
@@ -1247,28 +1262,35 @@ function filesBlock(q, draft, key, prominent, onChange) {
       open.target = '_blank';
       open.rel = 'noopener';
       const remove = btn('移除', 'btn-sm btn-quiet');
-      remove.title = '只移除与本题的关联，文件仍保留在本机';
-      remove.onclick = () => {
+      remove.title = '从答案缓存中删除此附件';
+      remove.onclick = async () => {
         if (remove.dataset.confirm !== '1') {
           remove.dataset.confirm = '1';
           remove.querySelector('span').textContent = '确认移除';
           setTimeout(() => { if (remove.isConnected) { remove.dataset.confirm = ''; remove.querySelector('span').textContent = '移除'; } }, 3000);
           return;
         }
+        remove.disabled = true;
         const a = editable(q, draft);
         a.files = (a.files || []).filter(x => x.id !== f.id);
         draft.answers[q.id] = a;
+        removeAttachmentFromRecovery(key, String(q.id), f.id);
         markDirty(key, q.id);
         paint(); onChange(); updateProgress();
-        toast('已移除附件关联，文件仍保留在本机');
+        try {
+          await flush(key);
+          toast('已从答案缓存中删除附件', 'ok');
+        } catch (e) {
+          toast('附件已移除，缓存保存失败：' + e.message, 'error');
+        }
       };
       row.append(fi, main, open, remove);
       list.append(row);
     }
     hint.hidden = !prominent && !files.length;
     hint.textContent = prominent
-      ? '单个文件不超过 30 MB，需在学习通手动上传。'
-      : '本题需在学习通手动填写并上传附件。';
+      ? '单个文件不超过 30 MB，自动填入时会尝试上传。'
+      : '自动填入时会尝试上传附件。';
   };
   const upload = async fileList => {
     for (const file of [...fileList]) {
@@ -1659,8 +1681,7 @@ function analyze(r, draft) {
     const item = {index: i, q};
     if (!a || (!hasValue(a.value) && !a.files?.length)) skipped.push({...item, kind: isUnsupported(q) ? 'unsupported' : 'empty'});
     else if (a.signature !== q.signature) skipped.push({...item, kind: 'changed'});
-    else if (a.files?.length) skipped.push({...item, kind: 'upload', files: a.files, text: hasValue(a.value)});
-    else if (isUnsupported(q)) skipped.push({...item, kind: 'unsupported'});
+    else if (isUnsupported(q) && !a.files?.length) skipped.push({...item, kind: 'unsupported'});
     else ready.push(item);
   });
   return {ready, skipped};

@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import html
 import re
+import time
 from datetime import datetime
+from pathlib import Path
 
 import homework_dom as dom
 
@@ -103,6 +105,36 @@ def _fill_essay(root, value, editor_name=None):
         return None
     if editor_name:
         return '未识别到对应空位的可验证编辑器'
+
+    # Some Chaoxing skins expose the answer editor as a contenteditable body
+    # inside an iframe without registering a UEditor instance.  Treat one
+    # visible editable frame as an essay editor, but never guess when there are
+    # multiple frames or when the frame already contains rich media.
+    frames = root.locator('iframe')
+    frame_editors = []
+    for i in range(frames.count()):
+        try:
+            body = frames.nth(i).content_frame.locator('body[contenteditable="true"]')
+            if body.count() == 1 and body.is_visible() and body.is_editable():
+                frame_editors.append(body)
+        except Exception:
+            continue
+    if len(frame_editors) == 1:
+        editor = frame_editors[0]
+        if _rich_media(editor.inner_html()):
+            return '网页已有图片或附件答案，请自行核对，未覆盖'
+        current = _normalized(editor.inner_text())
+        expected = _normalized(value)
+        if current and current != expected:
+            return '网页已有不同答案，未覆盖'
+        if current == expected:
+            return None
+        editor.fill(value)
+        editor.dispatch_event('input')
+        editor.dispatch_event('change')
+        editor.dispatch_event('blur')
+        return None if _normalized(editor.inner_text()) == expected else '答案回读未通过'
+
     controls = _visible_text_controls(root)
     if len(controls) == 1:
         control = controls[0]
@@ -114,8 +146,10 @@ def _fill_essay(root, value, editor_name=None):
             control.dispatch_event('change')
         return None if _normalized(control.input_value()) == _normalized(value) else '答案回读未通过'
     # Standard contenteditable with explicit answer mapping is supported too.
-    editable = root.locator('[contenteditable="true"][data-answer], [contenteditable="true"][id^="answer"]')
-    if editable.count() == 1 and editable.is_visible():
+    editable = root.locator('[contenteditable="true"]')
+    visible_editable = [editable.nth(i) for i in range(editable.count()) if editable.nth(i).is_visible() and editable.nth(i).is_editable()]
+    if len(visible_editable) == 1:
+        editable = visible_editable[0]
         if _rich_media(editable.inner_html()):
             return '网页已有图片或附件答案，请自行核对，未覆盖'
         current = _normalized(editable.inner_text())
@@ -126,6 +160,141 @@ def _fill_essay(root, value, editor_name=None):
             editable.dispatch_event('change')
         return None if _normalized(editable.inner_text()) == _normalized(value) else '答案回读未通过'
     return '未识别到可验证的文本编辑器，请在原网页填写'
+
+
+def _fill_attachments(root, files, local_files=None):
+    """Select saved local files in the question's native upload control.
+
+    The platform owns the upload request and validation.  We only use the
+    question's native file input or its UEditor attachment dialog, so no
+    upload endpoint or page script is invented by the assistant.
+    """
+    if not files:
+        return None
+    local_files = local_files or []
+    paths = [str(item.get('path', '')) for item in local_files if isinstance(item, dict) and item.get('path')]
+    if len(paths) != len(files):
+        return '本机附件不可用，请重新添加附件'
+    inputs = root.locator('input[type="file"]')
+    if inputs.count():
+        try:
+            if inputs.count() == 1:
+                inputs.first.set_input_files(paths)
+            elif inputs.count() == len(paths):
+                for i, path in enumerate(paths):
+                    inputs.nth(i).set_input_files(path)
+            else:
+                return '附件上传控件数量不匹配，请在原网页上传'
+        except Exception:
+            return '附件上传控件操作失败，请在原网页上传'
+        return None
+
+    # Chaoxing's essay/upload questions use UEditor.  Its attachment picker is
+    # created only after clicking the toolbar button and lives in a dialog
+    # iframe outside the question's file-input subtree.
+    toolbar = root.locator('.edui-for-attachment_new')
+    visible_toolbar = [toolbar.nth(i) for i in range(toolbar.count()) if toolbar.nth(i).is_visible()]
+    if len(visible_toolbar) != 1:
+        return '未找到附件上传控件，请在原网页上传'
+    try:
+        page = root.page
+        visible_toolbar[0].click()
+        dialog = page.locator('.edui-dialog.edui-for-attachment_new:visible').last
+        iframe = dialog.locator('iframe')
+        if iframe.count() != 1:
+            return '未打开附件上传窗口，请在原网页上传'
+        frame = iframe.content_frame
+
+        # Some Chaoxing skins use the newer WebUploader dialog.  It starts
+        # uploading as soon as files are selected, writes the returned file
+        # into the editor from its uploadSuccess callback, and has no separate
+        # upload/confirm button.  Detect this picker before falling back to
+        # the legacy queue dialog so the file is selected only once.
+        modern_picker = frame.locator('#pickfiles input[type=file]')
+        try:
+            modern_picker.first.wait_for(state='attached', timeout=5000)
+        except Exception:
+            pass
+        if modern_picker.count() != 1:
+            modern_picker = frame.locator('#pickfiles2 input[type=file]')
+        if modern_picker.count() == 1:
+            modern_picker.set_input_files(paths)
+            expected = len(paths)
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                try:
+                    uploaded = frame.locator('body').evaluate("""(body, expected) => {
+                        const value = typeof fileArr !== 'undefined' ? fileArr : [];
+                        return Array.isArray(value) ? value.length : 0;
+                    }""", expected)
+                except Exception:
+                    # addFileToEditor() closes this iframe after inserting the
+                    # attachment, so a detached frame is itself a possible
+                    # success signal.  Verify the editor before accepting it.
+                    current = _editor_info(root, None)
+                    if len(current) == 1 and _rich_media(current[0]['html']):
+                        return None
+                    uploaded = 0
+                if int(uploaded or 0) >= expected:
+                    break
+                page.wait_for_timeout(200)
+            else:
+                return '附件上传超时，请在原网页检查'
+
+            # addFileToEditor() in this skin closes its own dialog after
+            # inserting the attachment.  Older variants leave it open, so
+            # close it only when it is still visible.
+            try:
+                dialog_visible = dialog.is_visible()
+            except Exception:
+                dialog_visible = False
+            if dialog_visible:
+                close_button = dialog.locator('.edui-dialog-closebutton')
+                if close_button.count() != 1:
+                    return '未找到附件窗口关闭按钮，请在原网页检查'
+                close_button.click()
+                page.wait_for_timeout(300)
+            current = _editor_info(root, None)
+            if len(current) != 1 or not _rich_media(current[0]['html']):
+                return '附件已上传但编辑器未回读，请在原网页检查'
+            return None
+
+        picker = frame.locator('#filePickerBtn input[type="file"]')
+        try:
+            picker.wait_for(state='attached', timeout=5000)
+        except Exception:
+            pass
+        if picker.count() != 1:
+            picker = frame.locator('input[type="file"]').first
+        if picker.count() != 1:
+            return '未找到附件选择控件，请在原网页上传'
+        picker.set_input_files(paths)
+
+        upload = frame.locator('#queueList .btns .uploadBtn')
+        if upload.count() != 1:
+            return '未找到附件上传按钮，请在原网页上传'
+        deadline = time.monotonic() + 2
+        while 'disabled' in (upload.get_attribute('class') or '').split() and time.monotonic() < deadline:
+            page.wait_for_timeout(100)
+        if 'disabled' in (upload.get_attribute('class') or '').split():
+            return '附件格式不受支持或未进入上传队列'
+        upload.click()
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            state = upload.get_attribute('class') or ''
+            if 'state-finish' in state.split():
+                break
+            page.wait_for_timeout(200)
+        else:
+            return '附件上传超时，请在原网页检查'
+        ok = dialog.locator('.edui-okbutton .edui-button-body')
+        if ok.count() != 1:
+            return '未找到附件确认按钮，请在原网页检查'
+        ok.click()
+        page.wait_for_timeout(300)
+        return None
+    except Exception:
+        return '附件上传控件操作失败，请在原网页上传'
 
 
 def _fill_blanks(root, question, value):
@@ -290,14 +459,10 @@ def fill_page(page, questions, answers):
             reason = '当前网页未找到此题'
         elif saved.get('signature') != question.get('signature'):
             reason = '题目或选项发生变化，请重新核对并保存答案'
-        elif saved.get('files'):
-            # Platform-specific upload widgets may save immediately and involve
-            # unmapped attachment protocols. Preserve the local files and ask for
-            # explicit manual upload instead of claiming an unsupported transfer.
-            reason = '此题包含附件，请在原网页手动上传保存的文件'
         elif question['type'] == 'unsupported':
-            reason = '此题型暂不支持自动填入，请在原网页完成'
-        elif saved.get('value') in (None, '', []):
+            if not saved.get('files'):
+                reason = '此题型暂不支持自动填入，请在原网页完成'
+        elif saved.get('value') in (None, '', []) and not saved.get('files'):
             reason = '没有保存答案'
         if reason:
             skipped.append({'id': qid, 'reason': reason})
@@ -306,16 +471,27 @@ def fill_page(page, questions, answers):
         if root is None:
             skipped.append({'id': qid, 'reason': '未找到唯一题目容器'})
             continue
-        value = saved['value']
+        value = saved.get('value')
         try:
             if question['type'] in {'single', 'multiple', 'judgment'}:
                 reason = _fill_choice(root, question, value)
             elif question['type'] == 'blank':
-                reason = _fill_blanks(root, question, value)
-            elif question['type'] == 'essay' and isinstance(value, str):
-                reason = _fill_essay(root, value)
+                reason = _fill_attachments(root, saved['files'], saved.get('_local_files')) if not value and saved.get('files') else _fill_blanks(root, question, value)
+            elif question['type'] == 'essay':
+                if value not in (None, '', []) and not isinstance(value, str):
+                    reason = '答案格式与题型不一致'
+                else:
+                    reason = _fill_essay(root, value) if value else None
+                    if not reason and saved.get('files'):
+                        reason = _fill_attachments(root, saved['files'], saved.get('_local_files'))
+            elif question['type'] == 'upload':
+                reason = _fill_attachments(root, saved.get('files'), saved.get('_local_files'))
+            elif question['type'] == 'unsupported' and saved.get('files'):
+                reason = _fill_attachments(root, saved.get('files'), saved.get('_local_files'))
             else:
                 reason = '答案格式与题型不一致'
+            if not reason and saved.get('files') and question['type'] not in {'blank', 'essay', 'upload', 'unsupported'}:
+                reason = _fill_attachments(root, saved['files'], saved.get('_local_files'))
         except Exception as exc:
             # Playwright exceptions include URLs and request logs. Never expose
             # those, browser credentials, or content of an online answer.
@@ -348,18 +524,14 @@ def _record(key):
 
 
 def _entry(record):
-    for key in ('answer_url', 'entry_url', 'work_url', 'url', 'list_url'):
-        url = record.get(key)
+    for url in dom.record_urls(record):
         if url and dom.platform_url(url):
             return url
     raise ValueError('尚未取得可验证的作答入口，请刷新此作业')
 
 
 def _identities(record):
-    result = set(record.get('identities') or [])
-    for key in ('answer_url', 'entry_url', 'work_url', 'url'):
-        result.update(dom.url_identity(record.get(key) or ''))
-    return result
+    return dom.record_identities(record)
 
 
 def _identity_matches(record, markup, url):
@@ -412,6 +584,23 @@ def fill_assignment(key):
     b = _backend()
     with b.browser_operation():
         return _fill_assignment(key)
+
+
+def _local_attachment_files(b, files):
+    """Resolve saved attachment records to files inside this project's data dir."""
+    root = (Path(b.DATA_DIR) / 'answer_attachments').resolve()
+    resolved = []
+    for info in files or []:
+        if not isinstance(info, dict):
+            continue
+        file_id = str(info.get('id') or '')
+        name = Path(str(info.get('path') or '')).name
+        if not file_id or Path(name).stem != file_id:
+            continue
+        path = (root / name).resolve()
+        if path.is_relative_to(root) and path.is_file():
+            resolved.append({'path': str(path), 'name': info.get('name') or name})
+    return resolved
 
 
 def _fill_assignment(key):
@@ -499,7 +688,16 @@ def _fill_assignment(key):
             # Reparse the actual displayed question immediately before matching.
             markup = page.content()
             questions = dom.parse_questions(markup, page.url)
-            result = fill_page(page, questions, answers)
+            # Keep the persisted draft format unchanged.  The extra local file
+            # paths only live for this fill operation and are never returned to
+            # the UI or written back to disk.
+            fill_answers = {}
+            for qid, saved in answers.items():
+                if isinstance(saved, dict) and saved.get('files'):
+                    saved = dict(saved)
+                    saved['_local_files'] = _local_attachment_files(b, saved.get('files'))
+                fill_answers[qid] = saved
+            result = fill_page(page, questions, fill_answers)
             result['message'] = f"已填入 {len(result['filled'])} 题，跳过 {len(result['skipped'])} 题。"
             if not diagnostics['complete']:
                 result['message'] += ' 当前页面未确认包含全部题目，其他页未自动填入。'
