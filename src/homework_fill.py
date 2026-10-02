@@ -14,10 +14,17 @@ from datetime import datetime
 from pathlib import Path
 
 import homework_dom as dom
+import homework_shared as shared
 
 
 def _normalized(value):
-    return re.sub(r'\s+', ' ', str(value or '').replace('\xa0', ' ')).strip()
+    """折叠连续空白并去掉首尾空白；委托 homework_shared.collapse_whitespace。
+
+    既有写法里的 ``.replace('\xa0', ' ')`` 是冗余的：Python 的 ``\\s`` 在字符串
+    模式下本身就匹配 ``\xa0``，因此结果逐例相同（homework_shared 的 docstring
+    记录了这一点）。
+    """
+    return shared.collapse_whitespace(value)
 
 
 def _plain(markup):
@@ -504,11 +511,22 @@ def fill_page(page, questions, answers):
 
 
 def _backend():
+    """homework_engine, imported lazily.
+
+    Kept as a call so this module never imports the engine at load time:
+    homework_app imports both, and the lazy hop keeps the import order free
+    (the engine itself imports homework_dom only).
+    """
     import homework_engine as b
     return b
 
 
 def _record(key):
+    """Look up one assignment for filling.
+
+    The list/'items' shapes below are deliberate legacy tolerance: an older or
+    hand-edited state file must not crash the fill path.
+    """
     b = _backend()
     state = b.load_state()
     records = state.get('assignments', state.get('items', [])) if isinstance(state, dict) else state
@@ -622,7 +640,7 @@ def _fill_assignment(key):
         try:
             # Never create a disposable browser whose closure would discard the
             # filled answers. The dedicated Chrome must remain connected via CDP.
-            if hasattr(b, 'CONNECTED_BROWSER') and b.CONNECTED_BROWSER is None:
+            if b.CONNECTED_BROWSER is None:
                 return {'filled': [], 'skipped': [], 'message': '尚未连接到专用学习通窗口，请重新打开后再填入。'}
             # Fresh detail metadata is checked before any answer operation. A
             # cached pending status/deadline is insufficient if the teacher closed

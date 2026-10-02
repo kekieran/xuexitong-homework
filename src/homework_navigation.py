@@ -5,6 +5,7 @@ import json
 import re
 from urllib.parse import urljoin, urlsplit, parse_qs, urlencode
 import homework_dom as dom
+import homework_shared as shared
 
 
 def identities(record):
@@ -44,8 +45,7 @@ def _school_entry(context, record, markup, url, fetch_html):
         return None
     q = {k.lower(): v[0] for k, v in parse_qs(urlsplit(url).query).items() if v}
     course, clazz = q.get('courseid'), q.get('classid', q.get('clazzid'))
-    host = urlsplit(url).hostname or ''
-    host = 'chaoxing' if host == 'chaoxing.com' or host.endswith('.chaoxing.com') else host
+    host = dom.platform_host(urlsplit(url).hostname)
     expected = identities(record)
     prefix = f'{host}:{course}:{clazz}:'
     wanted = {x.split(':')[-1] for x in expected if x.startswith(prefix) and x.split(':')[-2] in {'taskrefid', 'workid'}}
@@ -67,7 +67,7 @@ def _school_entry(context, record, markup, url, fetch_html):
     row_anchors = row.all('a', cls='inspectTask')
     if any(a.attrs.get('data') != task for a in row_anchors):
         raise ValueError('作业列表行包含多个作业标识，已停止')
-    row_titles = {re.sub(r'\s+', ' ', a.attrs.get('title', '')).strip() for a in row_anchors if a.attrs.get('title', '').strip()}
+    row_titles = {shared.collapse_whitespace(a.attrs.get('title', '')) for a in row_anchors if a.attrs.get('title', '').strip()}
     if len(row_titles) > 1:
         raise ValueError('目标作业行含多个不同标题，已停止')
     if row_titles:
@@ -168,7 +168,7 @@ def _update_verified_title(record, markup):
         for top in root.all('div', cls='CyTop'):
             for nav in top.all('ul', cls='ul01'):
                 nodes.extend(nav.all('a'))
-    titles = {re.sub(r'\s+', ' ', dom.clean_text(n)).strip() for n in nodes if dom.clean_text(n).strip()}
+    titles = {shared.collapse_whitespace(dom.clean_text(n)) for n in nodes if dom.clean_text(n).strip()}
     if len(titles) == 1:
         record['title'] = next(iter(titles))
 
@@ -179,7 +179,7 @@ def resolve_work_page(context, record, fetch_html):
     School list metadata is applied from the unique matched row. Identity aliases
     are added only when that row and its server handler prove the relationship.
     """
-    urls = list(dict.fromkeys(u for u in dom.record_urls(record) if dom.platform_url(u)))
+    urls = [u for u in dom.record_urls(record) if dom.platform_url(u)]
     if not urls or not identities(record):
         raise ValueError('尚未取得可验证的作业入口')
     seen = set()

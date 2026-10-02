@@ -59,6 +59,12 @@ def answer_progress(record, draft):
 
 
 def capabilities(record):
+    """Per-record action switches for the UI.
+
+    The current front end reads can_open and show_submission_bar and derives fill
+    eligibility itself (ui/ui.js fillBlocker); the remaining keys are part of the
+    published contract and stay for other consumers.
+    """
     return {'can_open': bool(record.get('answer_url') or record.get('entry_url') or record.get('work_url') or record.get('list_url')),
             'can_reread': record.get('group') != 'history', 'can_manage': True,
             'show_submission_bar': record.get('group') != 'history',

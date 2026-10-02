@@ -14,11 +14,11 @@ const NO_SUBMIT = '填入后请在学习通核对并提交。';
 
 const S = {
   records: [], aliases: {}, key: null, group: 'active', sub: 'all',
-  progressFilter: 'all', dueFilter: 'all', dashboard: null,
+  progressFilter: 'all', dueFilter: 'all',
   loaded: false, loadError: null, lastSuccess: null, warnings: [],
   job: {busy: false, action: '', message: ''}, jobKey: null, revision: -1,
   auth: null, reminder: null, online: navigator.onLine, serverLost: false,
-  selecting: 0, printed: null, statusMemo: '',
+  selecting: 0, printed: null, statusMemo: '', exited: false,
 };
 const drafts = new Map(), dirty = new Map(), timers = new Map(), saving = new Map(), saveState = new Map();
 const draftChanges = new Map();
@@ -95,6 +95,12 @@ function btn(label, cls, onclick, iconName) {
   if (label) b.append(el('span', '', label));
   if (onclick) b.onclick = onclick;
   return b;
+}
+// 统计卡片：renderWelcome 与 renderLogin 原本各自内联了一份逐字符相同的实现。
+function statCard(value, label, tone = '') {
+  const card = el('div', 'stat ' + tone);
+  card.append(el('b', '', String(value)), el('small', '', label));
+  return card;
 }
 function externalLink(href, label, cls = 'link-chip') {
   const a = el('a', cls);
@@ -1735,8 +1741,7 @@ function renderFill() {
     const {ready, skipped} = analyze(r, draft);
     body.append(titled('fill-title', '填入前检查'));
     const stats = el('div', 'stats');
-    const stat = (n, t, tone = '') => { const s = el('div', 'stat ' + tone); s.append(el('b', '', String(n)), el('small', '', t)); return s; };
-    stats.append(stat(ready.length, '将填入', 'ok'), stat(skipped.length, '将跳过', skipped.length ? 'warn' : ''), stat(r.questions.length, '共计题目'));
+      stats.append(statCard(ready.length, '将填入', 'ok'), statCard(skipped.length, '将跳过', skipped.length ? 'warn' : ''), statCard(r.questions.length, '共计题目'));
     body.append(stats);
     if (skipped.length) {
       body.append(el('div', 'section-label', '以下题目不会自动填入'));
@@ -1790,8 +1795,7 @@ function renderFill() {
     rows.sort((a, b) => (a.i < 0 ? 1e9 : a.i) - (b.i < 0 ? 1e9 : b.i));
     const uploads = rows.filter(x => x.kind === 'upload').length;
     const stats = el('div', 'stats');
-    const stat = (n, tt, tone = '') => { const s = el('div', 'stat ' + tone); s.append(el('b', '', String(n)), el('small', '', tt)); return s; };
-    stats.append(stat(filled.length, '已填入', 'ok'), stat(rows.length, '已跳过', rows.length ? 'warn' : ''), stat(uploads, '需手动上传', uploads ? 'warn' : ''));
+      stats.append(statCard(filled.length, '已填入', 'ok'), statCard(rows.length, '已跳过', rows.length ? 'warn' : ''), statCard(uploads, '需手动上传', uploads ? 'warn' : ''));
     body.append(stats);
     if (rows.length) {
       body.append(el('div', 'section-label', '跳过的题目与原因'));
@@ -1937,7 +1941,6 @@ async function load() {
   await flushAll().catch(() => {});
   const data = await api('/api/state');
   S.records = data.assignments || [];
-  S.dashboard = data.dashboard || null;
   S.aliases = data.record_aliases || {};
   for (const r of S.records) if (r.group === 'history') discardHistoryDraft(r.key);
   S.lastSuccess = data.last_success;

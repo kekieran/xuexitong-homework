@@ -55,7 +55,14 @@ def clear_login_errors(sites):
 
 
 def safe_file(path):
-    """Require an actual file beneath the two owned cache folders, no links."""
+    """Require an actual file beneath the two owned cache folders, no links.
+
+    The strictest of the three "is this the saved attachment" checks: this one
+    feeds deletion, so it also refuses symlinks anywhere in the path, while
+    homework_app.attachment_path and homework_fill._local_attachment_files only
+    resolve the file and confirm it stays inside its folder. Do not relax this
+    one to match them.
+    """
     data = Path(engine.DATA_DIR).resolve()
     roots = (Path(engine.CONTENT_DIR), data / 'answer_attachments')
     path = Path(path)
@@ -141,11 +148,7 @@ def plan_cleanup():
     aliases = state.get('record_aliases', {})
 
     def canonical(key):
-        seen = set()
-        while key in aliases and key not in seen:
-            seen.add(key)
-            key = aliases[key]
-        return key
+        return engine.resolve_alias(aliases, key)
 
     history = {key for key, r in state.get('assignments', {}).items()
                if engine.record_group(dict(r, key=key)) == 'history'}

@@ -7,6 +7,8 @@ import json
 from html.parser import HTMLParser
 from urllib.parse import urljoin, urlsplit, parse_qs
 
+import homework_shared as shared
+
 VOID = {'img', 'input', 'br', 'hr', 'meta', 'link', 'source', 'wbr', 'area', 'base', 'embed', 'param', 'col'}
 BLOCK = {'div', 'p', 'li', 'h1', 'h2', 'h3', 'h4', 'tr', 'br', 'section'}
 
@@ -77,12 +79,22 @@ def platform_url(url):
     except ValueError:
         return False
 
+def platform_host(host):
+    """Fold the Chaoxing hosts (bare domain and sub-domains) onto one prefix.
+
+    Identity strings must be built the same way everywhere, otherwise the same
+    work crawled from two hosts never matches.
+    """
+    host = host or ''
+    return 'chaoxing' if host == 'chaoxing.com' or host.endswith('.chaoxing.com') else host
+
+
 def url_identity(url):
     """Taskref and work IDs are aliases, not interchangeable numbers."""
     try:
         u = urlsplit(url or '')
         q = {k.lower(): v[0] for k, v in parse_qs(u.query).items() if v}
-        host = 'chaoxing' if (u.hostname or '').endswith('.chaoxing.com') else u.hostname or ''
+        host = platform_host(u.hostname)
         course, clazz = q.get('courseid', ''), q.get('classid', q.get('clazzid', ''))
         return [f'{host}:{course}:{clazz}:{k}:{q[k]}' for k in ('taskrefid', 'workid') if q.get(k) and course and clazz]
     except ValueError:
@@ -94,7 +106,8 @@ def url_identity(url):
 RECORD_URL_FIELDS = ('entry_url', 'answer_url', 'work_url', 'url', 'list_url')
 
 def record_urls(record):
-    return [record.get(field) for field in RECORD_URL_FIELDS if record.get(field)]
+    """Candidate URLs in contract order, de-duplicated for every caller."""
+    return list(dict.fromkeys(record.get(field) for field in RECORD_URL_FIELDS if record.get(field)))
 
 def record_identities(record):
     result = set(record.get('identities') or [])
@@ -149,6 +162,9 @@ def safe_html(node, base_url='', asset=None):
 # Codes above 8 include compound, matching, ordering and language exercises.
 # They must never silently become a free-text answer with the wrong encoding.
 TYPE_MAP = {'0': 'single', '1': 'multiple', '2': 'blank', '3': 'judgment', '4': 'essay', '5': 'essay', '6': 'essay', '7': 'essay', '8': 'essay'}
+# API-facing labels shipped with each parsed question. The front end keeps its
+# own display table (ui/ui.js TYPES, preferred over q.label) - keep both in step
+# when a question type is added.
 TYPE_LABELS = {'single': '单选题', 'multiple': '多选题', 'blank': '填空题', 'judgment': '判断题', 'essay': '简答 / 论述题', 'upload': '上传题', 'unsupported': '特殊题型'}
 
 def question_nodes(root):
@@ -166,7 +182,7 @@ def question_id(n):
 
 def _content_fingerprint(node, base_url=''):
     """Ignore layout wrappers; include original media, not just its alt text."""
-    text = re.sub(r'\s+', ' ', clean_text(node)).strip()
+    text = shared.collapse_whitespace(clean_text(node))
     text = re.sub(r'^\d+\s*[.、．]\s*', '', text)
     text = re.sub(r'^[(（【]?(?:单选题|多选题|判断题|填空题|简答题|论述题|计算题)[)）】]?[\s:：]*', '', text)
     media = [urljoin(base_url, x.attrs.get('data-original') or x.attrs.get('data-src') or x.attrs.get('src') or '') for x in node.all() if x.tag in {'img', 'iframe', 'audio', 'video', 'source'}]
@@ -310,8 +326,7 @@ def page_identity(markup, url):
     f = {str(k).lower(): v for k, v in fields(parse(markup)).items() if k}
     course = f.get('courseid') or f.get('courseidinput')
     clazz = f.get('classid') or f.get('clazzid')
-    host = urlsplit(url).hostname or ''
-    host = 'chaoxing' if host == 'chaoxing.com' or host.endswith('.chaoxing.com') else host
+    host = platform_host(urlsplit(url).hostname)
     if course and clazz:
         for kind, names in [('taskrefid', ('taskrefid', 'workrelationid')), ('workid', ('workid',))]:
             for name in names:
@@ -332,6 +347,13 @@ def phone_entry(markup, base):
     return urljoin(base, html.unescape(match.group(1))) if match else None
 
 def explicit_status(text):
+    """Map a course-list row's own wording onto the canonical status.
+
+    This is the list-row vocabulary. Two other readers keep narrower sets on
+    purpose: engine.update_metadata matches the detail page's submit phrases and
+    navigation matches the school row's 待做. Unifying them changes edge-case
+    verdicts, so keep them in step deliberately rather than by accident.
+    """
     if re.search(r'未交|未提交|未完成|未作答|待完成', text):
         return 'pending'
     if re.search(r'已提交|已交|已完成|待批阅|已批阅|已作答', text):

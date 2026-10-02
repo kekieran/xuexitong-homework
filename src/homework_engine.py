@@ -17,6 +17,7 @@ from urllib.parse import urljoin, urlsplit, parse_qs
 from playwright.sync_api import sync_playwright
 import homework_dom as dom
 import homework_runtime as runtime
+import homework_shared as shared
 
 DATA_DIR = runtime.DATA_DIR
 PROFILE_DIR = runtime.PROFILE_DIR
@@ -36,10 +37,13 @@ CONNECTED_BROWSER = None
 BACKGROUND_CONTEXTS = {}
 PROGRESS = lambda message: None
 CONTENT_VERSION = 2
+ERROR_BACKOFF = timedelta(minutes=30)   # a failed read is not retried before this
+METADATA_MAX_AGE = timedelta(hours=6)   # cached deadline/status is refreshed after this
 TOAST_APP_ID = r'{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe'
 
 def now_iso():
-    return datetime.now().isoformat(timespec='seconds')
+    """当前本地时间戳（秒精度），委托 homework_shared 统一实现。"""
+    return shared.iso_timestamp()
 
 def normalize(value):
     return re.sub(r'[《》<>（）()\[\]【】\s:：—_-]+', '', unicodedata.normalize('NFKC', value or '')).casefold()
@@ -55,15 +59,17 @@ def log(message):
     PROGRESS(message)
 
 def read_json(path, fallback):
-    if not path.exists():
-        return fallback
-    return json.loads(path.read_text(encoding='utf-8-sig'))
+    """读取 JSON 文件；文件不存在返回 fallback，损坏时抛出（委托 homework_shared）。"""
+    return shared.read_json_file(path, fallback)
 
 def write_json(path, value):
+    """在 STATE_LOCK 内原子写入 JSON；临时名与缩进格式沿用既有约定。
+
+    实际落盘由 homework_shared.write_json_file 完成（临时文件 + 整体替换），
+    但写锁语义仍由本模块的 STATE_LOCK 提供，调用方无需额外加锁。
+    """
     with STATE_LOCK:
-        temp = path.with_name(path.name + f'.{os.getpid()}.{threading.get_ident()}.tmp')
-        temp.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding='utf-8')
-        temp.replace(path)
+        shared.write_json_file(path, value)
 
 @contextmanager
 def process_transaction(name, wait_ms=0):
@@ -93,6 +99,14 @@ def draft_transaction():
     return process_transaction('Local\\ChaoxingHomeworkDraftTransaction_' + runtime.PROJECT_ID, 10000)
 
 def parse_datetime(value):
+    """Canonical parser for stored and scraped timestamps.
+
+    Timezone-aware input is converted to local naive time so every comparison in
+    this module uses one clock. Two callers intentionally keep their own deadline
+    handling: homework_fill._deadline_reason accepts a trailing 'Z' and compares
+    timezone-aware, homework_workspace.dashboard normalises only aware values.
+    Merge them only after checking those comparisons.
+    """
     try:
         parsed = value if isinstance(value, datetime) else datetime.fromisoformat(value)
         return parsed.astimezone().replace(tzinfo=None) if parsed.tzinfo else parsed
@@ -136,6 +150,15 @@ def time_fields(text, reference=None):
     return start, end
 
 def load_state():
+    """Load and normalise every stored record.
+
+    Write-only fields: identity_source, source_notice_ids, last_seen,
+    deadline_reason, question_count, requirements, content_images and the
+    legacy_* snapshots are written for provenance (and read by older builds),
+    but no decision in this codebase reads them back - retention.summary() only
+    carries them through history compaction. Keep them unless the on-disk format
+    is deliberately migrated; they are not dead code to delete.
+    """
     with STATE_LOCK:
         state = read_json(STATE_FILE, {'version': 2, 'assignments': {}})
     for key, r in state.setdefault('assignments', {}).items():
@@ -156,6 +179,19 @@ def save_state(state):
     state['version'] = 2
     write_json(STATE_FILE, state)
 
+def resolve_alias(aliases, key):
+    """Follow a record-alias chain to its final key.
+
+    Pure and in-memory on purpose: callers pass the alias map they already hold,
+    so a merge published by another process mid-pass cannot desynchronise them.
+    """
+    seen = set()
+    while key in aliases and key not in seen:
+        seen.add(key)
+        key = aliases[key]
+    return key
+
+
 def local_overrides():
     """Local choices are independent of crawled metadata and survive key aliases."""
     global _OVERRIDES_CACHE
@@ -168,10 +204,7 @@ def local_overrides():
             aliases = read_json(STATE_FILE, {}).get('record_aliases', {})
             resolved = {}
             for key, value in read_json(OVERRIDES_FILE, {}).items():
-                seen = set()
-                while key in aliases and key not in seen:
-                    seen.add(key)
-                    key = aliases[key]
+                key = resolve_alias(aliases, key)
                 if key not in resolved or value.get('updated_at', '') > resolved[key].get('updated_at', ''):
                     resolved[key] = value
             _OVERRIDES_CACHE = (signature, resolved)
@@ -244,6 +277,11 @@ def match_record(records, candidate):
     return matches[0] if len(matches) == 1 else None
 
 def merge_record(records, candidate):
+    """Merge one crawled candidate into `records`, mutating it in place.
+
+    Returns the stored record for convenience; both call sites rely on the
+    in-place update, which is why the return value is not read there.
+    """
     key = match_record(records, candidate)
     if not key:
         identity = '|'.join(sorted(candidate.get('identities') or [])) or normalize(candidate['course']) + '|' + normalize(candidate['title'])
@@ -354,8 +392,7 @@ def reconcile_aliases(state):
                         if incoming.get('legacy_text') and incoming['legacy_text'] != existing.get('legacy_text'):
                             existing['legacy_text'] = (existing.get('legacy_text', '') + '\n\n' + incoming['legacy_text']).strip()
                         existing.setdefault('merged_drafts', {})[remove] = source
-                        drafts[keep] = existing
-                        write_json(DRAFTS_FILE, drafts)
+                        store_draft(keep, existing)
                     del records[remove]
                     # Publish the alias while holding the same short cross-process
                     # draft transaction. Autosave must not target a removed key in
@@ -434,16 +471,17 @@ def fetch_html(context, url):
     return markup, final
 
 def parse_notice_attachment(raw):
+    """Return the work entry URL carried by a notice attachment, if present."""
     try:
         entries = json.loads(raw) if isinstance(raw, str) else raw or []
     except ValueError:
-        return None, []
-    url, attachments = None, []
+        return None
+    url = None
     for entry in entries if isinstance(entries, list) else []:
         web = entry.get('att_web', {}) if isinstance(entry, dict) else {}
         if isinstance(web, dict) and str(web.get('examOrWork', '')).lower() == 'work':
             url = web.get('url') or url
-    return url, attachments
+    return url
 
 def collect_notices(context, state, stats):
     seen = set(state.get('notice_seen') or [])
@@ -487,7 +525,7 @@ def collect_notices(context, state, stats):
             course, title = field('课程名称'), field('作业名称')
             if not course or not title:
                 continue
-            url, _ = parse_notice_attachment(n.get('attachment'))
+            url = parse_notice_attachment(n.get('attachment'))
             start, deadline = time_fields(content)
             item = {'course': course, 'title': title, 'start': start, 'deadline': deadline,
                     'deadline_source': 'notice' if deadline else None,
@@ -556,6 +594,27 @@ def collect_course_rows(context, state, stats):
         except Exception as exc:
             stats['warnings'].append(f'{name}：{safe_error(exc)}')
 
+IMAGE_MIME_SUFFIX = {'image/png': '.png', 'image/jpeg': '.jpg', 'image/gif': '.gif', 'image/webp': '.webp'}
+
+
+def image_mime(data):
+    """Identify an image from its magic bytes, ignoring a wrong Content-Type.
+
+    The school image server sometimes labels JPEG bytes as image/png, so the
+    bytes win over the header. Shared with homework_ai, which forwards the same
+    bytes to a vision model, so both agree on what a file actually is.
+    """
+    if data.startswith(b'\x89PNG\r\n\x1a\n'):
+        return 'image/png'
+    if data.startswith(b'\xff\xd8\xff'):
+        return 'image/jpeg'
+    if data.startswith((b'GIF87a', b'GIF89a')):
+        return 'image/gif'
+    if data.startswith(b'RIFF') and data[8:12] == b'WEBP':
+        return 'image/webp'
+    return None
+
+
 def asset_downloader(context):
     def download(url):
         u = urlsplit(url)
@@ -570,17 +629,11 @@ def asset_downloader(context):
             return '/assets/' + existing[0].name
         try:
             response = request(context, url)
-            suffix = {'image/png': '.png', 'image/jpeg': '.jpg', 'image/gif': '.gif', 'image/webp': '.webp'}.get(response.headers.get('content-type', '').split(';')[0])
+            suffix = IMAGE_MIME_SUFFIX.get(response.headers.get('content-type', '').split(';')[0])
             data = response.body()
-            # The school image server sometimes labels JPEG bytes as image/png.
-            if data.startswith(b'\x89PNG\r\n\x1a\n'):
-                suffix = '.png'
-            elif data.startswith(b'\xff\xd8\xff'):
-                suffix = '.jpg'
-            elif data.startswith((b'GIF87a', b'GIF89a')):
-                suffix = '.gif'
-            elif data.startswith(b'RIFF') and data[8:12] == b'WEBP':
-                suffix = '.webp'
+            # Sniffed bytes win over the header; an unknown format keeps the
+            # header-derived suffix (or none) exactly as before.
+            suffix = IMAGE_MIME_SUFFIX.get(image_mime(data)) or suffix
             if suffix and len(data) <= 12_000_000:
                 (folder / (name + suffix)).write_bytes(data)
                 return '/assets/' + name + suffix
@@ -694,6 +747,23 @@ def needs_entry_upgrade(record):
                 and record.get('content_entry_checked') != entry)
 
 
+def skipped_by_cache(record, *, force_key, valid, due, attempted, identity_probe, entry_upgrade):
+    """True when this pass may reuse the stored content instead of re-reading.
+
+    Two independent rules share one bypass list (an explicit refresh, an identity
+    probe or an entry upgrade):
+      1. a recent read error backs off, so a failing course is not retried on
+         every pass;
+      2. an unchanged record inside its metadata window is reused as it is.
+    """
+    if force_key or record.get('metadata_needs_check') or identity_probe or entry_upgrade:
+        return False
+    now = datetime.now()
+    if record.get('content_error') and attempted and now - attempted < ERROR_BACKOFF:
+        return True
+    return (valid and not due) or (not valid and bool(attempted) and now - attempted < ERROR_BACKOFF)
+
+
 def check_once(headless=True, force_key=None, on_auth=None):
     with browser_operation():
         return _check_once(headless, force_key, on_auth)
@@ -736,11 +806,10 @@ def _check_once(headless=True, force_key=None, on_auth=None):
                     attempted = parse_datetime(record.get('content_attempted_at'))
                     valid = record.get('content_version') == CONTENT_VERSION and bool(record.get('questions'))
                     checked = parse_datetime(record.get('metadata_checked_at'))
-                    due = record.get('metadata_needs_check') or not checked or datetime.now() - checked > timedelta(hours=6)
-                    if not force_key and record.get('content_error') and attempted and datetime.now() - attempted < timedelta(minutes=30) and not record.get('metadata_needs_check') and not identity_probe and not entry_upgrade:
-                        stats['cache_hits'] += 1
-                        continue
-                    if not force_key and not record.get('metadata_needs_check') and not identity_probe and not entry_upgrade and ((valid and not due) or (not valid and attempted and datetime.now() - attempted < timedelta(minutes=30))):
+                    due = record.get('metadata_needs_check') or not checked or datetime.now() - checked > METADATA_MAX_AGE
+                    if skipped_by_cache(record, force_key=bool(force_key), valid=valid, due=due,
+                                        attempted=attempted, identity_probe=identity_probe,
+                                        entry_upgrade=entry_upgrade):
                         stats['cache_hits'] += 1
                         continue
                     if not record.get('entry_url') and not record.get('list_url') and not record.get('work_url'):
@@ -755,7 +824,8 @@ def _check_once(headless=True, force_key=None, on_auth=None):
                         reconcile_aliases(state)
                         # A proven alias may reveal a better PC entry only after
                         # the legacy mobile content was read earlier in this pass.
-                        merged_key = state.get('record_aliases', {}).get(key, key)
+                        # Walk the full chain: a record can be merged more than once.
+                        merged_key = resolve_alias(state.get('record_aliases') or {}, key)
                         merged = state['assignments'].get(merged_key)
                         if merged and needs_entry_upgrade(merged):
                             read_content(context, merged, stats, force=bool(force_key))
@@ -824,13 +894,16 @@ def notify(title, message):
     # Keep a compatibility fallback for environments where PowerShell notifications are unavailable.
     subprocess.Popen(['msg.exe', os.environ.get('USERNAME', '*'), '/TIME:300', title + '\n' + message[:900]], creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
 
-def ensure_chrome(url=None, app=False, window_size=None):
+def ensure_chrome(url=None, app=False):
     port = urlsplit(CHAOXING_CDP_URL).port or 9222
-    args = runtime.browser_args(url, app=app, port=port, window_size=window_size)
+    args = runtime.browser_args(url, app=app, port=port)
     subprocess.Popen(args, creationflags=getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0))
 
 LOGIN_TARGET_ID = None
 LOGIN_TARGET_PLATFORM = None
+# Visible-login targets for the CLI (--login). homework_auth keeps the fuller
+# pair for the in-app flow - its school entry carries fid/refer and lands on the
+# form directly - so this table is the minimal equivalent, not a copy to sync.
 LOGIN_URLS = {'chaoxing': NOTICE_URL, 'school': 'https://passport.istudy.szpu.edu.cn/'}
 
 
@@ -920,16 +993,29 @@ def load_draft(key):
         return {'version': 2, 'answers': {}, 'legacy_text': value, 'updated_at': None}
     return value if isinstance(value, dict) else {'version': 2, 'answers': {}}
 
+def store_draft(key, value):
+    """Persist one complete draft record.
+
+    The single place that rewrites answer_drafts.json, so every writer (UI
+    autosave, alias migration, AI answers and templates) shares one
+    read-modify-write shape. Callers already hold the draft transaction.
+    """
+    drafts = read_json(DRAFTS_FILE, {})
+    drafts[key] = value
+    write_json(DRAFTS_FILE, drafts)
+
+
 def save_draft(key, payload):
     if not isinstance(payload.get('answers'), dict):
         raise ValueError('答案格式不正确')
     with STATE_LOCK, draft_transaction():
         key = canonical_key(key)
-        if key not in load_state()['assignments']:
+        # 只读一次状态：确保两次判定基于同一份快照，也少解析一次大 JSON。
+        assignments = load_state()['assignments']
+        if key not in assignments:
             raise ValueError('作业不存在')
-        if record_group(load_state()['assignments'][key]) == 'history':
+        if record_group(assignments[key]) == 'history':
             raise ValueError('历史作业仅保留基本信息，不再保存答案')
-        drafts = read_json(DRAFTS_FILE, {})
         previous = load_draft(key)
         answers = payload['answers']
         changes = payload.get('_changed_questions')
@@ -945,14 +1031,9 @@ def save_draft(key, payload):
                 else:
                     answers.pop(qid, None)
         value = {**previous, 'version': 2, 'answers': answers, 'legacy_text': str(payload.get('legacy_text', previous.get('legacy_text', ''))), 'updated_at': now_iso()}
-        drafts[key] = value
-        write_json(DRAFTS_FILE, drafts)
+        store_draft(key, value)
     return value
 
 def canonical_key(key):
-    aliases = load_state().get('record_aliases') or {}
-    seen = set()
-    while key in aliases and key not in seen:
-        seen.add(key)
-        key = aliases[key]
-    return key
+    """Resolve an alias chain against the alias map currently on disk."""
+    return resolve_alias(load_state().get('record_aliases') or {}, key)

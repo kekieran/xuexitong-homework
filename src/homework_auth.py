@@ -155,6 +155,13 @@ def _login_error(page):
 
 
 def _submit(browser, context, target_id, platform, username, password, progress=None, silent=False):
+    """Fill and drive one site's login form.
+
+    Every current caller passes silent=True (the in-app flow logs in through a
+    hidden page). The non-silent branch drives the visible window through
+    _login_page and is currently unreachable; `browser` and `target_id` exist
+    only for it, which is why callers pass None for both.
+    """
     progress = progress or (lambda message: None)
     label = SITE_LABELS[platform]
     progress(f'正在登录{label}…')
@@ -207,7 +214,7 @@ def _submit(browser, context, target_id, platform, username, password, progress=
 
 
 def status(username=None, password=None, *, restore=False, force_restore=False,
-           existing_only=False, progress=None, on_state=None, context=None):
+           progress=None, on_state=None, context=None):
     """Return only site states to callers. Plaintext never enters response data."""
     global _AUTO_FAILED
     supplied = username is not None or password is not None

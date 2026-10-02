@@ -25,6 +25,16 @@ UI_DIR = backend.runtime.UI_DIR
 RUNTIME_FILE = DATA_DIR / "ui_runtime.json"
 SETTINGS_FILE = DATA_DIR / "ui_settings.json"
 UPLOAD_DIR = DATA_DIR / "answer_attachments"
+# The complete front-end whitelist for Handler.do_GET: request path -> (file name
+# inside UI_DIR, Content-Type before the "; charset=utf-8" suffix). Every entry is
+# served with the __APP_TOKEN__ placeholder replaced by the session token.
+STATIC_ASSETS = {
+    "/": ("ui.html", "text/html"),
+    "/ui.js": ("ui.js", "text/javascript"),
+    "/ui.css": ("ui.css", "text/css"),
+    "/workspace.js": ("workspace.js", "text/javascript"),
+    "/ai.js": ("ai.js", "text/javascript"),
+}
 TOKEN = secrets.token_urlsafe(32)
 COOKIE = "homework_session"
 JOB_LOCK = threading.Lock()
@@ -63,10 +73,23 @@ def normalize_reminder_times(value):
         raise ValueError(f'提醒时间最多设置 {MAX_REMINDER_TIMES} 个')
     return sorted(result)
 
+def reminder_clock(value):
+    """Split an already validated 'HH:MM' reminder time into (hour, minute)."""
+    hour, minute = value.split(':', 1)
+    return int(hour), int(minute)
+
+def reminder_slot(now, value):
+    """Slot marker for one reminder time when `now` is inside its window, else None."""
+    hour, minute = reminder_clock(value)
+    started = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if 0 <= (now - started).total_seconds() < REMINDER_WINDOW_SECONDS:
+        return f'{now:%Y-%m-%d}-{value}'
+    return None
+
 def next_reminder_at(now, times):
     candidates = []
     for value in times:
-        hour, minute = map(int, value.split(':'))
+        hour, minute = reminder_clock(value)
         candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
         if candidate <= now:
             candidate += timedelta(days=1)
@@ -95,6 +118,12 @@ def set_reminder(enabled, times=None):
     return reminder_snapshot()
 
 def show_reminder(records):
+    """Toast body for the scheduled reminder.
+
+    Deliberately a different wording from engine.render_summary(), which writes
+    the CLI/text-file digest of the same records: this one is capped at five
+    items because a Windows toast is truncated anyway. Keep them separate.
+    """
     items = sorted(records, key=lambda record: backend.parse_datetime(record.get('deadline')) or datetime.max)
     lines = [f'共 {len(items)} 项未截止、未提交作业']
     for record in items[:5]:
@@ -170,6 +199,12 @@ def start_job(action, key=None, credentials=None):
     return True
 
 def canonical_key(key):
+    """Normalise one assignment key through backend.canonical_key().
+
+    Forwarding layer only: every request handler in this module calls this name
+    (never backend.canonical_key directly) so the app layer keeps a single seam
+    that tests can patch. The normalisation rules themselves stay in the engine.
+    """
     return backend.canonical_key(key)
 
 
@@ -185,6 +220,8 @@ def workspace_snapshot():
             if record['group'] == 'history':
                 record = retention.summary(record)
             record['auth_platform'] = retention.platform(record)
+            # Display layer only: a confirmed login hides the stale error in this
+            # response. retention.clear_login_errors() does the persistent cleanup.
             if retention.login_error(record) and auth_snapshot()['sites'].get(record['auth_platform']):
                 record.pop('content_error', None)
             record['progress'] = workspace.answer_progress(record, {} if record['group'] == 'history' else drafts.get(key, {}))
@@ -253,10 +290,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send(403, {"error": "请从桌面启动入口打开助手"})
             return
         try:
-            if url.path in ("/", "/ui.js", "/ui.css", "/workspace.js", "/ai.js"):
-                name = "ui.html" if url.path == "/" else url.path[1:]
+            if url.path in STATIC_ASSETS:
+                name, content_type = STATIC_ASSETS[url.path]
                 data = (UI_DIR / name).read_bytes().replace(b"__APP_TOKEN__", TOKEN.encode())
-                self.send(200, data, {"ui.html": "text/html", "ui.js": "text/javascript", "workspace.js": "text/javascript", "ai.js": "text/javascript", "ui.css": "text/css"}[name] + "; charset=utf-8")
+                self.send(200, data, content_type + "; charset=utf-8")
             elif url.path == '/api/ai/settings':
                 self.send(200, homework_ai.public_settings())
             elif url.path == "/api/state":
@@ -320,7 +357,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send(200, {"id": file_id, "name": name, "path": path.relative_to(APP_DIR).as_posix(), "size": length})
                 return
             payload = json.loads(raw.decode("utf-8"))
-            key = canonical_key(payload.get("key"))
+            # Resolve the assignment key only where a branch needs it:
+            # /api/ai/settings, /api/reminder and /api/exit take none at all.
             if url.path == '/api/ai/settings':
                 if job_snapshot()['busy']:
                     raise ValueError('请等待当前操作结束')
@@ -328,6 +366,7 @@ class Handler(BaseHTTPRequestHandler):
             elif url.path == '/api/ai/template':
                 if not isinstance(payload.get('adopt'), bool) or not isinstance(payload.get('qid'), str):
                     raise ValueError('模板操作不正确')
+                key = canonical_key(payload.get("key"))
                 self.send(200, homework_ai.apply_template(key, payload['qid'], payload['adopt']))
             elif url.path == "/api/draft":
                 with backend.STATE_LOCK, backend.draft_transaction():
@@ -345,6 +384,7 @@ class Handler(BaseHTTPRequestHandler):
                     saved = backend.save_draft(key, draft)
                 self.send(200, saved)
             elif url.path == "/api/assignment-settings":
+                key = canonical_key(payload.get("key"))
                 # Serialize with the crawler so it cannot restore purged content.
                 with backend.browser_operation():
                     assignment(key)
@@ -353,6 +393,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send(200, result)
             elif url.path == "/api/action":
                 action = payload.get("action")
+                key = canonical_key(payload.get("key"))
                 if action not in ("refresh", "login", "open", "fill", "ai", "ai-test"):
                     raise ValueError("未知操作")
                 credentials = None
@@ -391,8 +432,12 @@ def reminder_loop():
             current = settings()
             times = normalize_reminder_times(current.get('reminder_times'))
             shown = current.setdefault("shown_slots", [])
-            slot = next((f'{now:%Y-%m-%d}-{value}' for value in times
-                         if 0 <= (now - now.replace(hour=int(value[:2]), minute=int(value[3:]), second=0, microsecond=0)).total_seconds() < REMINDER_WINDOW_SECONDS), None)
+            # The first configured time (sorted) whose window still contains `now`.
+            slot = None
+            for value in times:
+                slot = reminder_slot(now, value)
+                if slot:
+                    break
             if current.get("reminder_enabled", True) is False or not slot or slot in shown:
                 continue
             shown.append(slot)
@@ -409,7 +454,7 @@ def auth_watch_loop():
         delay = 120
         if not job_snapshot()['busy']:
             try:
-                result = homework_auth.status(restore=False, existing_only=True)
+                result = homework_auth.status(restore=False)
                 set_auth(result)
                 if not result['logged_in']:
                     delay = 30

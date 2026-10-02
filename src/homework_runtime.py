@@ -7,7 +7,6 @@ import os
 import shutil
 import subprocess
 import shlex
-import webbrowser
 
 APP_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = APP_DIR / 'data'
@@ -24,6 +23,12 @@ CHROMIUM_EXECUTABLES = {
 
 
 def _windows_argv(command):
+    """Split a command line into arguments for the current platform.
+
+    Windows is parsed with CommandLineToArgvW so quoted executable paths survive
+    intact; every other platform falls back to shlex.split. A command line that
+    cannot be parsed yields an empty list - callers decide what that means.
+    """
     if os.name != 'nt':
         return shlex.split(command)
     from ctypes import wintypes
@@ -91,7 +96,8 @@ def _installed_browser_paths(executable):
     return candidates
 
 
-def find_browser(required=True):
+def find_browser():
+    """Return the first usable Chromium-compatible executable, or fail loudly."""
     candidates = []
     custom = os.environ.get('HOMEWORK_BROWSER_PATH') or os.environ.get('HOMEWORK_CHROME_PATH')
     if custom:
@@ -113,40 +119,44 @@ def find_browser(required=True):
         if identity not in seen and candidate.is_file():
             return resolved
         seen.add(identity)
-    if required:
-        raise RuntimeError('未找到可用于读取作业的浏览器')
-    return None
+    raise RuntimeError('未找到可用于读取作业的浏览器')
 
 
-def find_chrome(required=True):
-    """Compatibility alias for older callers."""
-    return find_browser(required)
+def find_chrome():
+    """Compatibility alias for find_browser(), kept for older callers and tests.
+
+    Do not delete it and do not collapse it into `find_chrome = find_browser`:
+    the module-level function is referenced by tests/test_retention.py,
+    tests/test_ai.py and tests/test_workspace.py. New code should call
+    find_browser() directly.
+    """
+    return find_browser()
 
 
-def browser_args(url=None, app=False, port=9222, window_size=None):
+def browser_args(url=None, app=False, port=9222):
+    """Chromium arguments for the dedicated assistant window.
+
+    The app window size is fixed - no caller ever asked for a different one.
+    """
     args = [str(find_browser()), '--remote-debugging-address=127.0.0.1',
             '--remote-debugging-port=' + str(port),
             '--no-proxy-server', '--user-data-dir=' + str(PROFILE_DIR), '--profile-directory=Default']
     if app:
-        width, height = window_size or (1440, 980)
-        args += ['--app=' + url, f'--window-size={int(width)},{int(height)}']
+        width, height = 1440, 980
+        args += ['--app=' + url, f'--window-size={width},{height}']
     elif url:
         args += ['--new-window', url]
     return args
 
 
 def chrome_args(url=None, app=False, port=9222):
-    """Compatibility alias for older callers."""
+    """Compatibility alias for browser_args(), kept for older callers and tests.
+
+    Do not delete it and do not collapse it into `chrome_args = browser_args`:
+    the module-level function is referenced by tests/test_retention.py. New code
+    should call browser_args() directly.
+    """
     return browser_args(url, app, port)
-
-
-def open_default_browser(url):
-    """Open the local assistant UI with the user's normal browser."""
-    if os.name == 'nt':
-        os.startfile(url)
-        return
-    if not webbrowser.open(url, new=1):
-        raise RuntimeError('无法打开默认浏览器')
 
 
 def verify_browser_profile(browser):
@@ -156,21 +166,9 @@ def verify_browser_profile(browser):
         # SystemInfo works without --enable-automation (which adds an infobar).
         command = session.send('SystemInfo.getInfo').get('commandLine', '')
         if os.name == 'nt':
-            from ctypes import wintypes
-            shell = ctypes.WinDLL('shell32', use_last_error=True)
-            kernel = ctypes.WinDLL('kernel32', use_last_error=True)
-            shell.CommandLineToArgvW.argtypes = (wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_int))
-            shell.CommandLineToArgvW.restype = ctypes.POINTER(wintypes.LPWSTR)
-            kernel.LocalFree.argtypes = (ctypes.c_void_p,)
-            kernel.LocalFree.restype = ctypes.c_void_p
-            count = ctypes.c_int()
-            argv = shell.CommandLineToArgvW(command, ctypes.byref(count))
-            if not argv:
+            arguments = _windows_argv(command)
+            if not arguments:
                 raise ValueError('Missing browser command line')
-            try:
-                arguments = [argv[i] for i in range(count.value)]
-            finally:
-                kernel.LocalFree(argv)
         else:
             arguments = shlex.split(command)
         profile = next((value.split('=', 1)[1] for value in arguments if value.startswith('--user-data-dir=')), None)
@@ -189,8 +187,8 @@ def verify_browser_profile(browser):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--chrome', '--browser', dest='browser', action='store_true')
-    parser.add_argument('--check-chrome', '--check-browser', dest='check_browser', action='store_true')
+    parser.add_argument('--chrome', '--browser', dest='browser', action='store_true',
+                        help='start the dedicated assistant browser')
     args = parser.parse_args()
     find_browser()
     if args.browser:

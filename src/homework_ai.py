@@ -295,8 +295,7 @@ def _question_input(question, vision):
         if image.stat().st_size > 4 * 1024 * 1024:
             raise AIError('题目图片过大')
         data = image.read_bytes()
-        mime = ('image/png' if data.startswith(b'\x89PNG\r\n\x1a\n') else 'image/jpeg' if data.startswith(b'\xff\xd8\xff') else
-                'image/gif' if data[:6] in (b'GIF87a', b'GIF89a') else 'image/webp' if data[:4] == b'RIFF' and data[8:12] == b'WEBP' else None)
+        mime = engine.image_mime(data)
         size += len(data)
         if not mime or size > 8 * 1024 * 1024 or len(images) >= 8:
             raise AIError('题目图片格式或大小不支持')
@@ -420,11 +419,10 @@ def solve(key, progress=lambda message: None):
                     result['filled'].append(qid)
                 changed = True
             if changed:
-                # save_draft preserves server-owned template metadata.
-                all_drafts = engine.read_json(engine.DRAFTS_FILE, {})
+                # store_draft writes this whole record, so the ai_templates added
+                # above survive; save_draft would rebuild it from disk without them.
                 saved.update(version=2, updated_at=engine.now_iso())
-                all_drafts[current_key] = saved
-                engine.write_json(engine.DRAFTS_FILE, all_drafts)
+                engine.store_draft(current_key, saved)
     result['message'] = f'已填写 {len(result["filled"])} 题，生成 {len(result["templates"])} 份模板' if candidates else '没有可自动作答的题目'
     if result['skipped']:
         result['message'] += f'，跳过 {len(result["skipped"])} 题'
@@ -446,10 +444,8 @@ def apply_template(key, qid, adopt):
                 raise AIError('本题已有答案，请自行参考模板')
             draft.setdefault('answers', {})[qid] = {'value': template['text'], 'signature': template['signature'], 'files': []}
         del draft['ai_templates'][qid]
-        drafts = engine.read_json(engine.DRAFTS_FILE, {})
         draft['updated_at'] = engine.now_iso()
-        drafts[key] = draft
-        engine.write_json(engine.DRAFTS_FILE, drafts)
+        engine.store_draft(key, draft)
         return draft
 
 
