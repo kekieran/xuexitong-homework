@@ -8,8 +8,10 @@ not closed, so the review window remains available.
 from __future__ import annotations
 
 import html
+import mimetypes
 import re
 import time
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
@@ -169,6 +171,60 @@ def _fill_essay(root, value, editor_name=None):
     return '未识别到可验证的文本编辑器，请在原网页填写'
 
 
+def _attachment_tokens(markup):
+    """Count real attachment references, including duplicate uploads of one file."""
+    result = Counter()
+    for node in dom.parse(markup or '').all():
+        if node.tag not in {'iframe', 'a', 'img', 'audio', 'video'}:
+            continue
+        identity = node.attrs.get('objectid') or node.attrs.get('href' if node.tag == 'a' else 'src')
+        if not identity or identity.startswith(('blob:', 'data:', 'javascript:')):
+            continue
+        name = node.attrs.get('filename') or node.attrs.get('title') or (dom.clean_text(node) if node.tag == 'a' else '')
+        result[(node.tag, identity, name)] += 1
+    return result
+
+
+def _attachment_inserted(root, before, name):
+    editors = _editor_info(root, None)
+    if len(editors) != 1 or not editors[0]['ready']:
+        return '附件编辑器尚未就绪，请在原网页检查'
+    added = _attachment_tokens(editors[0]['html']) - before
+    image = (mimetypes.guess_type(name)[0] or '').startswith('image/')
+    matching = [token for token in added if token[2] == name or (image and token[0] == 'img' and not token[2])]
+    if not matching:
+        return '本次附件尚未写入答案，请在原网页检查'
+    # Use only the platform editor's own events/sync API; never assign a hidden
+    # answer field or call a save/submit endpoint ourselves.
+    mirrored = root.evaluate("""root => {
+        const all=[...Object.values(window.UE?.instants||{}),...Object.values(window.UE?.instances||{})];
+        if(window.ueditor) all.push(window.ueditor);
+        const found=[...new Set(all)].filter(e=>e&&e.body&&
+            ((e.container&&root.contains(e.container))||(e.iframe&&root.contains(e.iframe))));
+        if(found.length!==1 || !found[0].body.isContentEditable) return null;
+        const e=found[0];
+        if(typeof e.fireEvent==='function') { e.fireEvent('contentchange'); e.fireEvent('blur'); }
+        if(typeof e.sync==='function') e.sync();
+        const names=[e.key,e.textarea?.id,e.textarea?.name].filter(Boolean);
+        const fields=[...root.querySelectorAll('textarea,input')].filter(n=>names.includes(n.id)||names.includes(n.name));
+        const field=e.textarea || (fields.length===1 ? fields[0] : null);
+        return field && root.contains(field) ? field.value : null;
+    }""")
+    saved = _attachment_tokens(mirrored)
+    if not any(saved[token] >= before[token] + 1 for token in matching):
+        return '附件已上传但平台表单未同步，请在原网页检查'
+    return None
+
+
+def _wait_for_attachment(root, before, name, timeout=30):
+    deadline = time.monotonic() + timeout
+    while True:
+        reason = _attachment_inserted(root, before, name)
+        if reason is None or time.monotonic() >= deadline:
+            return reason
+        root.page.wait_for_timeout(200)
+
+
 def _fill_attachments(root, files, local_files=None):
     """Select saved local files in the question's native upload control.
 
@@ -182,27 +238,43 @@ def _fill_attachments(root, files, local_files=None):
     paths = [str(item.get('path', '')) for item in local_files if isinstance(item, dict) and item.get('path')]
     if len(paths) != len(files):
         return '本机附件不可用，请重新添加附件'
+    # Prefer the attachment toolbar to unrelated file inputs in an editor.
+    toolbar = root.locator('.edui-for-attachment_new')
+    visible_toolbar = [toolbar.nth(i) for i in range(toolbar.count()) if toolbar.nth(i).is_visible()]
+    if len(visible_toolbar) == 1 and len(files) > 1:
+        # Each callback closes the dialog; later files need a fresh picker.
+        for info, local in zip(files, local_files):
+            reason = _fill_attachments(root, [info], [local])
+            if reason:
+                return reason
+        return None
+    payloads = [{'name': str(info.get('name') or Path(path).name),
+                 'mimeType': mimetypes.guess_type(str(info.get('name') or path))[0] or 'application/octet-stream',
+                 'buffer': Path(path).read_bytes()} for info, path in zip(files, paths)]
     inputs = root.locator('input[type="file"]')
-    if inputs.count():
+    if inputs.count() and not visible_toolbar:
         try:
             if inputs.count() == 1:
-                inputs.first.set_input_files(paths)
+                inputs.first.set_input_files(payloads)
             elif inputs.count() == len(paths):
-                for i, path in enumerate(paths):
-                    inputs.nth(i).set_input_files(path)
+                for i, payload in enumerate(payloads):
+                    inputs.nth(i).set_input_files(payload)
             else:
                 return '附件上传控件数量不匹配，请在原网页上传'
         except Exception:
             return '附件上传控件操作失败，请在原网页上传'
-        return None
+        selected = inputs.evaluate_all("els => els.flatMap(e=>[...e.files].map(f=>f.name))")
+        return None if Counter(selected) == Counter(p['name'] for p in payloads) else '附件未被上传控件接受，请在原网页检查'
 
     # Chaoxing's essay/upload questions use UEditor.  Its attachment picker is
     # created only after clicking the toolbar button and lives in a dialog
     # iframe outside the question's file-input subtree.
-    toolbar = root.locator('.edui-for-attachment_new')
-    visible_toolbar = [toolbar.nth(i) for i in range(toolbar.count()) if toolbar.nth(i).is_visible()]
     if len(visible_toolbar) != 1:
         return '未找到附件上传控件，请在原网页上传'
+    editors = _editor_info(root, None)
+    if len(editors) != 1 or not editors[0]['ready']:
+        return '未找到可编辑的附件答案区域，请在原网页检查'
+    before = _attachment_tokens(editors[0]['html'])
     try:
         page = root.page
         visible_toolbar[0].click()
@@ -217,36 +289,22 @@ def _fill_attachments(root, files, local_files=None):
         # into the editor from its uploadSuccess callback, and has no separate
         # upload/confirm button.  Detect this picker before falling back to
         # the legacy queue dialog so the file is selected only once.
+        # Wait for whichever picker this dialog actually creates. Waiting for
+        # the modern-only selector costs a full timeout in a legacy dialog.
+        frame.locator('input[type=file]').first.wait_for(state='attached', timeout=5000)
         modern_picker = frame.locator('#pickfiles input[type=file]')
-        try:
-            modern_picker.first.wait_for(state='attached', timeout=5000)
-        except Exception:
-            pass
         if modern_picker.count() != 1:
             modern_picker = frame.locator('#pickfiles2 input[type=file]')
         if modern_picker.count() == 1:
-            modern_picker.set_input_files(paths)
-            expected = len(paths)
-            deadline = time.monotonic() + 30
-            while time.monotonic() < deadline:
-                try:
-                    uploaded = frame.locator('body').evaluate("""(body, expected) => {
-                        const value = typeof fileArr !== 'undefined' ? fileArr : [];
-                        return Array.isArray(value) ? value.length : 0;
-                    }""", expected)
-                except Exception:
-                    # addFileToEditor() closes this iframe after inserting the
-                    # attachment, so a detached frame is itself a possible
-                    # success signal.  Verify the editor before accepting it.
-                    current = _editor_info(root, None)
-                    if len(current) == 1 and _rich_media(current[0]['html']):
-                        return None
-                    uploaded = 0
-                if int(uploaded or 0) >= expected:
-                    break
-                page.wait_for_timeout(200)
-            else:
-                return '附件上传超时，请在原网页检查'
+            try:
+                modern_picker.set_input_files(payloads, timeout=5000)
+            except Exception:
+                # A successful callback can detach this frame during selection.
+                # Never repeat the upload; verify the owning editor/form instead.
+                pass
+            reason = _wait_for_attachment(root, before, payloads[0]['name'])
+            if reason:
+                return reason
 
             # addFileToEditor() in this skin closes its own dialog after
             # inserting the attachment.  Older variants leave it open, so
@@ -261,21 +319,14 @@ def _fill_attachments(root, files, local_files=None):
                     return '未找到附件窗口关闭按钮，请在原网页检查'
                 close_button.click()
                 page.wait_for_timeout(300)
-            current = _editor_info(root, None)
-            if len(current) != 1 or not _rich_media(current[0]['html']):
-                return '附件已上传但编辑器未回读，请在原网页检查'
-            return None
+            return _attachment_inserted(root, before, payloads[0]['name'])
 
         picker = frame.locator('#filePickerBtn input[type="file"]')
-        try:
-            picker.wait_for(state='attached', timeout=5000)
-        except Exception:
-            pass
         if picker.count() != 1:
             picker = frame.locator('input[type="file"]').first
         if picker.count() != 1:
             return '未找到附件选择控件，请在原网页上传'
-        picker.set_input_files(paths)
+        picker.set_input_files(payloads)
 
         upload = frame.locator('#queueList .btns .uploadBtn')
         if upload.count() != 1:
@@ -298,8 +349,7 @@ def _fill_attachments(root, files, local_files=None):
         if ok.count() != 1:
             return '未找到附件确认按钮，请在原网页检查'
         ok.click()
-        page.wait_for_timeout(300)
-        return None
+        return _wait_for_attachment(root, before, payloads[0]['name'])
     except Exception:
         return '附件上传控件操作失败，请在原网页上传'
 
@@ -558,7 +608,7 @@ def _identity_matches(record, markup, url):
     return bool(expected and actual and expected & actual)
 
 
-def _deadline_reason(record):
+def _deadline_reason(record, defer_missing=False):
     if record.get('availability') == 'closed':
         return '平台已关闭此作业，未填入'
     status = record.get('status', '')
@@ -570,6 +620,8 @@ def _deadline_reason(record):
     if not deadline:
         if any(record.get(key) in {'none', 'no_deadline', 'unlimited'} for key in ('deadline_kind', 'deadline_state', 'deadline_status')):
             return None
+        if defer_missing:
+            return None
         return '截止时间尚未核实，请先刷新'
     try:
         dt = datetime.fromisoformat(str(deadline).replace('Z', '+00:00'))
@@ -579,6 +631,52 @@ def _deadline_reason(record):
     except (ValueError, TypeError):
         return '截止时间格式无法核实，请先刷新'
     return None
+
+
+def _attachment_page_editable(page, questions, answers):
+    """Missing dates require live proof for every answer being filled."""
+    found = False
+    by_id = {str(q['id']): q for q in questions}
+    for qid, saved in answers.items():
+        if not isinstance(saved, dict) or not (saved.get('files') or saved.get('value') not in (None, '', [])):
+            continue
+        question = by_id.get(str(qid))
+        if not question or question.get('type') != 'essay' or not saved.get('files') or saved.get('signature') != question.get('signature'):
+            return False
+        root = _root_for(page, qid)
+        if root is None:
+            return False
+        editors = _editor_info(root)
+        toolbar = root.locator('.edui-for-attachment_new')
+        if len(editors) != 1 or not editors[0]['ready'] or sum(toolbar.nth(i).is_visible() for i in range(toolbar.count())) != 1:
+            return False
+        found = True
+    return found
+
+
+def _open_fill_context(playwright, backend, timeout=12):
+    """Wait for the dedicated browser instead of opening a disposable fallback."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            browser = playwright.chromium.connect_over_cdp(backend.CHAOXING_CDP_URL, timeout=1000)
+        except Exception:
+            if time.monotonic() >= deadline:
+                raise RuntimeError('尚未连接到专用学习通窗口，请重新打开后再填入。')
+            time.sleep(.25)
+            continue
+        backend.runtime.verify_browser_profile(browser)
+        if not browser.contexts:
+            if time.monotonic() >= deadline:
+                raise RuntimeError('专用学习通窗口尚未就绪，请重新打开后再填入。')
+            time.sleep(.25)
+            continue
+        context = browser.contexts[0]
+        state = backend.read_json(backend.DATA_DIR / 'browser_session.json', {})
+        if state.get('cookies'):
+            context.add_cookies(state['cookies'])
+        backend.CONNECTED_BROWSER = browser
+        return context
 
 
 def open_assignment(key):
@@ -633,11 +731,13 @@ def _fill_assignment(key):
     url = _entry(record)
     if not _identities(record):
         return {'filled': [], 'skipped': [], 'message': '作业身份尚未核实，请先刷新。'}
+    has_attachments = any(isinstance(v, dict) and v.get('files') for v in answers.values())
     from playwright.sync_api import sync_playwright
     b.ensure_chrome(url, app=False)
     with sync_playwright() as p:
-        context = b.open_context(p, headless=False)
+        context = None
         try:
+            context = _open_fill_context(p, b)
             # Never create a disposable browser whose closure would discard the
             # filled answers. The dedicated Chrome must remain connected via CDP.
             if b.CONNECTED_BROWSER is None:
@@ -653,7 +753,7 @@ def _fill_assignment(key):
             if _read_only_url(detail_final):
                 return {'filled': [], 'skipped': [], 'message': '作业详情为只读查看页面，未填入。'}
             b.update_metadata(record, detail, detail_final)
-            reason = _deadline_reason(record)
+            reason = _deadline_reason(record, defer_missing=has_attachments)
             if reason:
                 return {'filled': [], 'skipped': [], 'message': reason}
             matches = [existing for existing in context.pages if existing.url == url]
@@ -667,7 +767,7 @@ def _fill_assignment(key):
             if not _identity_matches(record, markup, page.url):
                 return {'filled': [], 'skipped': [], 'message': '作业身份与已保存答案不一致，已停止填入。'}
             b.update_metadata(record, markup, page.url)
-            reason = _deadline_reason(record)
+            reason = _deadline_reason(record, defer_missing=has_attachments)
             if reason:
                 return {'filled': [], 'skipped': [], 'message': reason}
             # A report/review page must never receive answer writes.
@@ -684,7 +784,7 @@ def _fill_assignment(key):
                     if dom.is_login(markup, page.url) or _read_only_url(page.url) or not _identity_matches(record, markup, page.url):
                         return {'filled': [], 'skipped': [], 'message': '作答页面的登录或作业身份校验未通过，未填入。'}
                     b.update_metadata(record, markup, page.url)
-                    reason = _deadline_reason(record)
+                    reason = _deadline_reason(record, defer_missing=has_attachments)
                     if reason:
                         return {'filled': [], 'skipped': [], 'message': reason}
                     questions = dom.parse_questions(markup, page.url)
@@ -706,6 +806,12 @@ def _fill_assignment(key):
             # Reparse the actual displayed question immediately before matching.
             markup = page.content()
             questions = dom.parse_questions(markup, page.url)
+            # Deferring the missing date only opens the page. It does not grant
+            # permission to write until this exact attachment editor is ready.
+            reason = _deadline_reason(record)
+            if reason and not (has_attachments and _deadline_reason(record, defer_missing=True) is None and
+                               _attachment_page_editable(page, questions, answers)):
+                return {'filled': [], 'skipped': [], 'message': reason}
             # Keep the persisted draft format unchanged.  The extra local file
             # paths only live for this fill operation and are never returned to
             # the UI or written back to disk.
@@ -723,4 +829,5 @@ def _fill_assignment(key):
         except Exception as exc:
             return {'filled': [], 'skipped': [], 'message': '打开或填入失败：' + b.safe_error(exc)}
         finally:
-            b.close_context(context)
+            if context is not None:
+                b.close_context(context)
