@@ -228,7 +228,8 @@ def workspace_snapshot():
             record['capabilities'] = workspace.capabilities(record)
             records.append(record)
     return {'assignments': records, 'record_aliases': state.get('record_aliases', {}),
-            'last_success': state.get('last_success'), 'last_stats': state.get('last_stats'),
+            'last_success': state.get('last_success'), 'last_check': state.get('last_check'),
+            'last_stats': state.get('last_stats'),
             'dashboard': workspace.dashboard(records)}
 
 def assignment(key):

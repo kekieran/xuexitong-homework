@@ -15,7 +15,7 @@ const NO_SUBMIT = '填入后请在学习通核对并提交。';
 const S = {
   records: [], aliases: {}, key: null, group: 'active', sub: 'all',
   progressFilter: 'all', dueFilter: 'all',
-  loaded: false, loadError: null, lastSuccess: null, warnings: [],
+  loaded: false, loadError: null, lastSuccess: null, lastCheck: null, warnings: [],
   job: {busy: false, action: '', message: ''}, jobKey: null, revision: -1,
   auth: null, reminder: null, online: navigator.onLine, serverLost: false,
   selecting: 0, printed: null, statusMemo: '', exited: false,
@@ -25,6 +25,7 @@ const draftChanges = new Map();
 let loginPhase = 'form', loginError = '';
 let fillPhase = 'check', fillResult = null;
 let accountMenuOpen = false;
+let warningDismissal;
 
 /* ---------- Small helpers ---------- */
 const ICONS = {
@@ -671,6 +672,22 @@ function banner(tone, iconName, title, text, actions = []) {
   }
   return b;
 }
+function visibleUpdateWarnings() {
+  if (warningDismissal === undefined) {
+    try {
+      const value = JSON.parse(sessionStorage.getItem('homework-update-warning-dismissal') || 'null');
+      warningDismissal = value && Array.isArray(value.warnings) ? value : null;
+    } catch { warningDismissal = null; }
+  }
+  const warnings = (S.warnings || []).map(String);
+  if (warningDismissal?.update !== (S.lastCheck || S.lastSuccess || '')) return warnings;
+  return warnings.filter(w => !warningDismissal.warnings.includes(w));
+}
+function dismissUpdateWarnings() {
+  warningDismissal = {update: S.lastCheck || S.lastSuccess || '', warnings: (S.warnings || []).map(String)};
+  try { sessionStorage.setItem('homework-update-warning-dismissal', JSON.stringify(warningDismissal)); } catch {}
+  renderStatus(true);
+}
 function renderBanners() {
   const box = $('#banners');
   box.replaceChildren();
@@ -686,20 +703,26 @@ function renderBanners() {
     const detail = S.job.message && S.job.message !== '正在处理…' && S.job.message !== label ? S.job.message : '';
     box.append(banner('busy', 'loader', label + '…', detail));
   }
-  if (S.warnings?.length && S.loaded && !S.job.busy) {
+  const warnings = visibleUpdateWarnings();
+  if (warnings.length && S.loaded && !S.job.busy) {
     const b = el('div', 'banner warn');
     b.append(icon('alert'));
     const d = el('details', 'banner-text');
-    d.append(el('summary', '', `上次更新有 ${S.warnings.length} 项未读取成功`));
+    d.append(el('summary', '', `上次更新有 ${warnings.length} 项未读取成功`));
     const ul = el('ul');
-    for (const w of S.warnings) ul.append(el('li', '', String(w)));
+    for (const w of warnings) ul.append(el('li', '', w));
     d.append(ul);
     b.append(d);
+    const actions = el('div', 'banner-actions');
+    const close = btn('关闭', 'btn-sm btn-ghost', dismissUpdateWarnings, 'x');
+    close.setAttribute('aria-label', '关闭本次读取失败提示');
+    actions.append(close);
+    b.append(actions);
     box.append(b);
   }
 }
 function renderStatus(force = false) {
-  const memo = JSON.stringify([S.job.busy, S.job.action, S.job.message, S.jobKey, S.auth, S.reminder, S.online, S.serverLost, S.loaded, S.lastSuccess, S.warnings?.length, S.key]);
+  const memo = JSON.stringify([S.job.busy, S.job.action, S.job.message, S.jobKey, S.auth, S.reminder, S.online, S.serverLost, S.loaded, S.lastSuccess, S.lastCheck, S.warnings, warningDismissal, S.key]);
   if (!force && memo === S.statusMemo) return;
   S.statusMemo = memo;
   renderAccount();
@@ -1944,6 +1967,7 @@ async function load() {
   S.aliases = data.record_aliases || {};
   for (const r of S.records) if (r.group === 'history') discardHistoryDraft(r.key);
   S.lastSuccess = data.last_success;
+  S.lastCheck = data.last_check;
   S.warnings = data.last_stats?.warnings || [];
   S.loaded = true;
   S.loadError = null;

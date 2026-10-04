@@ -3,6 +3,7 @@
 Never sweep a directory. Shared references in surviving records/drafts protect
 files, and unreferenced uploads are not cleanup candidates.
 """
+from collections import Counter
 from copy import deepcopy
 from html.parser import HTMLParser
 from pathlib import Path
@@ -140,12 +141,43 @@ def references(value):
     return found
 
 
+def _clear_completed_warnings(state):
+    """Remove only warnings attributable to a user's completion marks."""
+    stats = state.get('last_stats') or {}
+    warnings = stats.get('warnings') or []
+    if not warnings:
+        return
+    completed, remaining = Counter(), Counter()
+    overrides = engine.local_overrides()
+    aliases = state.get('record_aliases', {})
+    for key, record in state.get('assignments', {}).items():
+        error = record.get('content_error')
+        if not error:
+            continue
+        canonical = engine.resolve_alias(aliases, key)
+        counts = completed if overrides.get(canonical, {}).get('completed') else remaining
+        counts[f'{record.get("course")}：{error}'] += 1
+    # Several assignments can produce the same course/error string. Keep the
+    # copies still needed by unfinished assignments, even if errors were cached.
+    current = Counter(w for w in warnings if isinstance(w, str))
+    remove = {w: min(count, max(0, current[w] - remaining[w])) for w, count in completed.items()}
+    kept = []
+    for warning in warnings:
+        if isinstance(warning, str) and remove.get(warning, 0):
+            remove[warning] -= 1
+        else:
+            kept.append(warning)
+    stats['warnings'] = kept
+
+
 def plan_cleanup():
     """Read-only plan. Caller holds state/draft locks for an executable plan."""
     state = engine.read_json(engine.STATE_FILE, {'assignments': {}})
     drafts = engine.read_json(engine.DRAFTS_FILE, {})
     next_state, next_drafts = deepcopy(state), deepcopy(drafts)
     aliases = state.get('record_aliases', {})
+    # The original error must be matched before history compaction drops it.
+    _clear_completed_warnings(next_state)
 
     def canonical(key):
         return engine.resolve_alias(aliases, key)
