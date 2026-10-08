@@ -11,6 +11,7 @@
 <script src="/ai.js" defer></script>
 </head>
 <body>
+<div id="rail" class="rail" aria-hidden="true" hidden><i></i></div>
 <div id="app" class="app" data-view="list">
 
   <aside class="sidebar" aria-label="作业导航">
@@ -19,11 +20,14 @@
         <svg class="spark" viewBox="0 0 24 24" aria-hidden="true"><g stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M12 3v6.2"/><path d="M12 14.8V21"/><path d="M3 12h6.2"/><path d="M14.8 12H21"/><path d="M5.6 5.6l4.4 4.4"/><path d="M14 14l4.4 4.4"/><path d="M18.4 5.6L14 10"/><path d="M10 14l-4.4 4.4"/></g></svg>
         <span class="brand-name">作业助手</span>
       </div>
-      <button id="refresh" class="btn btn-ghost icon-only" type="button" title="刷新作业" aria-label="刷新作业"></button>
     </div>
 
     <nav class="side-nav" aria-label="主导航">
       <button id="home" class="nav-item" type="button"><span data-icon="home"></span><span>首页</span></button>
+      <div class="nav-row">
+        <button id="refresh" class="nav-item" type="button" title="刷新全部作业" aria-label="刷新全部作业"></button>
+        <span id="sync-badge" class="sync-badge" role="status" aria-live="polite"></span>
+      </div>
     </nav>
 
     <div class="side-tools">

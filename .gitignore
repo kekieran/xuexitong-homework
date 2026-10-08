@@ -1,0 +1,107 @@
+# ==============================
+# Python 环境和缓存
+# ==============================
+
+/.venv/
+/.venv-backup-*/
+/.venv-failed-*/
+
+__pycache__/
+*.py[cod]
+*.pyo
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ==============================
+# Chrome 浏览器配置、登录数据和缓存
+# ==============================
+
+/browser_profile*/
+/chrome_profile*/
+/browser_data*/
+/chrome_data*/
+
+# Chrome 数据库、缓存和模型文件
+*.db
+*.db-wal
+*.db-shm
+*.tflite
+
+# ==============================
+# 作业数据、答案和本地附件
+# ==============================
+
+/homework_content/
+/answer_attachments/
+/backups/
+/data/
+
+state*.json
+answer_drafts.json
+latest_assignments.txt
+
+# ==============================
+# 本地运行状态、锁和日志
+# ==============================
+
+ui_runtime.json
+ui_notification.json
+ui_settings.json
+.environment-setup.lock
+*.log
+*.pid
+
+# ==============================
+# 临时文件
+# ==============================
+
+*.tmp
+*.temp
+*.bak
+*.old
+*.orig
+
+# ==============================
+# 下载的网页和本地抓取文件
+# ==============================
+
+bd.html
+csdn.html
+
+# ==============================
+# 个人说明和账号相关文档
+# ==============================
+
+/学习通作业助手_记忆文件.md
+/学习通作业助手_项目交接文档*.md
+
+# ==============================
+# Windows 和编辑器文件
+# ==============================
+
+Thumbs.db
+Desktop.ini
+.vscode/
+.idea/
+/.claude/
+
+# 本机加密的登录凭据（即使移动过目录也不提交）
+login_credentials.bin
+
+
+codex_queue.json
+
+# 本地验证脚本与协作工具配置
+/tests/
+/AGENTS.md
+/.agents/
+/.codex/
+/.aws/
+
+# 本机环境变量和密钥配置
+.env
+.env.*

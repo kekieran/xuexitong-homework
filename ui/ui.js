@@ -19,7 +19,11 @@ const S = {
   job: {busy: false, action: '', message: ''}, jobKey: null, revision: -1,
   auth: null, reminder: null, online: navigator.onLine, serverLost: false,
   selecting: 0, printed: null, statusMemo: '', exited: false,
+  // Refresh feedback: when the running job began, how the last refresh ended,
+  // and which records the last refresh added or changed (key -> timestamp).
+  jobStart: 0, outcome: null, fresh: null, diff: null,
 };
+const OUTCOME_MS = 4500, FRESH_MS = 4200;
 const drafts = new Map(), dirty = new Map(), timers = new Map(), saving = new Map(), saveState = new Map();
 const draftChanges = new Map();
 let loginPhase = 'form', loginError = '';
@@ -39,6 +43,7 @@ const ICONS = {
   alert: '<path d="M12 4l9 16H3z"/><path d="M12 10v4"/><path d="M12 17.5v.01"/>',
   info: '<circle cx="12" cy="12" r="9"/><path d="M12 11v5"/><path d="M12 8v.01"/>',
   x: '<path d="M6 6l12 12M18 6L6 18"/>',
+  xcircle: '<circle cx="12" cy="12" r="9"/><path d="M9.2 9.2l5.6 5.6M14.8 9.2l-5.6 5.6"/>',
   bell: '<path d="M6 16v-5a6 6 0 0 1 12 0v5l1.5 2h-15z"/><path d="M10 20a2 2 0 0 0 4 0"/>',
   file: '<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/>',
   pen: '<path d="M4 20h4L19 9l-4-4L4 16z"/><path d="M13.5 6.5l4 4"/>',
@@ -111,16 +116,37 @@ function externalLink(href, label, cls = 'link-chip') {
   a.append(icon('external'), el('span', '', label));
   return a;
 }
-function toast(message, tone = '') {
+// Long one-line messages read better as a short headline plus a detail line.
+function splitMessage(text) {
+  let m = text.match(/^(.{2,30}?)[：:]\s*(\S[\s\S]*)$/) || text.match(/^(.{2,}?)\s·\s(.+)$/) || text.match(/^([^。]{4,}?)。(\S[\s\S]*)$/);
+  return m ? [m[1], m[2]] : [text, ''];
+}
+const TOAST_LIFE = {error: 8000, warn: 5500, ok: 3200, '': 3200};
+function toast(message, tone = '', opts = {}) {
   const box = $('#toasts');
   // The same message twice in a row replaces the first instead of stacking.
   for (const old of box.children) if (old.dataset.message === message) old.remove();
-  const t = el('div', 'toast ' + tone);
+  const [title, detail] = opts.title ? [opts.title, opts.detail || ''] : splitMessage(message);
+  const t = el('div', 'toast ' + tone), mark = el('span', 'toast-mark'), body = el('div', 'toast-body');
   t.dataset.message = message;
   t.setAttribute('role', tone === 'error' ? 'alert' : 'status');
-  t.append(icon(tone === 'error' ? 'alert' : tone === 'warn' ? 'info' : 'check'), el('span', '', message));
-  const dismiss = () => { t.classList.add('leaving'); setTimeout(() => t.remove(), 200); };
-  if (tone === 'error' || tone === 'warn') {
+  mark.append(icon(tone === 'error' ? 'xcircle' : tone === 'warn' ? 'alert' : 'check'));
+  body.append(el('div', 'toast-title', title));
+  if (detail) body.append(el('div', 'toast-detail', detail));
+  t.append(mark, body);
+  let remaining = opts.duration || TOAST_LIFE[tone] || 3200, started = 0, timer = 0, gone = false;
+  const dismiss = () => {
+    if (gone) return;
+    gone = true; clearTimeout(timer);
+    t.style.maxHeight = t.offsetHeight + 'px';
+    requestAnimationFrame(() => { t.classList.add('leaving'); t.style.maxHeight = '0px'; });
+    setTimeout(() => t.remove(), 260);
+  };
+  if (opts.action) {
+    const act = btn(opts.action.label, 'btn-sm toast-action', () => { dismiss(); opts.action.onClick(); });
+    t.append(act);
+  }
+  if (tone === 'error' || tone === 'warn' || opts.action) {
     const x = el('button', 'toast-x');
     x.type = 'button';
     x.setAttribute('aria-label', '关闭提示');
@@ -128,9 +154,19 @@ function toast(message, tone = '') {
     x.onclick = dismiss;
     t.append(x);
   }
+  // The countdown hairline and the dismiss timer pause together while hovered.
+  const bar = el('i', 'toast-timer');
+  bar.style.animationDuration = remaining + 'ms';
+  t.append(bar);
+  const run = () => { started = Date.now(); timer = setTimeout(dismiss, remaining); t.classList.remove('paused'); };
+  const hold = () => { if (gone || !started) return; clearTimeout(timer); remaining -= Date.now() - started; started = 0; t.classList.add('paused'); };
+  t.addEventListener('mouseenter', hold);
+  t.addEventListener('focusin', hold);
+  t.addEventListener('mouseleave', () => { if (!gone && !started && !t.matches(':focus-within')) run(); });
+  t.addEventListener('focusout', () => { if (!gone && !started && !t.matches(':hover')) run(); });
   box.append(t);
   while (box.children.length > 3) box.firstChild.remove();
-  setTimeout(dismiss, tone === 'error' ? 7000 : tone === 'warn' ? 4500 : 2600);
+  run();
 }
 async function api(url, data, raw = false) {
   const opts = {credentials: 'same-origin', cache: 'no-store'};
@@ -520,6 +556,10 @@ function listItem(r) {
   const d = due(r), b = el('button', 'item' + (r.group === 'active' && d.tone === 'urgent' ? ' urgent' : ''));
   b.type = 'button';
   if (r.key === S.key) b.setAttribute('aria-current', 'true');
+  // New or changed since the last refresh: continue the highlight where it was
+  // even if the list is rebuilt mid-animation.
+  const age = S.fresh?.has(r.key) ? Date.now() - S.fresh.get(r.key) : FRESH_MS;
+  if (age < FRESH_MS) { b.classList.add('fresh'); b.style.animationDelay = -age + 'ms'; }
   b.title = `${r.course || '未命名课程'}\n${r.title || '未命名作业'}`;
   b.append(el('span', 'item-title', r.course || '未命名课程'), el('span', 'item-sub', r.title || '未命名作业'));
   const foot = el('span', 'item-foot');
@@ -649,10 +689,60 @@ function renderSyncLine() {
   } else {
     line.append(el('span', '', S.lastSuccess ? '更新于 ' + stamp(S.lastSuccess) : '尚未更新'));
   }
-  const refresh = $('#refresh');
-  refresh.replaceChildren(icon(S.job.busy && S.job.action === 'refresh' && !S.jobKey ? 'loader' : 'refresh'));
+  const refresh = $('#refresh'), refreshing = S.job.busy && S.job.action === 'refresh' && !S.jobKey;
+  refresh.replaceChildren(icon('refresh', refreshing ? 'spin' : ''), el('span', '', refreshing ? '刷新中…' : '刷新全部'));
+  refresh.classList.toggle('is-busy', refreshing);
+  refresh.setAttribute('aria-busy', String(refreshing));
   refresh.disabled = S.job.busy || !S.online;
-  refresh.title = !S.online ? '网络不可用' : S.job.busy ? '请等待当前操作完成' : '刷新作业';
+  refresh.title = !S.online ? '网络不可用' : refreshing ? '正在刷新作业…' : S.job.busy ? '请等待当前操作完成' : '更新所有课程的作业列表、截止时间和提交状态';
+  $('#assignment-list').classList.toggle('refreshing', refreshing);
+  $('#detail').classList.toggle('is-refreshing', refreshing);
+  setRail(S.job.busy);
+  renderSyncBadge();
+}
+
+/* Thin progress rail along the top edge while any job runs. */
+function setRail(on) {
+  const rail = $('#rail');
+  if (on) { rail.className = 'rail on'; rail.hidden = false; return; }
+  if (rail.hidden || !rail.classList.contains('on')) return;
+  rail.className = 'rail finish';
+  setTimeout(() => { if (rail.classList.contains('finish')) rail.hidden = true; }, 600);
+}
+function elapsedText() {
+  const s = Math.max(0, Math.floor((Date.now() - (S.jobStart || Date.now())) / 1000));
+  return s < 60 ? `${s} 秒` : `${Math.floor(s / 60)} 分 ${pad(s % 60)} 秒`;
+}
+// Short status next to the refresh button: running time, last result, or last update.
+function renderSyncBadge() {
+  const badge = $('#sync-badge');
+  const refreshing = S.job.busy && S.job.action === 'refresh' && !S.jobKey;
+  const recent = S.outcome && Date.now() - S.outcome.at < OUTCOME_MS ? S.outcome : null;
+  let tone = '', iconName = '', text = '', hint = '';
+  if (refreshing) { tone = 'busy'; text = elapsedText(); hint = '正在从学习通读取作业'; }
+  else if (!S.online) { tone = 'warn'; iconName = 'offline'; text = '网络不可用'; }
+  else if (recent) {
+    tone = recent.tone;
+    iconName = recent.tone === 'ok' ? 'check' : 'alert';
+    text = recent.tone === 'ok' ? '已更新' : recent.tone === 'warn' ? '部分未更新' : '刷新失败';
+  } else if (S.loaded && S.lastSuccess) {
+    const d = parseDate(S.lastSuccess);
+    if (d) { text = '更新于 ' + (dayLabel(d) === '今天' ? hm(d) : dayLabel(d)); hint = '上次更新：' + stamp(S.lastSuccess); }
+  }
+  const sig = tone + '|' + text;
+  if (badge.dataset.sig === sig) return;
+  badge.dataset.sig = sig;
+  badge.className = 'sync-badge ' + tone;
+  badge.title = hint;
+  badge.replaceChildren(...(iconName ? [icon(iconName)] : []), ...(text ? [el('span', '', text)] : []));
+}
+// Keeps the "已用 N 秒" counters ticking without re-rendering anything else.
+function tickElapsed() {
+  if (!S.job.busy) return;
+  const text = elapsedText(), slow = Date.now() - S.jobStart > 40000;
+  document.querySelectorAll('[data-elapsed]').forEach(n => { n.textContent = '已用 ' + text; });
+  document.querySelectorAll('.slow-hint').forEach(n => { n.hidden = !slow; });
+  renderSyncBadge();
 }
 
 /* ---------- Banners ---------- */
@@ -660,7 +750,7 @@ const ACTION_LABEL = {refresh: '正在刷新作业', read: '正在读取题目',
 function banner(tone, iconName, title, text, actions = []) {
   const b = el('div', 'banner ' + tone);
   b.setAttribute('role', tone === 'danger' ? 'alert' : 'status');
-  b.append(icon(iconName));
+  b.append(typeof iconName === 'string' ? icon(iconName) : iconName);
   const body = el('div', 'banner-text');
   body.append(el('strong', '', title));
   if (text) body.append(el('span', '', text));
@@ -688,38 +778,73 @@ function dismissUpdateWarnings() {
   try { sessionStorage.setItem('homework-update-warning-dismissal', JSON.stringify(warningDismissal)); } catch {}
   renderStatus(true);
 }
+// Banners are reconciled by key: unchanged ones stay untouched (no flicker, an
+// open "查看" list stays open), changed ones are swapped without replaying the
+// entrance animation, and removed ones disappear at once.
+function syncBanners(items) {
+  const box = $('#banners'), old = new Map([...box.children].map(n => [n.dataset.key, n])), nodes = [];
+  for (const {key, sig, build} of items) {
+    let node = old.get(key);
+    if (!node || node.dataset.sig !== sig) {
+      const next = build();
+      next.dataset.key = key;
+      next.dataset.sig = sig;
+      if (node) { next.classList.add('still'); node.replaceWith(next); }
+      node = next;
+    }
+    old.delete(key);
+    nodes.push(node);
+  }
+  old.forEach(n => n.remove());
+  let cursor = box.firstChild;
+  for (const node of nodes) { if (node === cursor) cursor = cursor.nextSibling; else box.insertBefore(node, cursor); }
+}
+function busyBanner() {
+  const label = S.job.action === 'refresh' && S.jobKey ? ACTION_LABEL.read : ACTION_LABEL[S.job.action] || '正在处理';
+  const detail = S.job.message && S.job.message !== '正在处理…' && S.job.message !== label ? S.job.message : '';
+  const b = banner('busy', spark('icon banner-spark'), label + '…', detail);
+  const slow = el('span', 'slow-hint', '学习通响应较慢，请继续等待。');
+  slow.hidden = Date.now() - S.jobStart <= 40000;
+  b.querySelector('.banner-text').append(slow);
+  const elapsed = el('span', 'banner-meta', '已用 ' + elapsedText());
+  elapsed.dataset.elapsed = '';
+  b.append(elapsed);
+  return b;
+}
+function warningsBanner(warnings) {
+  const b = el('div', 'banner warn');
+  b.append(icon('alert'));
+  const d = el('details', 'banner-text');
+  d.append(el('summary', '', `上次更新有 ${warnings.length} 项未读取成功`));
+  const ul = el('ul');
+  for (const w of warnings) ul.append(el('li', '', w));
+  d.append(ul);
+  b.append(d);
+  const actions = el('div', 'banner-actions');
+  const close = btn('关闭', 'btn-sm btn-ghost', dismissUpdateWarnings, 'x');
+  close.setAttribute('aria-label', '关闭本次读取失败提示');
+  actions.append(close);
+  b.append(actions);
+  return b;
+}
 function renderBanners() {
-  const box = $('#banners');
-  box.replaceChildren();
-  if (S.serverLost) box.append(banner('danger', 'alert', '与助手的连接已中断', '已写的答案保存在本机，请重新打开助手。'));
-  if (!S.online) box.append(banner('warn', 'offline', '网络不可用', '可以继续作答，刷新和填入需要联网。'));
+  const items = [];
+  if (S.serverLost) items.push({key: 'lost', sig: '', build: () => banner('danger', 'alert', '与助手的连接已中断', '已写的答案保存在本机，正在尝试重新连接；长时间没有恢复时，请重新打开助手。')});
+  if (!S.online) items.push({key: 'offline', sig: '', build: () => banner('warn', 'offline', '网络不可用', '可以继续作答，刷新和填入需要联网。')});
   const a = S.auth;
   // Home and sidebar already show the login entry; the banner is for open assignments.
   if (S.key && a && a.state === 'login_required' && !(S.job.busy && S.job.action === 'login')) {
-    box.append(banner('login', 'lock', everLoggedIn() ? '登录已失效' : '尚未登录', '登录后才能读取题目和填入答案。', [btn('登录作业通', 'btn-sm btn-primary', openLogin)]));
+    const ever = everLoggedIn();
+    items.push({key: 'login', sig: String(ever), build: () => banner('login', 'lock', ever ? '登录已失效' : '尚未登录', '登录后才能读取题目和填入答案。', [btn('登录作业通', 'btn-sm btn-primary', openLogin)])});
   }
   if (S.job.busy && S.job.action !== 'login') {
-    const label = S.job.action === 'refresh' && S.jobKey ? ACTION_LABEL.read : ACTION_LABEL[S.job.action] || '正在处理';
-    const detail = S.job.message && S.job.message !== '正在处理…' && S.job.message !== label ? S.job.message : '';
-    box.append(banner('busy', 'loader', label + '…', detail));
+    items.push({key: 'busy', sig: [S.job.action, S.jobKey, S.job.message].join('|'), build: busyBanner});
   }
   const warnings = visibleUpdateWarnings();
   if (warnings.length && S.loaded && !S.job.busy) {
-    const b = el('div', 'banner warn');
-    b.append(icon('alert'));
-    const d = el('details', 'banner-text');
-    d.append(el('summary', '', `上次更新有 ${warnings.length} 项未读取成功`));
-    const ul = el('ul');
-    for (const w of warnings) ul.append(el('li', '', w));
-    d.append(ul);
-    b.append(d);
-    const actions = el('div', 'banner-actions');
-    const close = btn('关闭', 'btn-sm btn-ghost', dismissUpdateWarnings, 'x');
-    close.setAttribute('aria-label', '关闭本次读取失败提示');
-    actions.append(close);
-    b.append(actions);
-    box.append(b);
+    items.push({key: 'warnings', sig: JSON.stringify(warnings), build: () => warningsBanner(warnings)});
   }
+  syncBanners(items);
 }
 function renderStatus(force = false) {
   const memo = JSON.stringify([S.job.busy, S.job.action, S.job.message, S.jobKey, S.auth, S.reminder, S.online, S.serverLost, S.loaded, S.lastSuccess, S.lastCheck, S.warnings, warningDismissal, S.key]);
@@ -736,7 +861,7 @@ function renderStatus(force = false) {
   else if (!S.key) renderWelcome();
   if ($('#login-dialog').open) renderLogin();
   if ($('#fill-dialog').open && fillPhase === 'running') renderFill();
-  if ($('#reminder-dialog').open) renderReminder();
+  if ($('#reminder-dialog').open && !$('#reminder-body').contains(document.activeElement?.closest('input'))) renderReminder();
 }
 
 /* ---------- Home ---------- */
@@ -945,32 +1070,30 @@ function renderDetail(r, draft, keep = false) {
 
   const hero = el('header', 'hero'), top = el('div', 'hero-top'), titles = el('div', 'hero-titles');
   titles.append(el('div', 'hero-course', r.title || '未命名作业'), el('h1', '', r.course || '未命名课程'));
-  top.append(titles, btn('管理作业', 'btn-sm', () => openAssignmentManager(r), 'settings'));
+  const tools = el('div', 'hero-tools');
+  tools.append(btn('管理作业', 'btn-quiet btn-sm', () => openAssignmentManager(r), 'settings'));
+  top.append(titles, tools);
   hero.append(top);
   const facts = el('div', 'facts'), st = statusInfo(r), d = due(r);
   const fact = (text, tone = '', iconName) => { const f = el('span', 'fact ' + tone); if (iconName) f.append(icon(iconName)); f.append(el('span', '', text)); return f; };
-  facts.append(fact(st.label, st.tone));
-  facts.append(fact(live && d.left && d.tone !== 'urgent' ? `${d.text} · ${d.left}` : d.text, !live ? 'muted' : d.tone === 'urgent' ? 'clay' : d.tone === 'unknown' ? 'warn' : '', 'clock'));
+  // 未截止、未提交是待完成作业的默认状态，题目进度在题号导航里，这里只放当前作业独有的信息。
+  const reviewStatus = r.group === 'review' && reviewReasons(r).includes('status');
+  const showStatus = r.group === 'active' ? !!r.local_settings?.completed : r.group === 'review' ? reviewStatus : true;
+  if (showStatus) facts.append(fact(r.group === 'review' ? '提交状态待核实' : st.label, st.tone));
+  const local = r.deadline_source === 'local' && !r.local_settings?.completed ? ' · 自设' : '';
+  const strip = r.group === 'active' && d.tone === 'urgent' && d.left;
+  if (!strip) facts.append(fact(live && d.left && d.tone !== 'urgent' ? `${d.text} · ${d.left}${local}` : d.text + local, !live ? 'muted' : d.tone === 'urgent' ? 'clay' : d.tone === 'unknown' ? 'warn' : '', 'clock'));
   if (live) {
-    if (r.questions?.length) {
-      const p = progressFor(r);
-      facts.append(fact(`${p.answered}/${p.total} 题已作答`, p.state === 'complete' ? 'ok' : '', 'pen'));
-    } else facts.append(fact('题目待读取', 'warn'));
-    if (r.content_last_read) facts.append(fact('读取于 ' + stamp(r.content_last_read), 'muted'));
+    if (!r.questions?.length) facts.append(fact('题目待读取', 'warn'));
+    const meta = el('span', 'fact-meta');
+    if (r.content_last_read) meta.append(el('span', '', '读取于 ' + stamp(r.content_last_read)));
+    facts.append(meta);
   }
   hero.append(facts);
   col.append(hero);
 
   if (!live) {
-    const card = el('div', 'summary-card'), kv = el('dl', 'kv');
-    const row = (k, v) => kv.append(el('dt', '', k), el('dd', '', v));
-    row('课程', r.course || '未命名课程');
-    row('作业', r.title || '未命名作业');
-    row('截止', d.text);
-    row('状态', st.label);
-    if (r.local_settings?.deadline) row('自设截止', stamp(r.local_settings.deadline));
-    card.append(kv);
-    col.append(card, notice('soft', 'info', '', ['历史作业只保留基本信息。']));
+    col.append(notice('soft', 'info', '', ['历史作业只保留基本信息。']));
     detail.replaceChildren(col);
     S.printed = fingerprint(r);
     $('#crumb').textContent = `${GROUPS[r.group]} · ${r.course || '未命名课程'}`;
@@ -979,12 +1102,12 @@ function renderDetail(r, draft, keep = false) {
     return;
   }
 
-  if (r.group === 'active' && d.tone === 'urgent' && d.left) {
-    const strip = el('div', 'deadline-strip'), text = el('div');
-    strip.append(icon('clock'));
-    text.append(el('strong', '', d.left), el('span', '', ` · ${stamp(r.deadline)} 截止`));
-    strip.append(text);
-    col.append(strip);
+  if (strip) {
+    const bar = el('div', 'deadline-strip'), text = el('div');
+    bar.append(icon('clock'));
+    text.append(el('strong', '', d.left), el('span', '', ` · ${stamp(r.deadline)} 截止${local}`));
+    bar.append(text);
+    col.append(bar);
   }
   if (r.group === 'review') {
     const lines = reviewReasons(r).map(x => x === 'deadline' ? '截止时间不确定，不会计入待完成。' : '无法确认是否已提交。');
@@ -992,9 +1115,6 @@ function renderDetail(r, draft, keep = false) {
       btn('设置截止时间', 'btn-sm', () => openAssignmentSettings(r, 'deadline'), 'calendar'),
       btn('标为已完成', 'btn-sm btn-ghost', () => openAssignmentSettings(r, 'completed'), 'check'),
     ]));
-  }
-  if (r.local_settings?.deadline && !r.local_settings?.completed) {
-    col.append(notice('clay', 'calendar', '', ['使用自设截止时间：' + stamp(r.local_settings.deadline)]));
   }
   const warning = el('div'); warning.id = 'content-warning'; col.append(warning);
   const issues = [...new Set([...(r.content_complete === false && r.questions?.length ? [`只读取到 ${r.questions.length} 道题，缺失的题目请在学习通完成。`] : []), ...(r.content_warnings || [])].filter(Boolean))];
@@ -1030,10 +1150,8 @@ function renderDetail(r, draft, keep = false) {
     empty.append(row);
     col.append(empty);
   } else {
-    const nav = el('div', 'qnav'), label = el('div', 'qnav-label'), dots = el('div', 'qnav-dots'), bar = el('div', 'progress');
-    label.id = 'qnav-label';
+    const nav = el('div', 'qnav'), label = el('div', 'qnav-label', '题号'), dots = el('div', 'qnav-dots');
     dots.setAttribute('aria-label', '题号导航');
-    bar.append(el('i'));
     r.questions.forEach((q, i) => {
       const dot = el('button', 'qdot', String(i + 1));
       dot.type = 'button';
@@ -1041,7 +1159,7 @@ function renderDetail(r, draft, keep = false) {
       dot.onclick = () => document.getElementById('q-' + q.id)?.scrollIntoView({block: 'start'});
       dots.append(dot);
     });
-    nav.append(label, dots, bar);
+    nav.append(label, dots);
     col.append(nav);
     r.questions.forEach((q, i) => col.append(questionCard(q, i, draft, r.key, r)));
     const end = el('p', 'end-note');
@@ -1077,10 +1195,17 @@ function watchQuestions() {
 }
 function renderReading(r) {
   const main = $('.main');
-  main.querySelector('.reading')?.remove();
-  if (!(S.job.busy && S.job.action === 'refresh' && S.jobKey === r.key)) return;
-  const overlay = el('div', 'reading'), card = el('div', 'reading-card');
-  card.append(spark(), el('span', '', '正在重新读取题目…' + (S.job.message && S.job.message !== '正在处理…' ? ' ' + S.job.message : '')));
+  const reading = S.job.busy && S.job.action === 'refresh' && S.jobKey === r.key;
+  let overlay = main.querySelector('.reading');
+  if (!reading) { overlay?.remove(); return; }
+  const detail = S.job.message && S.job.message !== '正在处理…' ? S.job.message : '读取完成后会自动更新';
+  if (overlay) { overlay.querySelector('.reading-sub').textContent = detail; return; }
+  overlay = el('div', 'reading');
+  overlay.setAttribute('role', 'status');
+  const card = el('div', 'reading-card'), text = el('div', 'reading-text'), meta = el('span', 'reading-meta', '已用 ' + elapsedText());
+  meta.dataset.elapsed = '';
+  text.append(el('strong', '', '正在重新读取题目…'), el('span', 'reading-sub', detail));
+  card.append(spark('spark reading-spark'), text, meta, el('i', 'reading-bar'));
   overlay.append(card);
   main.append(overlay);
 }
@@ -1102,10 +1227,6 @@ function updateProgress() {
     }
   }
   const total = r.questions.length, percent = Math.round(done * 100 / total);
-  const label = $('#qnav-label');
-  if (label) label.replaceChildren(document.createTextNode('已作答 '), el('b', '', `${done} / ${total}`));
-  const bar = document.querySelector('.qnav .progress i');
-  if (bar) bar.style.width = percent + '%';
   const ring = document.querySelector('.dock .ring');
   if (ring) { ring.style.setProperty('--p', percent); ring.classList.toggle('complete', done === total); }
   const count = $('#dock-count');
@@ -1413,9 +1534,9 @@ function renderDock(r) {
   const sub = el('span', blocker && !busy ? 'warn' : '', blocker && !busy ? '暂不能填入：' + blocker : '填入后需在学习通提交');
   text.append(count, sub);
   progress.append(ring, text);
-  const reread = btn('', 'btn-ghost icon-only', () => startAction('refresh', r.key), busy && act === 'refresh' && mine ? 'loader' : 'refresh');
-  reread.title = '重新读取题目';
-  reread.setAttribute('aria-label', '重新读取题目');
+  const rereading = busy && act === 'refresh' && mine;
+  const reread = btn(rereading ? '读取中…' : '刷新本作业', '', () => startAction('refresh', r.key), rereading ? 'loader' : 'refresh');
+  reread.title = '只重新读取这份作业的题目，不影响其他作业';
   reread.disabled = busy || !S.online;
   const going = busy && mine && ['open', 'fill'].includes(act);
   const open = btn(going ? (act === 'fill' ? '正在填入…' : '正在打开…') : '前往交作业', 'btn-primary', () => goToAssignment(r), going ? 'loader' : 'arrow');
@@ -1457,16 +1578,12 @@ function openAssignmentManager(r) {
   const openItem = manageItem('查看原作业', '在学习通打开这份作业', 'external', () => run('open'));
   openItem.disabled = S.job.busy || !S.online || r.capabilities?.can_open === false;
   list.append(openItem);
-  if (r.group !== 'history') {
-    const reread = manageItem('重新读取题目', '题目有变化时使用', 'refresh', () => run('refresh'));
-    reread.disabled = S.job.busy || !S.online;
-    list.append(reread);
-  }
   body.append(list, el('div', 'manage-group', '本机设置'));
   const local = el('div', 'manage-list');
-  if (!r.local_settings?.completed) local.append(manageItem('标记已完成', '移入历史，并清理题目和答案', 'check', () => settings('completed')));
-  local.append(manageItem('设置截止时间', r.local_settings?.deadline ? '当前：' + stamp(r.local_settings.deadline) : '平台时间不准确时使用', 'calendar', () => settings('deadline')));
-  if (r.local_settings?.completed || r.local_settings?.deadline) local.append(manageItem('修改或撤销本机设置', '恢复跟随学习通的状态', 'undo', () => settings()));
+  const done = !!r.local_settings?.completed, own = r.local_settings?.deadline;
+  if (done) local.append(manageItem('撤销完成标记', '恢复跟随学习通的状态', 'undo', () => settings()));
+  else local.append(manageItem('标记已完成', '移入历史，并清理题目和答案', 'check', () => settings('completed')));
+  local.append(manageItem(own ? '修改截止时间' : '设置截止时间', own ? '当前自设：' + stamp(own) + '，可在其中撤销' : '平台时间不准确时使用', 'calendar', () => settings('deadline')));
   body.append(local);
   dialog.showModal();
 }
@@ -1555,6 +1672,7 @@ async function startAction(name, key = null, extra = {}) {
 function applyJob(job) {
   if (!job) return;
   window.HomeworkAI?.jobChanged(S.job, job);
+  if (job.busy && !S.job.busy) S.jobStart = Date.now();
   S.job = {busy: !!job.busy, action: job.action || '', key: job.key || null, message: job.message || '', result: job.result};
   if (job.auth) {
     S.auth = job.auth;
@@ -1569,12 +1687,22 @@ function onJobDone(job, key) {
   if (job.action === 'ai' || job.action === 'ai-test') return window.HomeworkAI?.jobDone(job);
   if (job.action === 'open') return toast(job.message || (failed ? '打开失败' : '已打开'), failed ? 'error' : 'ok');
   if (job.action === 'refresh') {
-    if (failed) return toast(job.message || '刷新失败', 'error');
+    if (!key) setOutcome(failed ? 'error' : /部分/.test(job.message || '') ? 'warn' : 'ok');
+    if (failed) {
+      const msg = job.message || '刷新失败', named = /刷新失败/.test(msg);
+      return toast(msg, 'error', {title: named ? msg : '刷新失败', detail: named ? '' : msg, action: {label: '重试', onClick: () => startAction('refresh', key)}});
+    }
     if (key) return toast('题目已重新读取', 'ok');
-    const n = S.records.filter(r => r.group === 'active').length, m = S.records.filter(r => r.group === 'review').length;
+    const n = S.records.filter(r => r.group === 'active').length, m = S.records.filter(r => r.group === 'review').length, d = S.diff || {added: 0, changed: 0};
     const partial = /部分/.test(job.message || '');
-    toast(`${job.message || '作业已更新'} · 待完成 ${n} 项${m ? '，待核实 ' + m + ' 项' : ''}`, partial ? 'warn' : 'ok');
+    const detail = [`待完成 ${n} 项`, m && `待核实 ${m} 项`, d.added && `新增 ${d.added} 项`, d.changed && `${d.changed} 项有变动`].filter(Boolean).join('，');
+    toast(job.message || '作业已更新', partial ? 'warn' : 'ok', {title: job.message || '作业已更新', detail});
   }
+}
+function setOutcome(tone) {
+  S.outcome = {tone, at: Date.now()};
+  renderSyncBadge();
+  setTimeout(renderSyncBadge, OUTCOME_MS + 100);
 }
 
 /* ---------- Login ---------- */
@@ -1855,84 +1983,129 @@ function reminderSlots(r) {
 }
 function reminderNextText(r) {
   const slots = reminderSlots(r);
-  if (!slots.length) return '今天的提醒时间已过 · 尚未设置下一次提醒';
+  if (!slots.length) return '尚未设置时间';
   const next = slots[0];
-  const todayCount = slots.filter(slot => slot.day === '今天').length;
-  const prefix = next.day === '今天' ? '今天' : '明天';
-  const passed = todayCount === 0 ? '今天的提醒时间已过；' : '';
-  return `${passed}${prefix} ${next.value} · ${left(next.target - Date.now())} · 今天还会提醒 ${todayCount} 次`;
+  return `下次 ${next.day} ${next.value}`;
 }
-function reminderSlotText(slot) {
-  return `${slot.day === '今天' ? '今天' : '明天'} · ${left(slot.target - Date.now())}`;
+function reminderPeriod(value) {
+  const hour = Number(value.slice(0, 2));
+  return hour < 5 || hour >= 23 ? '深夜' : hour < 11 ? '早上' : hour < 13 ? '中午' : hour < 18 ? '下午' : '晚上';
 }
-async function saveReminder(next, success = '') {
+async function saveReminder(next) {
+  if (S.reminderSaving) return false;
+  S.reminderSaving = true;
+  S.reminderError = '';
+  renderReminder();
   try {
     S.reminder = await api('/api/reminder', next);
-    if (success) toast(success, 'ok');
-    renderReminder();
+    S.reminderSavedAt = Date.now();
     renderReminderRow();
     return true;
   } catch (e) {
-    toast('提醒设置未更改：' + e.message, 'error');
-    renderReminder();
+    S.reminderError = '提醒设置未更改：' + e.message;
     return false;
+  } finally {
+    S.reminderSaving = false;
+    renderReminder();
   }
 }
 function renderReminder() {
   const body = $('#reminder-body'), dialog = $('#reminder-dialog'), r = S.reminder;
   body.replaceChildren(closeButton(dialog), el('div', 'sheet-eyebrow', '本机提醒'));
-  body.append(titled('reminder-title', '作业提醒'));
+  const head = el('div', 'rem-title-row');
+  head.append(titled('reminder-title', '作业提醒'));
+  if (S.reminderSaving) head.append(el('span', 'rem-note', '保存中…'));
+  else if (S.reminderSavedAt && Date.now() - S.reminderSavedAt < 1800) {
+    const saved = el('span', 'rem-saved');
+    saved.append(icon('check'), el('span', '', '已保存'));
+    head.append(saved);
+  }
+  body.append(head);
+  body.append(el('p', 'rem-description', '每天在你设置的时间，提醒还没提交的作业。'));
   if (!r) { body.append(el('p', 'sheet-text', '正在读取提醒状态…')); return; }
-  const row = el('div', 'switch-row'), text = el('div', 'sr-text'), sw = el('button', 'switch');
-  text.append(el('strong', '', r.enabled ? '提醒已开启' : '提醒已关闭'));
-  text.append(el('small', '', '助手运行期间有效：关掉页面仍会提醒；退出助手后停止'));
+
+  const slots = reminderSlots(r), next = slots[0], todayCount = slots.filter(slot => slot.day === '今天').length;
+  const card = el('div', 'rem-status' + (r.enabled ? '' : ' off')), mark = el('span', 'rem-bell'), text = el('div', 'rem-status-text');
+  mark.append(icon('bell'));
+  if (!r.enabled) {
+    text.append(el('small', '', '提醒已关闭'), el('strong', '', '不会再弹出提醒'), el('span', '', '提醒时间已保留，打开后继续生效'));
+  } else if (!next) {
+    text.append(el('small', '', '下次提醒'), el('strong', '', '尚未设置'), el('span', '', '添加一个提醒时间后才会提醒'));
+  } else {
+    text.append(el('small', '', '下次提醒'), el('strong', '', `${next.day} ${next.value}`),
+      el('span', '', `${left(next.target - Date.now())}${todayCount ? ` · 今天还会提醒 ${todayCount} 次` : ' · 今天的提醒已过'}`));
+  }
+  const sw = el('button', 'switch');
   sw.type = 'button';
   sw.setAttribute('role', 'switch');
   sw.setAttribute('aria-checked', String(r.enabled));
   sw.setAttribute('aria-label', '作业提醒');
-  sw.onclick = async () => {
-    sw.disabled = true;
-    await saveReminder({enabled: !r.enabled, times: r.times}, r.enabled ? '作业提醒已关闭' : '作业提醒已开启');
-  };
-  row.append(text, sw);
-  body.append(row);
-  if (!r.enabled) return;
+  sw.disabled = !!S.reminderSaving;
+  sw.onclick = async () => { sw.disabled = true; await saveReminder({enabled: !r.enabled, times: r.times}); };
+  card.append(mark, text, sw);
+  body.append(card);
 
-  const slots = reminderSlots(r);
-  const schedule = el('section', 'reminder-schedule'), head = el('div', 'reminder-section-head');
-  head.append(el('strong', '', '提醒时间'), el('span', '', `${(r.times || []).length} / ${r.max_times || 12}`));
-  schedule.append(head);
+  const wrap = el('div', 'rem-body' + (r.enabled ? '' : ' off'));
+  const schedule = el('section', 'rem-section'), count = el('div', 'rem-head');
+  count.append(el('strong', '', '提醒时间'), el('span', 'rem-count', `${(r.times || []).length} / ${r.max_times || 12}`));
+  schedule.append(count);
   const list = el('div', 'reminder-time-list');
   (r.times || []).forEach((value, index) => {
-    const item = el('div', 'reminder-time-item'), input = el('input', 'input');
-    input.type = 'time'; input.value = value; input.setAttribute('aria-label', `提醒时间 ${index + 1}`);
+    const item = el('div', 'reminder-time-item'), input = el('input', 'rem-time');
+    input.type = 'time'; input.value = value; input.disabled = !r.enabled || S.reminderSaving; input.setAttribute('aria-label', `提醒时间 ${index + 1}`);
     input.onchange = async () => {
+      if (!input.value) { input.value = value; return; }
+      if (r.times.some((time, i) => i !== index && time === input.value)) {
+        S.reminderError = '这个时间已经添加过了。'; renderReminder(); return;
+      }
       const times = [...r.times]; times[index] = input.value;
-      await saveReminder({enabled: true, times}, '提醒时间已保存');
+      await saveReminder({enabled: true, times});
     };
-    const meta = el('span', 'reminder-time-meta', reminderSlotText(slots.find(slot => slot.value === value) || {day: '今天', target: new Date()}));
+    const slot = slots.find(s => s.value === value);
+    const meta = el('span', 'reminder-time-meta', `${reminderPeriod(value)} · ${r.enabled && slot ? `${slot.day}提醒` : '每天'}`);
     const remove = btn('', 'btn-quiet icon-only', async () => {
-      const times = r.times.filter((_, i) => i !== index);
-      await saveReminder({enabled: true, times}, '提醒时间已删除');
+      await saveReminder({enabled: true, times: r.times.filter((_, i) => i !== index)});
     }, 'trash');
     remove.setAttribute('aria-label', `删除 ${value}`);
+    remove.disabled = !r.enabled || S.reminderSaving;
     item.append(input, meta, remove); list.append(item);
   });
-  if (!(r.times || []).length) list.append(el('p', 'reminder-empty', '还没有设置提醒时间。'));
+  if (!(r.times || []).length) list.append(el('p', 'reminder-empty', '还没有提醒时间，点下方「添加时间」设置第一个。'));
   schedule.append(list);
-  const add = btn('添加时间', 'btn-sm', async () => {
-    const used = new Set(r.times || []), candidates = ['08:30', '12:00', '19:00', '21:00'];
-    const value = candidates.find(item => !used.has(item)) || Array.from({length: 24}, (_, hour) => `${pad(hour)}:00`).find(item => !used.has(item));
-    if (!value) return;
-    await saveReminder({enabled: true, times: [...(r.times || []), value]}, '提醒时间已添加');
-  }, 'plus');
-  add.disabled = (r.times || []).length >= (r.max_times || 12);
-  schedule.append(add);
-  body.append(schedule);
+  if (S.reminderAdding && r.enabled) {
+    const form = el('form', 'rem-add-form'), label = el('label', 'rem-add-label'), input = el('input', 'input');
+    input.type = 'time'; input.id = 'reminder-new-time'; input.required = true;
+    input.value = S.reminderAdding.value; input.disabled = !!S.reminderSaving;
+    input.oninput = () => { S.reminderAdding.value = input.value; };
+    label.append(el('span', '', '新的提醒时间'), input);
+    const actions = el('div', 'rem-add-actions'), confirm = btn('添加', 'btn-primary btn-sm');
+    confirm.type = 'submit'; confirm.disabled = !!S.reminderSaving;
+    const cancel = btn('取消', 'btn-quiet btn-sm', () => { S.reminderAdding = null; S.reminderError = ''; renderReminder(); });
+    cancel.disabled = !!S.reminderSaving;
+    actions.append(cancel, confirm); form.append(label, actions);
+    form.onsubmit = async e => {
+      e.preventDefault();
+      if (!input.value) return;
+      if (r.times.includes(input.value)) { S.reminderError = '这个时间已经添加过了。'; renderReminder(); return; }
+      if (await saveReminder({enabled: true, times: [...r.times, input.value]})) { S.reminderAdding = null; renderReminder(); }
+    };
+    schedule.append(form);
+  } else {
+    const add = btn('添加时间', 'btn-sm', () => {
+      S.reminderAdding = {value: ''}; S.reminderError = ''; renderReminder(); $('#reminder-new-time')?.focus();
+    }, 'plus');
+    add.disabled = !r.enabled || S.reminderSaving || (r.times || []).length >= (r.max_times || 12);
+    schedule.append(add);
+  }
+  if (S.reminderError) {
+    const error = el('p', 'rem-error', S.reminderError); error.setAttribute('role', 'alert'); schedule.append(error);
+  }
+  wrap.append(schedule);
+  body.append(wrap);
 
-  const next = el('div', 'reminder-next-card');
-  next.append(el('strong', '', '下次提醒'), el('span', '', reminderNextText(r)));
-  body.append(next);
+  const foot = el('p', 'rem-foot');
+  foot.append(icon('info'), el('span', '', '助手运行期间有效：关掉页面仍会提醒，退出助手后停止。'));
+  body.append(foot);
 }
 
 async function exitApp() {
@@ -1960,10 +2133,24 @@ async function exitApp() {
 }
 
 /* ---------- Load & poll ---------- */
-async function load() {
+const recordSig = r => JSON.stringify([r.course, r.title, r.deadline, r.status, r.group, r.questions?.length || 0]);
+async function load({diff = false} = {}) {
   await flushAll().catch(() => {});
   const data = await api('/api/state');
+  // After a refresh, remember which records are new or changed so the list can show it.
+  const before = diff && S.loaded ? new Map(S.records.map(r => [r.key, recordSig(r)])) : null;
   S.records = data.assignments || [];
+  if (before) {
+    const now = Date.now();
+    S.fresh = new Map();
+    S.diff = {added: 0, changed: 0};
+    for (const r of S.records) {
+      const was = before.get(r.key);
+      if (was === recordSig(r)) continue;
+      S.diff[was === undefined ? 'added' : 'changed']++;
+      S.fresh.set(r.key, now);
+    }
+  }
   S.aliases = data.record_aliases || {};
   for (const r of S.records) if (r.group === 'history') discardHistoryDraft(r.key);
   S.lastSuccess = data.last_success;
@@ -2006,7 +2193,7 @@ async function poll() {
       S.revision = job.revision;
       if (!first) {
         S.jobKey = null;
-        await load().catch(e => toast(e.message, 'error'));
+        await load({diff: job.action === 'refresh' && !key && !job.result?.error}).catch(e => toast(e.message, 'error'));
         onJobDone(job, key);
       }
     }
@@ -2044,7 +2231,11 @@ $('#search').onkeydown = e => { if (e.key === 'Escape') { e.target.value = ''; r
 $('#refresh').onclick = () => startAction('refresh');
 $('#back').onclick = () => setView('list');
 $('#account-login-button').onclick = () => { closeAccountMenu(); openLogin(); };
-$('#reminder-button').onclick = () => { closeAccountMenu(); renderReminder(); $('#reminder-dialog').showModal(); };
+$('#reminder-button').onclick = () => {
+  closeAccountMenu();
+  S.reminderAdding = null; S.reminderError = '';
+  renderReminder(); $('#reminder-dialog').showModal();
+};
 $('#account-exit-button').onclick = () => { closeAccountMenu(); $('#exit-dialog').showModal(); };
 $('#exit-cancel').onclick = () => $('#exit-dialog').close();
 $('#exit-confirm').onclick = exitApp;
@@ -2088,6 +2279,7 @@ window.addEventListener('pagehide', () => {
   }
 });
 document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') flushAll().catch(() => {}); });
+setInterval(tickElapsed, 1000);
 setInterval(() => {
   if (!S.exited && !S.job.busy) {
     renderReminderRow();

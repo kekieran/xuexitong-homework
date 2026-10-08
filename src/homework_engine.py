@@ -851,16 +851,38 @@ def _check_once(headless=True, force_key=None, on_auth=None):
 def render_summary(items):
     return '\n'.join(f'{a.get("course")}｜{a.get("title")}｜{a.get("deadline") or "平台未设截止时间"}' for a in items) or '当前没有已确认仍可作答的待办作业。'
 
-def _native_toast(title, message):
-    """Show a Windows toast without opening a browser window or adding a dependency."""
+def _native_toast(title, message, persistent=False):
+    """Show a Windows toast without opening a browser window or adding a dependency.
+
+    `message` is one text block or a list of up to two (the toast layout has a
+    title plus two body blocks). Persistent reminders use Windows' maximum
+    three-day retention in Notification Center, with a system dismiss button.
+    """
     if os.name != 'nt':
         return False
+    blocks = [message] if isinstance(message, str) else list(message)
     heading = html.escape(str(title or '学习通作业助手')[:120], quote=True)
-    body = html.escape(str(message or '')[:1800], quote=True)
+    texts = ''.join(f'<text>{html.escape(str(block)[:900], quote=True)}</text>' for block in blocks[:2] if block)
+    if persistent and blocks:
+        # Compact view: summary. Expanded view: one group per assignment,
+        # with its name above quieter deadline and progress details.
+        paragraphs = [paragraph for paragraph in str(blocks[0])[:900].split('\n\n') if paragraph]
+        texts = f'<text hint-maxLines="2">{html.escape(paragraphs[0], quote=True)}</text>' if paragraphs else ''
+        for paragraph in paragraphs[1:]:
+            name, _, details = paragraph.partition('\n')
+            texts += (
+                '<group><subgroup>'
+                f'<text hint-style="base" hint-wrap="true" hint-maxLines="2">{html.escape(name, quote=True)}</text>'
+                f'<text hint-style="captionSubtle" hint-wrap="true" hint-maxLines="2">{html.escape(details, quote=True)}</text>'
+                '</subgroup></group>'
+            )
+        if len(blocks) > 1 and blocks[1]:
+            texts += f'<text placement="attribution">{html.escape(str(blocks[1])[:900], quote=True)}</text>'
     toast_xml = (
-        '<toast duration="short"><visual><binding template="ToastGeneric">'
-        f'<text>{heading}</text><text>{body}</text>'
-        '</binding></visual></toast>'
+        '<toast duration="short">'
+        + f'<visual><binding template="ToastGeneric"><text>{heading}</text>{texts}</binding></visual>'
+        + ('<actions><action content="知道了" arguments="dismiss" activationType="system"/></actions>' if persistent else '')
+        + '</toast>'
     )
     script = f"""
 $ErrorActionPreference = 'Stop'
@@ -869,6 +891,7 @@ $ErrorActionPreference = 'Stop'
 $xml = [Windows.Data.Xml.Dom.XmlDocument]::new()
 $xml.LoadXml('{toast_xml.replace("'", "''")}')
 $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
+{('$toast.ExpirationTime = [DateTimeOffset]::Now.AddDays(3)' if persistent else '')}
 [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{TOAST_APP_ID}').Show($toast)
 """
     encoded = base64.b64encode(script.encode('utf-16le')).decode('ascii')
@@ -888,11 +911,14 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
         return False
 
 
-def notify(title, message):
-    if _native_toast(title, message):
-        return
+def notify(title, message, persistent=False):
+    """Returns True when a native toast was shown, False when the fallback was used."""
+    if _native_toast(title, message, persistent):
+        return True
+    text = message if isinstance(message, str) else '\n'.join(str(block) for block in message if block)
     # Keep a compatibility fallback for environments where PowerShell notifications are unavailable.
-    subprocess.Popen(['msg.exe', os.environ.get('USERNAME', '*'), '/TIME:300', title + '\n' + message[:900]], creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+    subprocess.Popen(['msg.exe', os.environ.get('USERNAME', '*'), '/TIME:300', title + '\n' + text[:900]], creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+    return False
 
 def ensure_chrome(url=None, app=False):
     port = urlsplit(CHAOXING_CDP_URL).port or 9222
