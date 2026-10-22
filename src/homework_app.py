@@ -39,7 +39,7 @@ STATIC_ASSETS = {
 TOKEN = secrets.token_urlsafe(32)
 COOKIE = "homework_session"
 JOB_LOCK = threading.Lock()
-JOB = {"busy": False, "action": "", "message": "就绪", "revision": 0, "result": None}
+JOB = {"busy": False, "action": "", "key": None, "message": "就绪", "revision": 0, "result": None}
 AUTH_LOCK = threading.Lock()
 AUTH = {"state": "checking", "sites": {"chaoxing": False, "school": False}}
 STOP = threading.Event()
@@ -131,13 +131,10 @@ def reminder_records():
         state = backend.load_state()
         drafts = backend.read_json(backend.DRAFTS_FILE, {})
         records = []
-        for key, item in state.get('assignments', {}).items():
-            if backend.record_group(item) != 'active':
-                continue
-            record = dict(backend.effective_record(item), key=key)
-            record['progress'] = workspace.answer_progress(record, drafts.get(key, {}))
+        for record in backend.active_pending(state):
+            record['progress'] = workspace.answer_progress(record, drafts.get(record['key'], {}))
             records.append(record)
-    return sorted(records, key=lambda record: backend.parse_datetime(record.get('deadline')) or datetime.max)
+    return records
 
 def reminder_day(moment, now):
     gap = (moment.date() - now.date()).days
@@ -150,7 +147,7 @@ def reminder_left(seconds):
     return f'还剩 {minutes // 60} 小时' if minutes >= 60 else f'还剩 {minutes} 分钟'
 
 def reminder_clip(text, limit):
-    text = ' '.join(str(text or '').split())
+    text = shared.collapse_whitespace(text)
     return text if len(text) <= limit else text[:limit - 1] + '…'
 
 def reminder_line(record, now):
@@ -415,7 +412,7 @@ class Handler(BaseHTTPRequestHandler):
             elif url.path == "/api/attachment":
                 key, file_id = canonical_key(query.get("key", [""])[0]), query.get("id", [""])[0]
                 assignment(key)
-                files = [f for a in backend.load_draft(key).get("answers", {}).values() for f in a.get("files", [])]
+                files = [f for a in backend.load_draft(key).get("answers", {}).values() if isinstance(a, dict) for f in a.get("files", [])]
                 match = next((f for f in files if f.get("id") == file_id), None)
                 if not match:
                     raise ValueError("找不到已保存的附件")
@@ -446,7 +443,8 @@ class Handler(BaseHTTPRequestHandler):
                         raise ValueError('历史作业仅保留基本信息，不再保存答案')
                     if not any(str(q["id"]) == qid for q in record.get("questions", [])):
                         raise ValueError("题目不存在，请重新打开该作业")
-                    name = Path(query.get("name", ["answer"])[0]).name[:180]
+                    raw_name = (query.get("name", ["answer"])[0] or "").strip() or "answer"
+                    name = Path(raw_name).name[:180] or "answer"
                     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
                     file_id = secrets.token_hex(16)
                     path = UPLOAD_DIR / (file_id + Path(name).suffix[:16])
@@ -469,7 +467,9 @@ class Handler(BaseHTTPRequestHandler):
                 with backend.STATE_LOCK, backend.draft_transaction():
                     key = canonical_key(payload.get("key"))
                     assignment(key)
-                    draft = payload["draft"]
+                    draft = payload.get("draft")
+                    if not isinstance(draft, dict):
+                        raise ValueError("草稿格式不正确")
                     if key != payload.get("key"):
                         merged = backend.load_draft(key)
                         merged["answers"] = backend.merge_draft_answers(
@@ -528,26 +528,31 @@ class Handler(BaseHTTPRequestHandler):
 def reminder_loop():
     while not STOP.is_set():
         REMINDER_WAKE.clear()
-        with SETTINGS_LOCK:
-            now = datetime.now()
-            current = settings()
-            times = normalize_reminder_times(current.get('reminder_times')) if current.get('reminder_enabled', True) is not False else []
-            shown = current.setdefault("shown_slots", [])
-            # An already sent time must not mask the next time within the
-            # three-minute recovery window, e.g. 08:30 followed by 08:31.
-            due_slots = [slot for value in times if (slot := reminder_slot(now, value)) and slot not in shown]
+        try:
+            with SETTINGS_LOCK:
+                now = datetime.now()
+                current = settings()
+                times = normalize_reminder_times(current.get('reminder_times')) if current.get('reminder_enabled', True) is not False else []
+                shown = current.setdefault("shown_slots", [])
+                # An already sent time must not mask the next time within the
+                # three-minute recovery window, e.g. 08:30 followed by 08:31.
+                due_slots = [slot for value in times if (slot := reminder_slot(now, value)) and slot not in shown]
+                if due_slots:
+                    current["shown_slots"] = (shown + due_slots)[-120:]
+                    shared.write_json_file(SETTINGS_FILE, current)
+                upcoming = next_reminder_at(now, times)
             if due_slots:
-                current["shown_slots"] = (shown + due_slots)[-120:]
-                shared.write_json_file(SETTINGS_FILE, current)
-            upcoming = next_reminder_at(now, times)
-        if due_slots:
-            active = reminder_records()
-            if active:
-                show_reminder(active)
-            continue
-        # Wait only until the precise next deadline. The short upper bound also
-        # rechecks the wall clock after sleep/resume or a system time change.
-        delay = min(REMINDER_RECHECK_SECONDS, max(0, (upcoming - now).total_seconds())) if upcoming else REMINDER_RECHECK_SECONDS
+                active = reminder_records()
+                if active:
+                    show_reminder(active)
+                continue
+            # Wait only until the precise next deadline. The short upper bound also
+            # rechecks the wall clock after sleep/resume or a system time change.
+            delay = min(REMINDER_RECHECK_SECONDS, max(0, (upcoming - now).total_seconds())) if upcoming else REMINDER_RECHECK_SECONDS
+        except Exception:
+            # A transient failure (locked or unreadable file, failed toast) must
+            # not end the thread: reminders would silently stop until restart.
+            delay = 30
         REMINDER_WAKE.wait(delay)
 
 def auth_watch_loop():
@@ -611,14 +616,18 @@ def main():
         url = backend.read_json(RUNTIME_FILE, {}).get("url", "")
         parsed = urllib.parse.urlsplit(url)
         if parsed.hostname == "127.0.0.1" and parsed.scheme == "http":
+            reachable = False
             try:
                 # HTTPError 403 is expected after the bootstrap redirect without a cookie jar.
                 opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor())
                 opener.open(url, timeout=2).close()
-                if not args.background:
-                    backend.ensure_chrome(url, app=True)
+                reachable = True
+            except urllib.error.HTTPError:
+                reachable = True
             except Exception:
                 pass
+            if reachable and not args.background:
+                backend.ensure_chrome(url, app=True)
         return
     retention.cleanup_history()
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)

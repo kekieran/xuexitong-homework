@@ -8,8 +8,7 @@ import homework_dom as dom
 import homework_shared as shared
 
 
-def identities(record):
-    return dom.record_identities(record)
+identities = dom.record_identities
 
 
 def _serialize(node):

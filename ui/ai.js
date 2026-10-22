@@ -182,11 +182,16 @@ window.HomeworkAI = (() => {
       return;
     }
     const key = canonicalKey(job.result?.key || job.key);
+    settling.add(key); lockInputs(record());
     try {
-      await flushAll();
-      drafts.delete(key);
+      await flush(key);
+      const latest = await api('/api/draft?key=' + encodeURIComponent(key));
+      latest.answers ??= {};
+      drafts.set(key, latest);
+      saveState.set(key, {state: 'saved', at: latest.updated_at});
+      if (S.key === key) renderDetail(record(), latest, true);
       await load();
-    } catch (e) { toast('答案刷新失败：' + e.message, 'error'); }
+    } catch (e) { toast('答案刷新失败：' + e.message, 'error'); return; }
     finally { settling.delete(key); lockInputs(record()); }
     if (job.result?.error) { toast(job.message, 'error'); return; }
     const skipped = job.result?.skipped || [];

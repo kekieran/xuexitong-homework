@@ -283,9 +283,7 @@ function isUnsupported(q) {
 }
 
 /* ---------- Answers ---------- */
-function hasValue(v) {
-  return Array.isArray(v) ? v.some(x => String(x ?? '').trim()) : String(v ?? '').trim() !== '';
-}
+const hasValue = HomeworkWorkspace.hasValue;
 function answered(a) { return !!a && (hasValue(a.value) || !!a.files?.length); }
 function changedAnswer(q, a) { return !!a && a.signature !== q.signature && hasValue(a.value); }
 // Returns a copy that can be edited for the current question version. A value
@@ -396,6 +394,7 @@ async function getDraft(key) {
   if (drafts.has(key)) return drafts.get(key);
   const draft = await api('/api/draft?key=' + encodeURIComponent(key));
   draft.answers ??= {};
+  drafts.set(key, draft);
   let recovered = false;
   try {
     const keys = [...new Set([key, ...Object.keys(S.aliases).filter(k => canonicalKey(k) === key)])];
@@ -409,14 +408,12 @@ async function getDraft(key) {
       if (data.draft.legacy_text) draft.legacy_text = data.draft.legacy_text;
       recovered = true;
     }
-    drafts.set(key, draft);
     if (recovered) {
       markDirty(key);
       for (const {key: oldKey} of recoveries) if (oldKey !== key) localStorage.removeItem('homework-recovery:' + oldKey);
       toast('已恢复上次未完成保存的答案', 'warn');
     }
   } catch {}
-  drafts.set(key, draft);
   if (!saveState.has(key)) saveState.set(key, {state: 'saved', at: draft.updated_at});
   return draft;
 }
@@ -445,18 +442,19 @@ function renderRich(node, html, text) {
     node.textContent = text || '';
     return;
   }
-  node.innerHTML = html;
-  node.querySelectorAll('script,style,iframe,object,embed,form,input,button,textarea,select').forEach(n => n.remove());
-  node.querySelectorAll('*').forEach(n => {
+  const tmpl = document.createElement('template');
+  tmpl.innerHTML = html;
+  tmpl.content.querySelectorAll('script,style,iframe,object,embed,form,input,button,textarea,select').forEach(n => n.remove());
+  tmpl.content.querySelectorAll('*').forEach(n => {
     for (const attr of [...n.attributes]) if (/^on/i.test(attr.name) || attr.name === 'style') n.removeAttribute(attr.name);
   });
-  node.querySelectorAll('a').forEach(a => {
+  tmpl.content.querySelectorAll('a').forEach(a => {
     const href = a.getAttribute('href') || '';
     if (!/^https?:\/\//i.test(href)) { a.removeAttribute('href'); return; }
     a.target = '_blank';
     a.rel = 'noopener noreferrer';
   });
-  node.querySelectorAll('img').forEach(img => {
+  tmpl.content.querySelectorAll('img').forEach(img => {
     const src = img.getAttribute('src') || '';
     if (/^https?:\/\//i.test(src)) { img.replaceWith(mediaFallback('uncached', src)); return; }
     img.decoding = 'async';
@@ -464,11 +462,12 @@ function renderRich(node, html, text) {
     img.onerror = () => img.replaceWith(mediaFallback('failed'));
     if (img.complete && img.naturalWidth) img.onload();
   });
-  node.querySelectorAll('audio,video').forEach(media => {
+  tmpl.content.querySelectorAll('audio,video').forEach(media => {
     const src = media.getAttribute('src') || media.querySelector('source')?.getAttribute('src') || '';
     if (/^https?:\/\//i.test(src)) media.replaceWith(mediaFallback('media', src));
     else media.remove();
   });
+  node.replaceChildren(tmpl.content);
 }
 
 /* ---------- Sidebar ---------- */
@@ -1188,7 +1187,14 @@ function watchQuestions() {
       if (!e.isIntersecting) continue;
       document.querySelectorAll('.qdot.here').forEach(d => d.classList.remove('here'));
       const dot = document.getElementById('qd-' + e.target.id.slice(2));
-      if (dot) { dot.classList.add('here'); dot.scrollIntoView({block: 'nearest', inline: 'nearest'}); }
+      if (dot) {
+        dot.classList.add('here');
+        // Keep the active number visible without interrupting the detail's
+        // smooth scroll by scrolling any of its vertical ancestors.
+        const dots = dot.parentElement, bounds = dots.getBoundingClientRect(), target = dot.getBoundingClientRect();
+        if (target.left < bounds.left) dots.scrollLeft += target.left - bounds.left - 2;
+        else if (target.right > bounds.right) dots.scrollLeft += target.right - bounds.right + 2;
+      }
     }
   }, {root: $('#detail'), rootMargin: '-20% 0px -70% 0px'});
   document.querySelectorAll('#detail .question').forEach(q => questionObserver.observe(q));
@@ -1897,7 +1903,7 @@ function renderFill() {
     if (skipped.length) {
       body.append(el('div', 'section-label', '以下题目不会自动填入'));
       const ul = el('ul', 'reasons');
-      ul.append(...reasonRows(skipped.map(x => ({i: x.index, kind: x.kind, files: x.files, reason: x.kind === 'upload' && x.text ? '文字答案也需手动填写。' : ''}))));
+      ul.append(...reasonRows(skipped.map(x => ({i: x.index, kind: x.kind, reason: x.kind === 'upload' && x.text ? '文字答案也需手动填写。' : ''}))));
       body.append(ul);
     }
     if (r.content_complete === false) body.append(notice('warn', 'alert', '', ['题目未读全，其余题目需在学习通完成。']));

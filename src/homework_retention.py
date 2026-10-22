@@ -170,6 +170,13 @@ def _clear_completed_warnings(state):
     stats['warnings'] = kept
 
 
+def _size(path):
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
 def plan_cleanup():
     """Read-only plan. Caller holds state/draft locks for an executable plan."""
     state = engine.read_json(engine.STATE_FILE, {'assignments': {}})
@@ -213,7 +220,7 @@ def plan_cleanup():
     return {'state': next_state, 'drafts': next_drafts,
             'state_changed': next_state != state, 'drafts_changed': next_drafts != drafts,
             'history_count': len(history), 'draft_count': len(drafts) - len(next_drafts),
-            'files': files, 'bytes': sum(p.stat().st_size for p in files),
+            'files': files, 'bytes': sum(_size(p) for p in files),
             'shared_files': len(candidates & protected)}
 
 

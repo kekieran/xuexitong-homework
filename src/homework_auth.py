@@ -95,47 +95,6 @@ def probe(context, platform: str, *, timeout=12000) -> bool:
         raise RuntimeError('暂时无法核对登录状态，请检查网络后重试') from None
 
 
-def _target_page(browser, context, target_id):
-    deadline = time.monotonic() + 8
-    while time.monotonic() < deadline:
-        for page in context.pages:
-            session = context.new_cdp_session(page)
-            try:
-                target = session.send('Target.getTargetInfo')['targetInfo']
-                if target['targetId'] == target_id:
-                    return page
-            finally:
-                session.detach()
-        time.sleep(.15)
-    raise RuntimeError('登录窗口没有打开，请重新登录')
-
-
-def _login_page(browser, context, target_id, platform):
-    url = LOGIN_URLS[platform]
-    session = browser.new_browser_cdp_session()
-    try:
-        infos = session.send('Target.getTargets').get('targetInfos', [])
-        current = next((x for x in infos if x.get('targetId') == target_id and x.get('type') == 'page'), None)
-        if not current:
-            current = next((x for x in infos if x.get('type') == 'page' and engine.login_page_platform(x.get('url', ''))), None)
-        if current:
-            target_id = current['targetId']
-            engine.navigate_login_target(browser, target_id, url)
-        else:
-            created = session.send('Target.createTarget', {'url': url, 'newWindow': True, 'background': False})
-            target_id = created.get('targetId')
-            if not target_id:
-                raise RuntimeError('登录窗口没有打开，请重新登录')
-        session.send('Target.activateTarget', {'targetId': target_id})
-        window = session.send('Browser.getWindowForTarget', {'targetId': target_id})
-        if window.get('bounds', {}).get('windowState') == 'minimized':
-            session.send('Browser.setWindowBounds', {
-                'windowId': window['windowId'], 'bounds': {'windowState': 'normal'}})
-    finally:
-        session.detach()
-    return _target_page(browser, context, target_id), target_id
-
-
 def _login_error(page):
     # Only return fixed messages; server errors can echo identifiers or secrets.
     for selector in ('#err-txt', '#phoneMsg', '#pwdMsg'):
@@ -154,26 +113,17 @@ def _login_error(page):
     return None
 
 
-def _submit(browser, context, target_id, platform, username, password, progress=None, silent=False):
-    """Fill and drive one site's login form.
-
-    Every current caller passes silent=True (the in-app flow logs in through a
-    hidden page). The non-silent branch drives the visible window through
-    _login_page and is currently unreachable; `browser` and `target_id` exist
-    only for it, which is why callers pass None for both.
-    """
+def _submit(context, platform, username, password, progress=None):
+    """Fill and drive one site's login form through a hidden page."""
     progress = progress or (lambda message: None)
     label = SITE_LABELS[platform]
     progress(f'正在登录{label}…')
-    if silent:
-        page = context.new_page()
-        try:
-            page.goto(LOGIN_URLS[platform], wait_until='domcontentloaded', timeout=15000)
-        except Exception:
-            page.close()
-            raise RuntimeError('后台登录页面无法打开，请检查网络后重试') from None
-    else:
-        page, target_id = _login_page(browser, context, target_id, platform)
+    page = context.new_page()
+    try:
+        page.goto(LOGIN_URLS[platform], wait_until='domcontentloaded', timeout=15000)
+    except Exception:
+        page.close()
+        raise RuntimeError('后台登录页面无法打开，请检查网络后重试') from None
     try:
         try:
             page.locator('#phone').wait_for(state='visible', timeout=15000)
@@ -182,8 +132,8 @@ def _submit(browser, context, target_id, platform, username, password, progress=
             page.locator('#loginBtn').click(timeout=10000)
         except Exception:
             raise RuntimeError('登录表单未能填写，请重新登录') from None
-        progress(f'正在确认{label}登录状态' + ('' if silent else '；如网页要求滑块或验证码，请在登录窗口完成'))
-        deadline = time.monotonic() + (30 if silent else 120)
+        progress(f'正在确认{label}登录状态')
+        deadline = time.monotonic() + 30
         next_probe = 0
         probe_succeeded = False
         while time.monotonic() < deadline:
@@ -198,18 +148,16 @@ def _submit(browser, context, target_id, platform, username, password, progress=
             try:
                 if probe(context, platform, timeout=4000):
                     progress(f'{label}登录已确认')
-                    return target_id
+                    return
                 probe_succeeded = True
             except RuntimeError:
                 pass
             next_probe = time.monotonic() + 3
         if not probe_succeeded:
             raise RuntimeError(f'{label}登录状态核对超时，请检查网络后重试')
-        if silent:
-            raise RuntimeError(f'{label}需要手动完成验证')
-        raise RuntimeError(f'{label}尚未完成验证，请在登录窗口完成滑块、短信或其他验证后重试；窗口已保留')
+        raise RuntimeError(f'{label}需要手动完成验证')
     finally:
-        if silent and not page.is_closed():
+        if not page.is_closed():
             page.close()
 
 
@@ -240,8 +188,7 @@ def status(username=None, password=None, *, restore=False, force_restore=False,
             try:
                 for platform, logged_in in sites.items():
                     if not logged_in:
-                        _submit(None, active_context, None, platform, *credentials,
-                                progress=progress, silent=True)
+                        _submit(active_context, platform, *credentials, progress=progress)
                         sites[platform] = True
                         if on_state:
                             on_state({'logged_in': all(sites.values()), 'sites': dict(sites)})

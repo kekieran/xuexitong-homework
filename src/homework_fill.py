@@ -29,6 +29,18 @@ def _normalized(value):
     return shared.collapse_whitespace(value)
 
 
+# Shared UEditor enumeration for the evaluate() calls below. Expects `root` and
+# `name` in scope (null name matches every instance) and produces `editors`:
+# live instances owned by root, deduplicated across instants/instances/ueditor.
+_UE_EDITORS = """
+const candidates = [...Object.values(window.UE?.instants || {}), ...Object.values(window.UE?.instances || {})];
+if (window.ueditor) candidates.push(window.ueditor);
+const editors = [...new Set(candidates)].filter(e => e && e.body &&
+    ((e.container && root.contains(e.container)) || (e.iframe && root.contains(e.iframe))) &&
+    (!name || [e.key, e.textarea?.id, e.textarea?.name].includes(name)));
+"""
+
+
 def _plain(markup):
     return _normalized(dom.clean_text(dom.parse(markup or '')))
 
@@ -60,12 +72,7 @@ def _visible_text_controls(root, name=None):
 
 def _editor_info(root, name=None):
     # Reading only. UE instances are matched by DOM ownership, not array order.
-    return root.evaluate("""(root,name) => {
-        const candidates = [...Object.values(window.UE?.instants || {}), ...Object.values(window.UE?.instances || {})];
-        if (window.ueditor) candidates.push(window.ueditor);
-        const editors = [...new Set(candidates)].filter(e => e && e.body &&
-            ((e.container && root.contains(e.container)) || (e.iframe && root.contains(e.iframe))) &&
-            (!name || [e.key,e.textarea?.id,e.textarea?.name].includes(name)));
+    return root.evaluate("(root, name) => {" + _UE_EDITORS + """
         return editors.map(e => ({id:e.key || e.uid || '', names:[e.key,e.textarea?.id,e.textarea?.name].filter(Boolean), html:e.getContent(), text:e.getContentTxt(),
             ready:!!(e.body.isContentEditable && typeof e.setContent==='function')}));
     }""", name)
@@ -87,10 +94,8 @@ def _fill_essay(root, value, editor_name=None):
         if _normalized(current['text']) == _normalized(value):
             return None
         markup = '<p>' + html.escape(value).replace('\n', '</p><p>') + '</p>'
-        result = root.evaluate("""(root, args) => {
-            const all=[...Object.values(window.UE?.instants||{}),...Object.values(window.UE?.instances||{})];
-            if(window.ueditor) all.push(window.ueditor);
-            const found=[...new Set(all)].filter(e=>e&&e.body&&((e.container&&root.contains(e.container))||(e.iframe&&root.contains(e.iframe)))&&(!args.name||[e.key,e.textarea?.id,e.textarea?.name].includes(args.name)));
+        result = root.evaluate("(root, args) => { const name = args.name;" + _UE_EDITORS + """
+            const found = editors;
             if(found.length!==1 || !found[0].body.isContentEditable) return false;
             const e=found[0];
             // Recheck in the same operation so a just-entered online answer is never overwritten.
@@ -196,11 +201,8 @@ def _attachment_inserted(root, before, name):
         return '本次附件尚未写入答案，请在原网页检查'
     # Use only the platform editor's own events/sync API; never assign a hidden
     # answer field or call a save/submit endpoint ourselves.
-    mirrored = root.evaluate("""root => {
-        const all=[...Object.values(window.UE?.instants||{}),...Object.values(window.UE?.instances||{})];
-        if(window.ueditor) all.push(window.ueditor);
-        const found=[...new Set(all)].filter(e=>e&&e.body&&
-            ((e.container&&root.contains(e.container))||(e.iframe&&root.contains(e.iframe))));
+    mirrored = root.evaluate("(root) => { const name = null;" + _UE_EDITORS + """
+        const found = editors;
         if(found.length!==1 || !found[0].body.isContentEditable) return null;
         const e=found[0];
         if(typeof e.fireEvent==='function') { e.fireEvent('contentchange'); e.fireEvent('blur'); }
@@ -362,7 +364,7 @@ def _fill_blanks(root, question, value):
     for name, answer in zip(names, value):
         found = _visible_text_controls(root, name)
         if not isinstance(answer, str):
-            return '部分空位没有唯一可编辑控件，未填入此题'
+            return '填空答案格式不正确，未填入此题'
         if len(found) == 1:
             current = _normalized(found[0].input_value())
             control = found[0]
@@ -598,12 +600,8 @@ def _entry(record):
     raise ValueError('尚未取得可验证的作答入口，请刷新此作业')
 
 
-def _identities(record):
-    return dom.record_identities(record)
-
-
 def _identity_matches(record, markup, url):
-    expected = _identities(record)
+    expected = dom.record_identities(record)
     actual = set(dom.page_identity(markup, url))
     return bool(expected and actual and expected & actual)
 
@@ -729,7 +727,7 @@ def _fill_assignment(key):
     if not isinstance(answers, dict) or not any(isinstance(v, dict) and (v.get('value') not in (None, '', []) or v.get('files')) for v in answers.values()):
         return {'filled': [], 'skipped': [], 'message': '请先在助手里保存每道题的答案。'}
     url = _entry(record)
-    if not _identities(record):
+    if not dom.record_identities(record):
         return {'filled': [], 'skipped': [], 'message': '作业身份尚未核实，请先刷新。'}
     has_attachments = any(isinstance(v, dict) and v.get('files') for v in answers.values())
     from playwright.sync_api import sync_playwright

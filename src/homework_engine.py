@@ -516,7 +516,7 @@ def collect_notices(context, state, stats):
         if not isinstance(payload, dict) or not payload.get('status') or not isinstance(container, dict):
             raise RuntimeError('通知读取失败，可能需要重新登录')
         notices = container.get('list') or []
-        ids = [str(n.get('idCode', '')) for n in notices]
+        ids = [str(n.get('idCode')) for n in notices if n.get('idCode')]
         for n in notices:
             content = str(n.get('content') or '')
             def field(label):
@@ -530,7 +530,8 @@ def collect_notices(context, state, stats):
             item = {'course': course, 'title': title, 'start': start, 'deadline': deadline,
                     'deadline_source': 'notice' if deadline else None,
                     'notice_sent': standard_time(n.get('sendTime')), 'entry_url': url,
-                    'identities': dom.url_identity(url), 'source_notice_ids': [str(n.get('idCode'))], 'status': 'unknown'}
+                    'identities': dom.url_identity(url),
+                    'source_notice_ids': [str(n['idCode'])] if n.get('idCode') else [], 'status': 'unknown'}
             merge_record(state['assignments'], item)
         fresh_ids.extend(ids)
         page_known = bool(ids) and all(i in seen for i in ids)
@@ -667,7 +668,7 @@ def update_metadata(record, markup, url):
     record['metadata_checked_at'] = now_iso()
     return text
 
-def read_content(context, record, stats, force=False):
+def read_content(context, record, stats):
     url = record.get('entry_url') or record.get('list_url') or record.get('work_url')
     if not url:
         record['content_status'] = '缺少作答入口，等待通知或课程列表补全'
@@ -817,7 +818,7 @@ def _check_once(headless=True, force_key=None, on_auth=None):
                     log(f'正在核对：{record.get("course")} / {record.get("title")}')
                     record['content_attempted_at'] = now_iso()
                     try:
-                        read_content(context, record, stats, force=bool(force_key))
+                        read_content(context, record, stats)
                         if identity_probe:
                             record['identity_probe_done'] = True
                         record.pop('content_error', None)
@@ -828,7 +829,7 @@ def _check_once(headless=True, force_key=None, on_auth=None):
                         merged_key = resolve_alias(state.get('record_aliases') or {}, key)
                         merged = state['assignments'].get(merged_key)
                         if merged and needs_entry_upgrade(merged):
-                            read_content(context, merged, stats, force=bool(force_key))
+                            read_content(context, merged, stats)
                             merged.pop('content_error', None)
                             reconcile_aliases(state)
                     except Exception as exc:
@@ -844,7 +845,9 @@ def _check_once(headless=True, force_key=None, on_auth=None):
         state['last_success'] = now_iso()
     state['last_stats'] = stats
     save_state(state)
-    LATEST_FILE.write_text(render_summary(active_pending(state)) + '\n', encoding='utf-8')
+    latest = LATEST_FILE.with_name(LATEST_FILE.name + f'.{os.getpid()}.{threading.get_ident()}.tmp')
+    latest.write_text(render_summary(active_pending(state)) + '\n', encoding='utf-8')
+    latest.replace(LATEST_FILE)
     log(f'同步完成：通知 {stats["notice_pages"]} 页，课程 {stats["course_lists"]} 门，详情 {stats["details"]} 次，复用 {stats["cache_hits"]} 项。')
     return 0 if connected else 2
 
@@ -917,7 +920,10 @@ def notify(title, message, persistent=False):
         return True
     text = message if isinstance(message, str) else '\n'.join(str(block) for block in message if block)
     # Keep a compatibility fallback for environments where PowerShell notifications are unavailable.
-    subprocess.Popen(['msg.exe', os.environ.get('USERNAME', '*'), '/TIME:300', title + '\n' + text[:900]], creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+    try:
+        subprocess.Popen(['msg.exe', os.environ.get('USERNAME', '*'), '/TIME:300', title + '\n' + text[:900]], creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+    except OSError:
+        pass
     return False
 
 def ensure_chrome(url=None, app=False):

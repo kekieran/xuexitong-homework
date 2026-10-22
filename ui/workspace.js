@@ -49,5 +49,5 @@ window.HomeworkWorkspace = (() => {
     }
     return {version: 1, generated_at: now.toISOString(), counts: Object.fromEntries(Object.entries(keys).map(([k,v]) => [k,v.length])), questions: {answered,total}, keys};
   }
-  return Object.freeze({labels, questionComplete, progress, dashboard});
+  return Object.freeze({labels, hasValue, questionComplete, progress, dashboard});
 })();
