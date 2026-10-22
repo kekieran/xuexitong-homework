@@ -465,7 +465,14 @@ function renderRich(node, html, text) {
     const src = img.getAttribute('src') || '';
     if (/^https?:\/\//i.test(src)) { img.replaceWith(mediaFallback('uncached', src)); return; }
     img.decoding = 'async';
-    img.onload = () => { if (img.naturalWidth > 160 || img.naturalHeight > 60) img.classList.add('block'); };
+    // Big images become block only when they stand alone. A formula image that
+    // sits inside a line of text must stay inline, otherwise it breaks the
+    // sentence and picks up the framed look meant for pictures.
+    img.onload = () => {
+      const holder = img.closest('p, li, td');
+      const inline = !!holder && holder.textContent.trim().length > 0;
+      if (!inline && (img.naturalWidth > 160 || img.naturalHeight > 60)) img.classList.add('block');
+    };
     img.onerror = () => img.replaceWith(mediaFallback('failed'));
     if (img.complete && img.naturalWidth) img.onload();
   });
