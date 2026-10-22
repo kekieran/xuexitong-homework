@@ -1321,7 +1321,15 @@ function choiceInput(q, index, cur, update) {
   wrap.setAttribute('aria-label', `第 ${index + 1} 题选项`);
   const chosen = new Set(multi ? (Array.isArray(cur) ? cur.map(String) : []) : (hasValue(cur) ? [String(Array.isArray(cur) ? cur[0] : cur)] : []));
   const summary = el('div', 'choice-summary');
-  const textOf = v => { const o = q.options.find(o => String(o.value) === v); return judge ? (o?.text || v) : v; };
+  // The platform shuffles option order but keeps the original letter in the
+  // radio value, so the letter shown must come from the position, never from
+  // the value; the value only identifies the answer when saving and filling.
+  const letterAt = i => i < 26 ? String.fromCharCode(65 + i) : String(i + 1);
+  const textOf = v => {
+    const i = q.options.findIndex(o => String(o.value) === String(v));
+    if (judge) return (i >= 0 ? q.options[i].text : '') || String(v);
+    return i >= 0 ? letterAt(i) : String(v);
+  };
   const paint = () => {
     const values = [...wrap.querySelectorAll('input:checked')].map(x => x.value);
     summary.replaceChildren();
@@ -1342,7 +1350,7 @@ function choiceInput(q, index, cur, update) {
     input.checked = chosen.has(String(o.value));
     const text = el('div', 'option-text');
     renderRich(text, o.html, o.text);
-    const letter = /^[A-Z]$/.test(String(o.value)) ? String(o.value) : String.fromCharCode(65 + i);
+    const letter = letterAt(i);
     const prefixed = new RegExp('^\\s*' + letter + '\\s*[.、．:：)）\\s]').test(text.textContent || '');
     const mark = el('span', 'mark', judge || prefixed ? '' : letter);
     input.onchange = () => {
