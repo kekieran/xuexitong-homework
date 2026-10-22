@@ -79,6 +79,26 @@ def platform_url(url):
     except ValueError:
         return False
 
+PAGE_PATH_HEADS = ('/mooc-ans/', '/work/', '/course/', '/mycourse/', '/exam/', '/notice/',
+                   '/task-list', '/getallwork')
+
+
+def platform_page_url(url):
+    """True for a platform navigation page (work, course, notice...).
+
+    Such links are inserted by the editor around the assignment title and point
+    back to the platform itself; they are neither attachments nor content links.
+    Files served from a platform CDN keep a different path and are not matched.
+    """
+    if not platform_url(url):
+        return False
+    try:
+        path = (urlsplit(url).path or '/').lower()
+    except ValueError:
+        return False
+    return path.startswith(PAGE_PATH_HEADS) or '/work/' in path
+
+
 def platform_host(host):
     """Fold the Chaoxing hosts (bare domain and sub-domains) onto one prefix.
 
@@ -143,7 +163,7 @@ def safe_html(node, base_url='', asset=None):
         attrs += f' alt="{html.escape(node.attrs.get("alt") or "题目原图", quote=True)}"'
     elif node.tag == 'a':
         href = urljoin(base_url, node.attrs.get('href') or '')
-        if href.startswith(('https://', 'http://')):
+        if href.startswith(('https://', 'http://')) and not platform_page_url(href):
             attrs += f' href="{html.escape(href, quote=True)}" target="_blank" rel="noopener noreferrer"'
     elif node.tag in {'audio', 'video', 'source'}:
         src = urljoin(base_url, node.attrs.get('src') or '')

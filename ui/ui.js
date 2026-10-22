@@ -436,6 +436,10 @@ function mediaFallback(kind, src) {
   }
   return box;
 }
+// The platform editor wraps the assignment title in a link back to its own work
+// page. Those navigation links are not attachments and must not be clickable
+// inside the question text; file links on the platform CDN stay untouched.
+const PLATFORM_PAGE = /^https?:\/\/[^/]*(?:chaoxing\.com|chaoxing\.com\.cn|chaoxing\.net|istudy\.szpu\.edu\.cn)\/(?:mooc-ans|work|course|mycourse|exam|notice|task-list|getallwork)\//i;
 function renderRich(node, html, text) {
   node.classList.add('rich');
   if (!html) {
@@ -457,7 +461,7 @@ function renderRich(node, html, text) {
   });
   tmpl.content.querySelectorAll('a').forEach(a => {
     const href = a.getAttribute('href') || '';
-    if (!/^https?:\/\//i.test(href)) { a.removeAttribute('href'); return; }
+    if (!/^https?:\/\//i.test(href) || PLATFORM_PAGE.test(href)) { a.removeAttribute('href'); return; }
     a.target = '_blank';
     a.rel = 'noopener noreferrer';
   });
@@ -1144,7 +1148,7 @@ function renderDetail(r, draft, keep = false) {
     legacy.append(input);
     col.append(legacy);
   }
-  const links = (r.attachments || []).filter(a => /^https?:\/\//i.test(a.url || ''));
+  const links = (r.attachments || []).filter(a => /^https?:\/\//i.test(a.url || '') && !PLATFORM_PAGE.test(a.url));
   if (links.length) {
     const n = notice('soft', 'clip', '题目附件');
     const box = el('div', 'links');

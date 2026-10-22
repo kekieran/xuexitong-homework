@@ -729,7 +729,7 @@ def read_content(context, record, stats):
         for fragment in [question.get('html', ''), *[option.get('html', '') for option in question.get('options', [])]]:
             for anchor in dom.parse(fragment).all('a'):
                 href = anchor.attrs.get('href') or ''
-                if href.startswith(('https://', 'http://')):
+                if href.startswith(('https://', 'http://')) and not dom.platform_page_url(href):
                     attachments.setdefault(href, {'name': dom.clean_text(anchor) or '题目附件', 'url': href})
     record['attachments'] = list(attachments.values())
     record['content_version'] = CONTENT_VERSION
