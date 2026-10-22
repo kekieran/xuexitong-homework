@@ -572,9 +572,16 @@ def course_ids(record):
 
 def collect_course_rows(context, state, stats, only=None):
     """Read course task lists; `only` restricts it to one (courseId, classId)."""
-    markup, _ = fetch_html(context, COURSES_URL)
-    courses = dom.parse(markup).all('li', attr='courseid')
-    if not courses:
+    try:
+        markup, _ = fetch_html(context, COURSES_URL)
+        courses = dom.parse(markup).all('li', attr='courseid')
+    except Exception:
+        # A one-course refresh may target a school-hosted course; that write
+        # must not depend on the separate chaoxing course list.
+        if only is None:
+            raise
+        courses = []
+    if not courses and only is None:
         raise RuntimeError('课程列表结构无法识别，请检查登录状态')
     targets = {}
     for course in courses:
