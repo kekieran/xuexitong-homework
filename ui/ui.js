@@ -445,6 +445,13 @@ function renderRich(node, html, text) {
   const tmpl = document.createElement('template');
   tmpl.innerHTML = html;
   tmpl.content.querySelectorAll('script,style,iframe,object,embed,form,input,button,textarea,select').forEach(n => n.remove());
+  // The platform editor leaves runs of empty paragraphs (and <p><br></p>) after
+  // the real content. Each one is a full line plus margin, so they show up as a
+  // large blank band between the stem and the options. Drop only blocks that
+  // carry neither text nor media, so real images and tables always stay.
+  tmpl.content.querySelectorAll('p').forEach(p => {
+    if (!p.textContent.trim() && !p.querySelector('img,audio,video,iframe,math,svg,table')) p.remove();
+  });
   tmpl.content.querySelectorAll('*').forEach(n => {
     for (const attr of [...n.attributes]) if (/^on/i.test(attr.name) || attr.name === 'style') n.removeAttribute(attr.name);
   });
