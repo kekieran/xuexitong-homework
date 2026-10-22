@@ -681,16 +681,24 @@ def open_assignment(key):
     b = _backend()
     with b.browser_operation():
         record = _record(key)
+        entry = _entry(record)
         from playwright.sync_api import sync_playwright
         from homework_navigation import resolve_work_page
-        b.ensure_chrome(_entry(record), app=False)
+        final, error = None, None
         with sync_playwright() as p:
             context = b.open_context(p, headless=False)
             try:
                 _, final = resolve_work_page(context, record, b.fetch_html)
-                b.ensure_chrome(final, app=False)
+            except Exception as exc:
+                error = exc
             finally:
                 b.close_context(context)
+        # Exactly one window: the verified do-homework page. The stored entry
+        # usually lands on a notice, list or redirect page, so opening it first
+        # left a second, wrong window behind on every click.
+        b.ensure_chrome(final or entry, app=False)
+        if error:
+            raise error
     return {'message': '已打开作业'}
 
 

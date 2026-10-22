@@ -558,7 +558,20 @@ def collect_notices(context, state, stats):
         state['notice_pending_cursors'] = list(dict.fromkeys([cursor] + pending_cursors))
         stats['warnings'].append('通知较多，本次达到分页上限，已有作业仍保留。')
 
-def collect_course_rows(context, state, stats):
+def course_ids(record):
+    """(courseId, classId) of the course that owns this record, or None."""
+    for name in ('entry_url', 'work_url', 'list_url', 'answer_url'):
+        u = urlsplit(record.get(name) or '')
+        q = {k.lower(): v[0] for k, v in parse_qs(u.query).items() if v}
+        course = q.get('courseid')
+        clazz = q.get('classid') or q.get('clazzid')
+        if course and clazz:
+            return course, clazz
+    return None
+
+
+def collect_course_rows(context, state, stats, only=None):
+    """Read course task lists; `only` restricts it to one (courseId, classId)."""
     markup, _ = fetch_html(context, COURSES_URL)
     courses = dom.parse(markup).all('li', attr='courseid')
     if not courses:
@@ -569,14 +582,19 @@ def collect_course_rows(context, state, stats):
         if cid and clazz:
             targets[('mooc1.chaoxing.com', cid, clazz)] = dom.clean_text(course.first('dt') or course)
     # School-hosted courses have a separate login and are absent from the main list.
+    # Every stored link is inspected: a record's entry may be a notice URL while
+    # its work page is the school host, and only the latter carries the ids.
     for r in state['assignments'].values():
         if record_group(r) == 'history':
             continue
-        u = urlsplit(r.get('entry_url') or r.get('work_url') or '')
-        q = {k.lower(): v[0] for k, v in parse_qs(u.query).items() if v}
-        if u.hostname == 'mooc.istudy.szpu.edu.cn' and q.get('courseid') and q.get('classid'):
-            targets[(u.hostname, q['courseid'], q['classid'])] = r.get('course', '')
+        for name in ('entry_url', 'work_url', 'list_url', 'answer_url'):
+            u = urlsplit(r.get(name) or '')
+            q = {k.lower(): v[0] for k, v in parse_qs(u.query).items() if v}
+            if u.hostname == 'mooc.istudy.szpu.edu.cn' and q.get('courseid') and q.get('classid'):
+                targets[(u.hostname, q['courseid'], q['classid'])] = r.get('course', '')
     for (host, cid, clazz), name in targets.items():
+        if only and (cid, clazz) != only:
+            continue
         try:
             markup, base = fetch_html(context, f'https://{host}/work/task-list?courseId={cid}&classId={clazz}&vx=1')
             stats['course_lists'] += 1
@@ -794,11 +812,26 @@ def _check_once(headless=True, force_key=None, on_auth=None):
                             stats['warnings'].append(safe_error(exc))
                 else:
                     connected = True
+                    # A single-assignment refresh must still read this course's
+                    # task-list row: after submitting, that row is the page that
+                    # says 已提交/待批阅, while the detail page may keep showing
+                    # the pending form and never archive the assignment.
+                    ids = course_ids(state['assignments'].get(force_key) or {})
+                    if ids:
+                        try:
+                            collect_course_rows(context, state, stats, only=ids)
+                        except Exception as exc:
+                            stats['warnings'].append(safe_error(exc))
                 reconcile_aliases(state)
                 for key, record in list(state['assignments'].items()):
                     if key not in state['assignments']:
                         continue
                     if force_key and key != force_key:
+                        continue
+                    if force_key and record.get('status') == 'submitted':
+                        # The course row just proved it is submitted; its detail
+                        # page is read-only now and would only add a warning.
+                        stats['cache_hits'] += 1
                         continue
                     identity_probe = needs_identity_probe(record, state['assignments'])
                     entry_upgrade = needs_entry_upgrade(record)
