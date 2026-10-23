@@ -878,7 +878,7 @@ function renderStatus(force = false) {
   else if (!S.key) renderWelcome();
   if ($('#login-dialog').open) renderLogin();
   if ($('#fill-dialog').open && fillPhase === 'running') renderFill();
-  if ($('#reminder-dialog').open && !$('#reminder-body').contains(document.activeElement?.closest('input'))) renderReminder();
+  if ($('#reminder-dialog').open && !S.reminderEditing && !$('#reminder-body').contains(document.activeElement)) renderReminder();
 }
 
 /* ---------- Home ---------- */
@@ -2038,11 +2038,203 @@ async function saveReminder(next) {
     return false;
   } finally {
     S.reminderSaving = false;
-    renderReminder();
+    if ($('#reminder-dialog').open) renderReminder();
   }
 }
+const TIME_WHEEL_ROW = 40;
+let reminderWheelCleanup = [];
+function clearReminderWheel() {
+  reminderWheelCleanup.splice(0).forEach(dispose => dispose());
+}
+function reminderDraftTime(draft) {
+  return `${String(draft.hour).padStart(2, '0')}:${String(draft.minute).padStart(2, '0')}`;
+}
+function focusReminderTime(value) {
+  if (!$('#reminder-dialog').open) return;
+  const target = [...document.querySelectorAll('#reminder-body .rem-time')].find(button => button.dataset.time === value);
+  (target || $('#reminder-add'))?.focus({preventScroll: true});
+}
+function openReminderEditor(originalValue = null) {
+  if (S.reminderSaving || !S.reminder?.enabled) return;
+  const [hour, minute] = (originalValue || '08:00').split(':').map(Number);
+  S.reminderEditing = {originalValue, hour, minute, focusColumn: 'hour'};
+  S.reminderError = '';
+  renderReminder();
+  $('#reminder-hour')?.focus({preventScroll: true});
+  $('.tw-editor')?.scrollIntoView({block: 'nearest'});
+}
+function cancelReminderEditor() {
+  if (S.reminderSaving) return;
+  const originalValue = S.reminderEditing?.originalValue;
+  S.reminderEditing = null;
+  S.reminderError = '';
+  renderReminder();
+  focusReminderTime(originalValue);
+}
+function renderReminderEditor(draft) {
+  const form = el('form', 'tw-editor'); form.id = 'reminder-time-editor';
+  form.setAttribute('aria-label', draft.originalValue ? '调整提醒时间' : '新的提醒时间');
+  const head = el('div', 'tw-head'), preview = el('output', 'tw-value', reminderDraftTime(draft));
+  head.append(el('strong', '', draft.originalValue ? '调整提醒时间' : '新的提醒时间'), preview);
+  const wheels = el('div', 'tw'), columns = {}, presets = el('div', 'rem-chips');
+  const error = el('p', 'rem-error', S.reminderError || ''); error.setAttribute('role', 'alert');
+  const update = () => {
+    preview.textContent = reminderDraftTime(draft);
+    presets.querySelectorAll('button').forEach(chip => chip.setAttribute('aria-pressed', String(chip.dataset.time === preview.textContent)));
+  };
+  const editable = () => S.reminderEditing === draft && !S.reminderSaving && S.reminder?.enabled;
+  for (const [field, label, maximum] of [['hour', '小时', 23], ['minute', '分钟', 59]]) {
+    const group = el('div', 'tw-group'), window = el('div', 'tw-window'), column = el('div', 'tw-column');
+    column.id = `reminder-${field}`; column.dataset.column = field;
+    column.tabIndex = S.reminderSaving ? -1 : 0;
+    column.setAttribute('role', 'spinbutton'); column.setAttribute('aria-label', label);
+    column.setAttribute('aria-valuemin', '0'); column.setAttribute('aria-valuemax', String(maximum));
+    column.setAttribute('aria-disabled', String(!!S.reminderSaving));
+    column.setAttribute('aria-describedby', 'reminder-wheel-hint');
+    const options = [];
+    for (let value = 0; value <= maximum; value++) {
+      const option = el('div', 'tw-option', String(value).padStart(2, '0'));
+      option.dataset.value = value; option.setAttribute('aria-hidden', 'true');
+      options.push(option); column.append(option);
+    }
+    let snapTimer, frame, disposed = false, touching = false, wheelDelta = 0, wheelStamp = 0;
+    let drag = null, suppressDragClick = false;
+    const paint = () => {
+      column.setAttribute('aria-valuenow', String(draft[field]));
+      column.setAttribute('aria-valuetext', `${String(draft[field]).padStart(2, '0')} ${label}`);
+      options.forEach((option, value) => option.classList.toggle('selected', value === draft[field]));
+    };
+    const choose = (value, align = true) => {
+      if (!editable() || disposed) return;
+      draft[field] = Math.max(0, Math.min(maximum, value));
+      S.reminderError = ''; error.textContent = '';
+      paint(); update();
+      if (align) { clearTimeout(snapTimer); column.scrollTop = draft[field] * TIME_WHEEL_ROW; }
+    };
+    columns[field] = {column, choose};
+    column.addEventListener('focus', () => { draft.focusColumn = field; });
+    const finishDrag = () => {
+      if (!drag) return;
+      const {id, active} = drag; drag = null;
+      if (active) {
+        suppressDragClick = true;
+        choose(Math.round(column.scrollTop / TIME_WHEEL_ROW));
+      }
+      column.classList.remove('dragging');
+      if (column.hasPointerCapture(id)) column.releasePointerCapture(id);
+    };
+    column.addEventListener('pointerdown', e => {
+      if (e.pointerType !== 'mouse' || e.button !== 0 || !editable()) return;
+      suppressDragClick = false; wheelDelta = 0;
+      drag = {id: e.pointerId, startY: e.clientY, startTop: column.scrollTop, active: false};
+      column.focus({preventScroll: true});
+    });
+    column.addEventListener('pointermove', e => {
+      if (!drag || drag.id !== e.pointerId || !editable()) return;
+      if (!(e.buttons & 1)) { finishDrag(); return; }
+      const distance = drag.startY - e.clientY;
+      if (!drag.active && Math.abs(distance) < 4) return;
+      if (!drag.active) {
+        drag.active = true;
+        clearTimeout(snapTimer);
+        column.classList.add('dragging');
+        column.setPointerCapture(e.pointerId);
+      }
+      e.preventDefault();
+      column.scrollTop = Math.max(0, Math.min(maximum * TIME_WHEEL_ROW, drag.startTop + distance));
+      choose(Math.round(column.scrollTop / TIME_WHEEL_ROW), false);
+    });
+    for (const event of ['pointerup', 'pointercancel', 'lostpointercapture']) column.addEventListener(event, e => {
+      if (drag?.id === e.pointerId) finishDrag();
+    });
+    column.addEventListener('pointerleave', () => { if (drag && !drag.active) drag = null; });
+    column.addEventListener('wheel', e => {
+      e.preventDefault();
+      if (!editable() || drag?.active || !e.deltaY) return;
+      column.focus({preventScroll: true});
+      const delta = e.deltaY * (e.deltaMode === 1 ? TIME_WHEEL_ROW : e.deltaMode === 2 ? column.clientHeight : 1);
+      const now = performance.now();
+      if (now - wheelStamp > 180 || Math.sign(delta) !== Math.sign(wheelDelta)) wheelDelta = 0;
+      wheelStamp = now; wheelDelta += delta;
+      if (Math.abs(wheelDelta) >= TIME_WHEEL_ROW) {
+        const direction = Math.sign(wheelDelta);
+        // A mouse notch moves one row; tiny trackpad events accumulate first.
+        wheelDelta = Math.abs(delta) >= TIME_WHEEL_ROW ? 0 : wheelDelta - direction * TIME_WHEEL_ROW;
+        choose(draft[field] + direction);
+      }
+    }, {passive: false});
+    column.addEventListener('click', e => {
+      // A mouse drag can emit a click on release; it must not select a different row.
+      if (suppressDragClick && e.detail > 0) { suppressDragClick = false; e.preventDefault(); return; }
+      const option = e.target.closest('.tw-option');
+      if (option && editable()) { column.focus({preventScroll: true}); choose(Number(option.dataset.value)); }
+    });
+    column.addEventListener('keydown', e => {
+      if (!editable()) return;
+      const values = {ArrowUp: draft[field] + 1, ArrowDown: draft[field] - 1, Home: 0, End: maximum};
+      if (e.key in values) { e.preventDefault(); choose(values[e.key]); }
+      else if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+        e.preventDefault(); columns[field === 'hour' ? 'minute' : 'hour'].column.focus({preventScroll: true});
+      } else if (e.key === 'Enter') { e.preventDefault(); form.requestSubmit(); }
+    });
+    const scheduleSnap = () => {
+      clearTimeout(snapTimer);
+      if (!touching && !drag?.active) snapTimer = setTimeout(() => {
+        if (editable() && !disposed) column.scrollTop = draft[field] * TIME_WHEEL_ROW;
+      }, 120);
+    };
+    column.addEventListener('touchstart', () => { touching = true; clearTimeout(snapTimer); }, {passive: true});
+    for (const event of ['touchend', 'touchcancel']) column.addEventListener(event, () => { touching = false; scheduleSnap(); }, {passive: true});
+    column.addEventListener('scroll', () => {
+      if (!editable() || disposed) return;
+      const value = Math.round(column.scrollTop / TIME_WHEEL_ROW);
+      if (value !== draft[field]) choose(value, false);
+      scheduleSnap();
+    }, {passive: true});
+    paint();
+    frame = requestAnimationFrame(() => { if (!disposed) column.scrollTop = draft[field] * TIME_WHEEL_ROW; });
+    reminderWheelCleanup.push(() => {
+      disposed = true; clearTimeout(snapTimer); cancelAnimationFrame(frame);
+      finishDrag();
+    });
+    window.append(column); group.append(el('span', 'tw-label', label), window); wheels.append(group);
+  }
+  for (const [value, label] of [['08:00', '早间'], ['12:30', '午间'], ['18:30', '傍晚'], ['21:30', '晚间']]) {
+    const chip = btn(`${value} ${label}`, 'chip rem-preset-chip', () => {
+      const [hour, minute] = value.split(':').map(Number);
+      columns.hour.choose(hour); columns.minute.choose(minute);
+    });
+    chip.type = 'button'; chip.dataset.time = value; chip.disabled = !!S.reminderSaving; presets.append(chip);
+  }
+  const hint = el('p', 'tw-hint', '拖动、滚动或点击选择，确认后生效'); hint.id = 'reminder-wheel-hint';
+  const actions = el('div', 'rem-add-actions'), cancel = btn('取消', 'btn-quiet', cancelReminderEditor);
+  const confirm = btn(draft.originalValue ? '保存时间' : '添加', 'btn-primary');
+  cancel.type = 'button'; confirm.type = 'submit'; cancel.disabled = confirm.disabled = !!S.reminderSaving;
+  actions.append(cancel, confirm); form.append(head, wheels, hint, presets, error, actions); update();
+  form.onsubmit = async e => {
+    e.preventDefault();
+    if (!editable()) return;
+    const value = reminderDraftTime(draft), current = S.reminder, times = [...(current.times || [])];
+    const index = draft.originalValue === null ? -1 : times.indexOf(draft.originalValue);
+    const fail = message => { S.reminderError = message; error.textContent = message; };
+    if (draft.originalValue !== null && index < 0) { fail('原提醒时间已更改，请取消后重新选择。'); return; }
+    if (times.some((time, i) => time === value && i !== index)) { fail('这个时间已经添加过了。'); return; }
+    if (index < 0 && times.length >= (current.max_times || 12)) { fail(`提醒时间最多设置 ${current.max_times || 12} 个。`); return; }
+    if (index < 0) times.push(value); else times[index] = value;
+    if (value === draft.originalValue) { cancelReminderEditor(); return; }
+    const saved = await saveReminder({enabled: true, times});
+    // A closed/reopened dialog belongs to a new editing session.
+    if (S.reminderEditing !== draft || !$('#reminder-dialog').open) return;
+    if (saved) { S.reminderEditing = null; renderReminder(); focusReminderTime(value); }
+    else $(`#reminder-${draft.focusColumn}`)?.focus({preventScroll: true});
+  };
+  return form;
+}
+
 function renderReminder() {
   const body = $('#reminder-body'), dialog = $('#reminder-dialog'), r = S.reminder;
+  const scrollTop = body.scrollTop;
+  clearReminderWheel();
   body.replaceChildren(closeButton(dialog), el('div', 'sheet-eyebrow', '本机提醒'));
   const head = el('div', 'rem-title-row');
   head.append(titled('reminder-title', '作业提醒'));
@@ -2053,19 +2245,19 @@ function renderReminder() {
     head.append(saved);
   }
   body.append(head);
-  body.append(el('p', 'rem-description', '每天在你设置的时间，提醒还没提交的作业。'));
-  if (!r) { body.append(el('p', 'sheet-text', '正在读取提醒状态…')); return; }
+  body.append(el('p', 'rem-description', '每天定时提醒未提交的作业。'));
+  if (!r) { body.append(el('p', 'sheet-text', '正在读取…')); return; }
 
   const slots = reminderSlots(r), next = slots[0], todayCount = slots.filter(slot => slot.day === '今天').length;
   const card = el('div', 'rem-status' + (r.enabled ? '' : ' off')), mark = el('span', 'rem-bell'), text = el('div', 'rem-status-text');
   mark.append(icon('bell'));
   if (!r.enabled) {
-    text.append(el('small', '', '提醒已关闭'), el('strong', '', '不会再弹出提醒'), el('span', '', '提醒时间已保留，打开后继续生效'));
+    text.append(el('small', '', '提醒已关闭'), el('strong', '', '不会再弹出提醒'), el('span', '', '时间已保留，开启后恢复'));
   } else if (!next) {
-    text.append(el('small', '', '下次提醒'), el('strong', '', '尚未设置'), el('span', '', '添加一个提醒时间后才会提醒'));
+    text.append(el('small', '', '下次提醒'), el('strong', '', '尚未设置'), el('span', '', '添加时间后生效'));
   } else {
     text.append(el('small', '', '下次提醒'), el('strong', '', `${next.day} ${next.value}`),
-      el('span', '', `${left(next.target - Date.now())}${todayCount ? ` · 今天还会提醒 ${todayCount} 次` : ' · 今天的提醒已过'}`));
+      el('span', '', `${left(next.target - Date.now())}${todayCount ? ` · 今天还有 ${todayCount} 次` : ''}`));
   }
   const sw = el('button', 'switch');
   sw.type = 'button';
@@ -2073,7 +2265,11 @@ function renderReminder() {
   sw.setAttribute('aria-checked', String(r.enabled));
   sw.setAttribute('aria-label', '作业提醒');
   sw.disabled = !!S.reminderSaving;
-  sw.onclick = async () => { sw.disabled = true; await saveReminder({enabled: !r.enabled, times: r.times}); };
+  sw.onclick = async () => {
+    S.reminderEditing = null;
+    await saveReminder({enabled: !S.reminder.enabled, times: S.reminder.times});
+    if (dialog.open) $('#reminder-body .switch')?.focus({preventScroll: true});
+  };
   card.append(mark, text, sw);
   body.append(card);
 
@@ -2083,61 +2279,48 @@ function renderReminder() {
   schedule.append(count);
   const list = el('div', 'reminder-time-list');
   (r.times || []).forEach((value, index) => {
-    const item = el('div', 'reminder-time-item'), input = el('input', 'rem-time');
-    input.type = 'time'; input.value = value; input.disabled = !r.enabled || S.reminderSaving; input.setAttribute('aria-label', `提醒时间 ${index + 1}`);
-    input.onchange = async () => {
-      if (!input.value) { input.value = value; return; }
-      if (r.times.some((time, i) => i !== index && time === input.value)) {
-        S.reminderError = '这个时间已经添加过了。'; renderReminder(); return;
-      }
-      const times = [...r.times]; times[index] = input.value;
-      await saveReminder({enabled: true, times});
-    };
+    const editing = S.reminderEditing?.originalValue === value;
+    const entry = el('div', 'rem-time-entry' + (editing ? ' editing' : ''));
+    const item = el('div', 'reminder-time-item'), trigger = btn(value, 'rem-time', () => openReminderEditor(value));
+    trigger.dataset.time = value; trigger.disabled = !r.enabled || !!S.reminderSaving;
+    trigger.setAttribute('aria-label', `提醒时间 ${index + 1}，${value}`);
+    trigger.setAttribute('aria-expanded', String(editing));
+    if (editing) trigger.setAttribute('aria-controls', 'reminder-time-editor');
+    trigger.append(icon('chevron')); trigger.title = '修改提醒时间';
     const slot = slots.find(s => s.value === value);
-    const meta = el('span', 'reminder-time-meta', `${reminderPeriod(value)} · ${r.enabled && slot ? `${slot.day}提醒` : '每天'}`);
+    const meta = el('span', 'reminder-time-meta', `${r.enabled && slot ? `${slot.day} · ` : '每天 · '}${reminderPeriod(value)}`);
     const remove = btn('', 'btn-quiet icon-only', async () => {
-      await saveReminder({enabled: true, times: r.times.filter((_, i) => i !== index)});
+      S.reminderEditing = null;
+      await saveReminder({enabled: true, times: S.reminder.times.filter(time => time !== value)});
+      focusReminderTime(value);
     }, 'trash');
     remove.setAttribute('aria-label', `删除 ${value}`);
-    remove.disabled = !r.enabled || S.reminderSaving;
-    item.append(input, meta, remove); list.append(item);
+    remove.disabled = !r.enabled || !!S.reminderSaving;
+    item.append(trigger, meta, remove); entry.append(item);
+    if (editing && r.enabled) entry.append(renderReminderEditor(S.reminderEditing));
+    list.append(entry);
   });
   if (!(r.times || []).length) list.append(el('p', 'reminder-empty', '还没有提醒时间，点下方「添加时间」设置第一个。'));
   schedule.append(list);
-  if (S.reminderAdding && r.enabled) {
-    const form = el('form', 'rem-add-form'), label = el('label', 'rem-add-label'), input = el('input', 'input');
-    input.type = 'time'; input.id = 'reminder-new-time'; input.required = true;
-    input.value = S.reminderAdding.value; input.disabled = !!S.reminderSaving;
-    input.oninput = () => { S.reminderAdding.value = input.value; };
-    label.append(el('span', '', '新的提醒时间'), input);
-    const actions = el('div', 'rem-add-actions'), confirm = btn('添加', 'btn-primary btn-sm');
-    confirm.type = 'submit'; confirm.disabled = !!S.reminderSaving;
-    const cancel = btn('取消', 'btn-quiet btn-sm', () => { S.reminderAdding = null; S.reminderError = ''; renderReminder(); });
-    cancel.disabled = !!S.reminderSaving;
-    actions.append(cancel, confirm); form.append(label, actions);
-    form.onsubmit = async e => {
-      e.preventDefault();
-      if (!input.value) return;
-      if (r.times.includes(input.value)) { S.reminderError = '这个时间已经添加过了。'; renderReminder(); return; }
-      if (await saveReminder({enabled: true, times: [...r.times, input.value]})) { S.reminderAdding = null; renderReminder(); }
-    };
-    schedule.append(form);
+
+  if (S.reminderEditing?.originalValue === null && r.enabled) {
+    schedule.append(renderReminderEditor(S.reminderEditing));
   } else {
-    const add = btn('添加时间', 'btn-sm', () => {
-      S.reminderAdding = {value: ''}; S.reminderError = ''; renderReminder(); $('#reminder-new-time')?.focus();
-    }, 'plus');
-    add.disabled = !r.enabled || S.reminderSaving || (r.times || []).length >= (r.max_times || 12);
+    const add = btn('添加时间', 'btn-sm rem-add-btn', () => openReminderEditor(), 'plus');
+    add.id = 'reminder-add';
+    add.disabled = !r.enabled || !!S.reminderSaving || (r.times || []).length >= (r.max_times || 12);
     schedule.append(add);
   }
-  if (S.reminderError) {
+  if (S.reminderError && !S.reminderEditing) {
     const error = el('p', 'rem-error', S.reminderError); error.setAttribute('role', 'alert'); schedule.append(error);
   }
   wrap.append(schedule);
   body.append(wrap);
 
   const foot = el('p', 'rem-foot');
-  foot.append(icon('info'), el('span', '', '助手运行期间有效：关掉页面仍会提醒，退出助手后停止。'));
+  foot.append(icon('info'), el('span', '', '助手运行时生效，关闭网页仍会提醒。'));
   body.append(foot);
+  body.scrollTop = scrollTop;
 }
 
 async function exitApp() {
@@ -2265,9 +2448,15 @@ $('#back').onclick = () => setView('list');
 $('#account-login-button').onclick = () => { closeAccountMenu(); openLogin(); };
 $('#reminder-button').onclick = () => {
   closeAccountMenu();
-  S.reminderAdding = null; S.reminderError = '';
+  S.reminderEditing = null; S.reminderError = '';
   renderReminder(); $('#reminder-dialog').showModal();
 };
+$('#reminder-dialog').addEventListener('cancel', e => {
+  if (S.reminderEditing) { e.preventDefault(); cancelReminderEditor(); }
+});
+$('#reminder-dialog').addEventListener('close', () => {
+  S.reminderEditing = null; S.reminderError = ''; clearReminderWheel();
+});
 $('#account-exit-button').onclick = () => { closeAccountMenu(); $('#exit-dialog').showModal(); };
 $('#exit-cancel').onclick = () => $('#exit-dialog').close();
 $('#exit-confirm').onclick = exitApp;

@@ -36,15 +36,19 @@ window.HomeworkAI = (() => {
     if (!list.children.length) list.append(el('div', 'ai-library-empty', '还没有配置\n添加一个常用模型开始使用'));
     library.append(list); body.append(library);
     function profileCard(id, item) {
-      const expanded = id === selected, card = el('article', 'ai-profile-card' + (expanded ? ' expanded' : id === config.active ? ' active' : ''));
+      const expanded = id === selected, card = el('article', (item ? 'ai-profile-card' : 'ai-config-editor') + (expanded ? ' expanded' : '') + (item && id === config.active ? ' active' : ''));
       card.dataset.profile = id;
       const head = el('div', 'ai-card-head'), toggle = btn('', 'ai-card-toggle', () => { selected = selected === id ? null : id; settingsNotice = null; renderSettings(); });
       toggle.disabled = S.job.busy;
+      toggle.dataset.initial = item ? (config.presets[item.provider]?.name || '自定义').slice(0, 1) : '+';
       const main = el('div', 'ai-card-main');
       if (item) main.append(el('strong', '', item.name), el('span', '', `${config.presets[item.provider]?.name || '自定义'} · ${item.model || '未填写模型'}`));
       else main.append(el('strong', '', '新建 AI 配置'), el('span', '', '填写后保存并使用'));
       toggle.setAttribute('aria-label', item ? '编辑 ' + item.name : '编辑新配置');
-      toggle.append(main); head.append(toggle);
+      toggle.setAttribute('aria-expanded', String(expanded));
+      if (expanded) toggle.setAttribute('aria-controls', 'ai-profile-editor');
+      toggle.title = expanded ? '收起配置' : '展开编辑配置';
+      toggle.append(main, icon('chevron', 'ai-card-chevron')); head.append(toggle);
       const actions = el('div', 'ai-card-actions');
       if (item && id === config.active) actions.append(el('span', 'ai-active-badge', '使用中'));
       else if (item) {
@@ -78,7 +82,7 @@ window.HomeworkAI = (() => {
     function profileEditor(id, saved) {
       const provider = saved?.provider || newProvider;
       const current = {...(saved || {...config.presets[provider], model: '', has_key: false, name: ''})};
-      const editor = el('div', 'ai-inline-editor');
+      const editor = el('div', 'ai-inline-editor'); editor.id = 'ai-profile-editor';
       const providers = el('div', 'ai-providers'); providers.setAttribute('role', 'tablist'); providers.setAttribute('aria-label', 'AI 平台');
       for (const [providerId, item] of Object.entries(config.presets)) {
         const tab = btn(item.name, 'ai-provider', () => { newProvider = providerId; renderSettings(); });
