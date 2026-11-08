@@ -102,11 +102,16 @@ function btn(label, cls, onclick, iconName) {
   if (onclick) b.onclick = onclick;
   return b;
 }
-// 统计卡片：renderWelcome 与 renderLogin 原本各自内联了一份逐字符相同的实现。
+// 统计卡片：供填入检查、填入结果与 AI 作答结果弹窗共用。
 function statCard(value, label, tone = '') {
   const card = el('div', 'stat ' + tone);
   card.append(el('b', '', String(value)), el('small', '', label));
   return card;
+}
+function noSubmitNote(text = NO_SUBMIT) {
+  const n = el('div', 'no-submit');
+  n.append(icon('lock'), el('span', '', text));
+  return n;
 }
 function externalLink(href, label, cls = 'link-chip') {
   const a = el('a', cls);
@@ -309,16 +314,18 @@ function showValue(v) {
 }
 
 /* ---------- Draft persistence ---------- */
+function aliasKeys(key) {
+  return [...new Set([key, ...Object.keys(S.aliases).filter(k => canonicalKey(k) === key)])];
+}
 function discardHistoryDraft(key) {
-  for (const old of new Set([key, ...Object.keys(S.aliases).filter(k => canonicalKey(k) === key)])) {
+  for (const old of aliasKeys(key)) {
     clearTimeout(timers.get(old)); timers.delete(old);
     dirty.delete(old); drafts.delete(old); saveState.delete(old); draftChanges.delete(old);
     try { localStorage.removeItem('homework-recovery:' + old); } catch {}
   }
 }
 function removeAttachmentFromRecovery(key, qid, fileId) {
-  const keys = [...new Set([key, ...Object.keys(S.aliases).filter(k => canonicalKey(k) === key)])];
-  for (const recoveryKey of keys) {
+  for (const recoveryKey of aliasKeys(key)) {
     const storageKey = 'homework-recovery:' + recoveryKey;
     try {
       const saved = JSON.parse(localStorage.getItem(storageKey) || 'null');
@@ -397,7 +404,7 @@ async function getDraft(key) {
   drafts.set(key, draft);
   let recovered = false;
   try {
-    const keys = [...new Set([key, ...Object.keys(S.aliases).filter(k => canonicalKey(k) === key)])];
+    const keys = aliasKeys(key);
     const recoveries = keys
       .map(k => ({key: k, data: JSON.parse(localStorage.getItem('homework-recovery:' + k))}))
       .filter(r => r.data?.draft && r.data.savedAt > Math.max(new Date(draft.updated_at || 0).getTime(), new Date(S.records.find(x => x.key === key)?.history_cleaned_at || 0).getTime()))
@@ -439,7 +446,7 @@ function mediaFallback(kind, src) {
 // The platform editor wraps the assignment title in a link back to its own work
 // page. Those navigation links are not attachments and must not be clickable
 // inside the question text; file links on the platform CDN stay untouched.
-const PLATFORM_PAGE = /^https?:\/\/[^/]*(?:chaoxing\.com|chaoxing\.com\.cn|chaoxing\.net|istudy\.szpu\.edu\.cn)\/(?:mooc-ans|work|course|mycourse|exam|notice|task-list|getallwork)\//i;
+const PLATFORM_PAGE = /^https?:\/\/[^/]+\/(?:mooc-ans|work|course|mycourse|exam|notice|task-list|getallwork)\//i;
 function renderRich(node, html, text) {
   node.classList.add('rich');
   if (!html) {
@@ -501,10 +508,12 @@ function showWorkspaceList(group, progress = 'all', dueRange = 'all') {
   renderList(); setView('list');
 }
 async function goHome() {
-  ++S.selecting; S.key = null; S.printed = null;
+  ++S.selecting; S.printed = null;
   $('.main').querySelector('.reading')?.remove();
+  try { await flushAll(); } catch {}
+  S.key = null;
   setView('detail'); renderList(); renderWelcome();
-  try { await flushAll(); await load(); }
+  try { await load(); }
   catch (e) { toast('首页显示本机数据，更新失败：' + e.message, 'warn'); }
 }
 function renderList() {
@@ -1015,7 +1024,7 @@ function renderWelcome() {
 
 /* ---------- Detail ---------- */
 function fingerprint(r) {
-  return JSON.stringify([r.questions, r.group, r.status, r.deadline, r.deadline_kind, r.content_complete, r.content_warnings, r.content_error, r.content_status, r.attachments, r.title, r.course, r.local_settings]);
+  return JSON.stringify([r.questions, r.group, r.status, r.deadline, r.deadline_kind, r.content_complete, r.content_warnings, r.content_error, r.content_status, r.instructions_html, r.instructions_text, r.instructions_source, r.attachments, r.online_attachments, r.review_attachments, r.child_tasks, r.submission_note, r.title, r.course, r.local_settings]);
 }
 function setView(v) { $('#app').dataset.view = v; }
 async function select(key, keep = false) {
@@ -1075,7 +1084,9 @@ function renderContentWarning(r) {
   const login = /需要重新登录|LOGIN_REQUIRED/.test(r.content_error);
   if (login && r.auth_platform && S.auth?.sites?.[r.auth_platform]) return;
   box.append(login
-    ? notice('danger', 'lock', '该课程的平台需要重新登录', ['登录后重新读取题目即可。'], [btn('登录作业通', 'btn-sm btn-primary', openLogin)])
+    ? notice('danger', 'lock', '该课程的平台需要重新登录', ['登录后重新读取题目即可。'], [r.auth_platform === 'lab'
+      ? btn('打开作业网页', 'btn-sm btn-primary', () => startAction('open', r.key))
+      : btn('登录作业通', 'btn-sm btn-primary', openLogin)])
     : notice('danger', 'alert', '题目读取失败', [r.content_error], [rereadButton(r)]));
 }
 function renderDetail(r, draft, keep = false) {
@@ -1097,6 +1108,7 @@ function renderDetail(r, draft, keep = false) {
   const reviewStatus = r.group === 'review' && reviewReasons(r).includes('status');
   const showStatus = r.group === 'active' ? !!r.local_settings?.completed : r.group === 'review' ? reviewStatus : true;
   if (showStatus) facts.append(fact(r.group === 'review' ? '提交状态待核实' : st.label, st.tone));
+  if (r.submission_note) facts.append(fact(r.submission_note, 'warn'));
   const local = r.deadline_source === 'local' && !r.local_settings?.completed ? ' · 自设' : '';
   const strip = r.group === 'active' && d.tone === 'urgent' && d.left;
   if (!strip) facts.append(fact(live && d.left && d.tone !== 'urgent' ? `${d.text} · ${d.left}${local}` : d.text + local, !live ? 'muted' : d.tone === 'urgent' ? 'clay' : d.tone === 'unknown' ? 'warn' : '', 'clock'));
@@ -1138,6 +1150,13 @@ function renderDetail(r, draft, keep = false) {
   if (issues.length) col.append(notice('warn', 'alert', '题目可能不完整', issues, [rereadButton(r)]));
   else if (r.questions?.length && r.content_status && r.content_status !== 'ready') col.append(notice('info', 'info', '建议重新读取题目', [r.content_status], [rereadButton(r)]));
 
+  if (r.instructions_html || r.instructions_text) {
+    const n = notice('soft', 'info', r.instructions_source === 'form_prefill' ? '表单预填说明' : '作业要求'), body = el('div', 'q-body');
+    renderRich(body, r.instructions_html, r.instructions_text);
+    n.querySelector('.notice-body').append(body);
+    col.append(n);
+  }
+
   if (draft.legacy_text) {
     const legacy = el('details', 'legacy');
     legacy.append(el('summary', '', '旧版草稿'), el('p', '', '请手动复制到对应题目。'));
@@ -1154,6 +1173,23 @@ function renderDetail(r, draft, keep = false) {
     const box = el('div', 'links');
     for (const a of links) box.append(externalLink(a.url, a.name || a.title || '查看附件'));
     n.querySelector('.notice-body').append(box);
+    col.append(n);
+  }
+  for (const [label, files] of [['网页已上传文件', r.online_attachments], ['教师批阅文件', r.review_attachments]]) {
+    const valid = (files || []).filter(a => /^https?:\/\//i.test(a.url || '') && !PLATFORM_PAGE.test(a.url));
+    if (!valid.length) continue;
+    const n = notice('soft', 'clip', label), box = el('div', 'links');
+    for (const a of valid) box.append(externalLink(a.url, a.name || '查看附件'));
+    n.querySelector('.notice-body').append(box);
+    col.append(n);
+  }
+  if (r.child_tasks?.length) {
+    const n = notice('soft', 'info', '作业内容');
+    for (const item of r.child_tasks) {
+      n.querySelector('.notice-body').append(el('p', '', `${item.title || '未命名内容'} · ${item.status_label || '状态待核实'}`));
+      if (item.description_text) n.querySelector('.notice-body').append(el('p', '', item.description_text));
+      if (/^https:\/\//i.test(item.entry_url || '')) n.querySelector('.notice-body').append(externalLink(item.entry_url, '打开 ' + (item.title || '该项内容')));
+    }
     col.append(n);
   }
 
@@ -1919,22 +1955,21 @@ function renderFill() {
   const r = record(), draft = drafts.get(S.key), dialog = $('#fill-dialog'), body = $('#fill-body');
   if (!r || !draft) { dialog.close(); return; }
   body.replaceChildren(closeButton(dialog), el('div', 'sheet-eyebrow', '自动填入'));
-  const noSubmit = () => { const n = el('div', 'no-submit'); n.append(icon('lock'), el('span', '', NO_SUBMIT)); return n; };
   if (fillPhase === 'check') {
     const {ready, skipped} = analyze(r, draft);
     body.append(titled('fill-title', '填入前检查'));
     const stats = el('div', 'stats');
-      stats.append(statCard(ready.length, '将填入', 'ok'), statCard(skipped.length, '将跳过', skipped.length ? 'warn' : ''), statCard(r.questions.length, '共计题目'));
+    stats.append(statCard(ready.length, '将填入', 'ok'), statCard(skipped.length, '将跳过', skipped.length ? 'warn' : ''), statCard(r.questions.length, '共计题目'));
     body.append(stats);
     if (skipped.length) {
       body.append(el('div', 'section-label', '以下题目不会自动填入'));
       const ul = el('ul', 'reasons');
-      ul.append(...reasonRows(skipped.map(x => ({i: x.index, kind: x.kind, reason: x.kind === 'upload' && x.text ? '文字答案也需手动填写。' : ''}))));
+      ul.append(...reasonRows(skipped.map(x => ({i: x.index, kind: x.kind, reason: ''}))));
       body.append(ul);
     }
     if (r.content_complete === false) body.append(notice('warn', 'alert', '', ['题目未读全，其余题目需在学习通完成。']));
     if (fillBlocker(r)) body.append(notice('warn', 'info', '暂不能填入', [fillBlocker(r)]));
-    body.append(noSubmit());
+    body.append(noSubmitNote());
     const actions = el('div', 'sheet-actions'), go = btn(ready.length ? `开始填入 ${ready.length} 题` : '没有可以自动填入的答案', 'btn-primary', async () => {
       go.disabled = true;
       if (await startAction('fill', r.key)) { fillPhase = 'running'; renderFill(); } else go.disabled = false;
@@ -1949,7 +1984,7 @@ function renderFill() {
     body.append(el('p', 'sheet-text', '填入期间请勿操作学习通窗口。'));
     const live = el('div', 'live');
     live.append(icon('loader'), document.createTextNode(' ' + (S.job.message || '正在处理…')));
-    body.append(live, noSubmit());
+    body.append(live, noSubmitNote());
     const actions = el('div', 'sheet-actions');
     actions.append(btn('在后台等待', '', () => dialog.close()));
     body.append(actions);
@@ -1987,7 +2022,7 @@ function renderFill() {
       body.append(ul);
     }
   }
-  body.append(noSubmit());
+  body.append(noSubmitNote());
   const actions = el('div', 'sheet-actions');
   if (failed || notRun) actions.append(Object.assign(btn('重新检查', '', () => { fillPhase = 'check'; renderFill(); }), {disabled: S.job.busy}));
   actions.append(btn('知道了', 'btn-dark', () => dialog.close()));

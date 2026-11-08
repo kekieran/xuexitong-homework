@@ -151,7 +151,7 @@ def write_json_file(path: str | Path, value: Any, *, indent: int | None = 2,
         目标文件路径（``Path``）。
 
     异常行为：``TypeError``（不可序列化，未传 ``default``）、``OSError``（写入失败、
-    父目录缺失）原样抛出。不追加结尾换行。失败时临时文件可能残留（既有实现同样如此）。
+    父目录缺失）原样抛出。不追加结尾换行。若写入或替换失败，会尽力清理残留的临时文件。
 
     注意：临时文件名为 ``path.name + f'.{os.getpid()}.{threading.get_ident()}.tmp'``，
     与 ``homework_engine.write_json`` 的既有命名逐字符一致；缩进与 ``ensure_ascii``
@@ -159,7 +159,12 @@ def write_json_file(path: str | Path, value: Any, *, indent: int | None = 2,
     本函数**不加锁**：``homework_engine.STATE_LOCK`` 等写锁仍由调用方持有。
     """
     target = Path(path)
+    payload = json.dumps(value, ensure_ascii=ensure_ascii, indent=indent)
     temporary = target.with_name(target.name + f'.{os.getpid()}.{threading.get_ident()}.tmp')
-    temporary.write_text(json.dumps(value, ensure_ascii=ensure_ascii, indent=indent), encoding='utf-8')
-    temporary.replace(target)
+    try:
+        temporary.write_text(payload, encoding='utf-8')
+        temporary.replace(target)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
     return target

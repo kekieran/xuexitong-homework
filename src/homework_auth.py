@@ -1,4 +1,4 @@
-"""One local sign-in for the two Chaoxing hosts, with user-bound Windows storage."""
+"""One local sign-in for Chaoxing and the discovered school host, with user-bound Windows storage."""
 from __future__ import annotations
 
 import ctypes
@@ -9,6 +9,7 @@ from urllib.parse import quote, urlsplit
 from playwright.sync_api import sync_playwright
 
 import homework_engine as engine
+import homework_school as school
 
 SCHOOL_URL = 'https://mooc.istudy.szpu.edu.cn/visit/interaction'
 SITES = {'chaoxing': engine.NOTICE_URL, 'school': SCHOOL_URL}
@@ -16,6 +17,8 @@ LOGIN_URLS = dict(SITES, school='https://passport.istudy.szpu.edu.cn/login?fid=1
 SITE_LABELS = {'chaoxing': '学习通', 'school': '学校站点'}
 CREDENTIAL_FILE = engine.runtime.DATA_DIR / 'login_credentials.bin'
 _AUTO_FAILED = False
+_DEFAULT_SITES = dict(SITES)
+_DEFAULT_LOGIN_URLS = dict(LOGIN_URLS)
 
 
 class BrowserUnavailable(RuntimeError):
@@ -24,6 +27,22 @@ class BrowserUnavailable(RuntimeError):
 
 class DataBlob(ctypes.Structure):
     _fields_ = [('cbData', ctypes.c_ulong), ('pbData', ctypes.POINTER(ctypes.c_ubyte))]
+
+
+def _custom_sites() -> bool:
+    return SITES != _DEFAULT_SITES or LOGIN_URLS != _DEFAULT_LOGIN_URLS
+
+
+def _site_url(platform: str) -> str:
+    if _custom_sites() or platform != 'school':
+        return SITES[platform]
+    return school.school_catalog_url() or SITES[platform]
+
+
+def _login_url(platform: str) -> str:
+    if _custom_sites() or platform != 'school':
+        return LOGIN_URLS[platform]
+    return school.school_login_url() or LOGIN_URLS[platform]
 
 
 def _protect(data: bytes, decrypt=False) -> bytes:
@@ -85,14 +104,20 @@ def credential_info():
 
 
 def probe(context, platform: str, *, timeout=12000) -> bool:
+    if platform == 'school' and not _custom_sites() and school.is_chaoxing_only():
+        return probe(context, 'chaoxing', timeout=timeout)
+    site_url = _site_url(platform)
+    response = None
     try:
-        response = context.request.get(SITES[platform], timeout=timeout)
+        response = context.request.get(site_url, timeout=timeout)
         if response.status >= 400:
             raise RuntimeError()
         markup = response.text()
-        return bool(markup.strip()) and urlsplit(response.url).hostname == urlsplit(SITES[platform]).hostname and not engine.dom.is_login(markup, response.url)
+        return bool(markup.strip()) and urlsplit(response.url).hostname == urlsplit(site_url).hostname and not engine.dom.is_login(markup, response.url)
     except Exception:
         raise RuntimeError('暂时无法核对登录状态，请检查网络后重试') from None
+    finally:
+        engine.lab.dispose_response(response)
 
 
 def _login_error(page):
@@ -100,7 +125,8 @@ def _login_error(page):
     for selector in ('#err-txt', '#phoneMsg', '#pwdMsg'):
         node = page.locator(selector).first
         if node.is_visible():
-            message = node.inner_text().strip()
+            raw_message = node.inner_text()
+            message = raw_message.strip() if isinstance(raw_message, str) else ''
             if not message:
                 continue
             if any(word in message for word in ('密码', '账号', '用户名', '手机号')):
@@ -113,14 +139,79 @@ def _login_error(page):
     return None
 
 
+def _needs_verification(page) -> bool:
+    for selector in ('#err-txt', '#phoneMsg', '#pwdMsg'):
+        try:
+            node = page.locator(selector).first
+            if node.is_visible() is True:
+                raw_message = node.inner_text()
+                if isinstance(raw_message, str) and any(word in raw_message for word in ('验证', '滑块', '安全校验')):
+                    return True
+        except Exception:
+            pass
+    for selector in ('.nc-container', '.geetest_panel', '.geetest_widget', '#captcha', '.verify-wrap'):
+        try:
+            node = page.locator(selector).first
+            if node.is_visible() is True:
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _fill_fallback_form(page, username: str, password: str) -> bool:
+    user_selectors = (
+        'input[name="uname"]',
+        'input[name="username"]',
+        'input[name="phone"]',
+        'input[type="text"]',
+        'input[type="tel"]',
+    )
+    pwd_selectors = (
+        'input[name="password"]',
+        'input[name="pwd"]',
+        'input[type="password"]',
+    )
+    btn_selectors = (
+        'button[type="submit"]',
+        'input[type="submit"]',
+        '.login-btn',
+        'button:has-text("登录")',
+    )
+    user_box = None
+    for sel in user_selectors:
+        loc = page.locator(sel).first
+        if loc.is_visible() is True:
+            user_box = loc
+            break
+    pwd_box = None
+    for sel in pwd_selectors:
+        loc = page.locator(sel).first
+        if loc.is_visible() is True:
+            pwd_box = loc
+            break
+    if not user_box or not pwd_box:
+        return False
+    user_box.fill(username)
+    pwd_box.fill(password)
+    for sel in btn_selectors:
+        loc = page.locator(sel).first
+        if loc.is_visible() is True:
+            loc.click(timeout=10000)
+            return True
+    pwd_box.press('Enter')
+    return True
+
+
 def _submit(context, platform, username, password, progress=None):
     """Fill and drive one site's login form through a hidden page."""
     progress = progress or (lambda message: None)
     label = SITE_LABELS[platform]
+    login_url = _login_url(platform)
     progress(f'正在登录{label}…')
     page = context.new_page()
     try:
-        page.goto(LOGIN_URLS[platform], wait_until='domcontentloaded', timeout=15000)
+        page.goto(login_url, wait_until='domcontentloaded', timeout=15000)
     except Exception:
         page.close()
         raise RuntimeError('后台登录页面无法打开，请检查网络后重试') from None
@@ -131,11 +222,19 @@ def _submit(context, platform, username, password, progress=None):
             page.locator('#pwd').fill(password)
             page.locator('#loginBtn').click(timeout=10000)
         except Exception:
-            raise RuntimeError('登录表单未能填写，请重新登录') from None
+            if not _fill_fallback_form(page, username, password):
+                try:
+                    if probe(context, platform, timeout=4000):
+                        progress(f'{label}登录已确认')
+                        return
+                except RuntimeError:
+                    pass
+                raise RuntimeError('登录表单未能填写，请重新登录') from None
         progress(f'正在确认{label}登录状态')
         deadline = time.monotonic() + 30
         next_probe = 0
         probe_succeeded = False
+        verification_opened = False
         while time.monotonic() < deadline:
             if page.is_closed():
                 raise RuntimeError('登录页面已关闭，请重新登录')
@@ -143,6 +242,21 @@ def _submit(context, platform, username, password, progress=None):
             error = _login_error(page)
             if error:
                 raise RuntimeError(f'{label}：{error}')
+            if not verification_opened and _needs_verification(page):
+                verification_opened = True
+                deadline = max(deadline, time.monotonic() + 60)
+                progress(f'{label}需要完成滑块验证，已自动打开验证窗口…')
+                try:
+                    engine.ensure_chrome(login_url, app=False)
+                except Exception:
+                    pass
+            if verification_opened:
+                try:
+                    session = engine.read_json(engine.DATA_DIR / 'browser_session.json', None)
+                    if isinstance(session, dict) and session.get('cookies') and hasattr(context, 'add_cookies'):
+                        context.add_cookies(session['cookies'])
+                except Exception:
+                    pass
             if time.monotonic() < next_probe:
                 continue
             try:
@@ -169,27 +283,99 @@ def status(username=None, password=None, *, restore=False, force_restore=False,
     if supplied and (not isinstance(username, str) or not username.strip() or not isinstance(password, str) or not password):
         raise ValueError('请输入账号和密码')
     credentials = (username.strip(), password) if supplied else None
+    account_changed = False
     if supplied:
+        prev_saved = (credential_info().get('username') or '').strip()
+        cfg_before = school.load_config() if not _custom_sites() else {}
+        prev_cfg_account = (cfg_before.get('account') or '').strip()
+        has_unattributed_state = (
+            not prev_saved
+            and not prev_cfg_account
+            and not _custom_sites()
+            and (
+                any((d / 'browser_session.json').exists() for d in {engine.DATA_DIR, engine.runtime.DATA_DIR})
+                or cfg_before.get('mode', 'unknown') != 'unknown'
+                or bool(cfg_before.get('fid'))
+                or bool(cfg_before.get('uid'))
+                or bool(cfg_before.get('school_origin'))
+            )
+        )
+        if (
+            (prev_saved and prev_saved != credentials[0])
+            or (prev_cfg_account and prev_cfg_account != credentials[0])
+            or has_unattributed_state
+        ):
+            account_changed = True
+            for session_dir in {engine.DATA_DIR, engine.runtime.DATA_DIR}:
+                try:
+                    (session_dir / 'browser_session.json').unlink(missing_ok=True)
+                except OSError:
+                    pass
         # The user asked the assistant to remember these locally even when a
         # site still needs a captcha or another manual verification step.
         save_credentials(*credentials)
+        if not _custom_sites():
+            school.sync_account(credentials[0])
         _AUTO_FAILED = False
     if not credentials and restore and (force_restore or not _AUTO_FAILED):
         try:
             credentials = load_credentials()
         except RuntimeError:
             _AUTO_FAILED = True
+
     def authenticate(active_context):
         global _AUTO_FAILED
-        sites = {name: probe(active_context, name) for name in SITES}
+        if account_changed:
+            if hasattr(active_context, 'clear_cookies'):
+                try:
+                    active_context.clear_cookies()
+                except Exception:
+                    pass
+            sites = {name: False for name in SITES}
+        else:
+            sites = {}
+            for name in SITES:
+                if name == 'chaoxing':
+                    cx_ok = probe(active_context, 'chaoxing')
+                    sites['chaoxing'] = cx_ok
+                    if not _custom_sites() and cx_ok and school.load_config().get('mode') == 'unknown':
+                        known_user = credentials[0] if credentials else (credential_info().get('username') or '').strip()
+                        school.discover_school(active_context, username=known_user or None)
+                elif name == 'school' and not _custom_sites() and school.is_chaoxing_only():
+                    sites['school'] = bool(sites.get('chaoxing', False))
+                elif name == 'school' and not _custom_sites() and school.load_config().get('mode') == 'unknown' and not sites.get('chaoxing'):
+                    try:
+                        sites['school'] = probe(active_context, 'school')
+                    except RuntimeError:
+                        sites['school'] = False
+                else:
+                    sites[name] = probe(active_context, name)
         if on_state:
             on_state({'logged_in': all(sites.values()), 'sites': dict(sites)})
         if credentials:
             try:
-                for platform, logged_in in sites.items():
-                    if not logged_in:
+                for platform in list(sites):
+                    if not sites[platform]:
+                        if platform == 'school' and not _custom_sites() and school.is_chaoxing_only():
+                            sites['school'] = bool(sites.get('chaoxing', False))
+                            if on_state:
+                                on_state({'logged_in': all(sites.values()), 'sites': dict(sites)})
+                            continue
                         _submit(active_context, platform, *credentials, progress=progress)
                         sites[platform] = True
+                        if platform == 'chaoxing' and not _custom_sites():
+                            school.discover_school(active_context, username=credentials[0])
+                            if 'school' in sites:
+                                if school.is_chaoxing_only():
+                                    sites['school'] = True
+                                elif school.load_config().get('mode') == 'school_site':
+                                    if account_changed:
+                                        sites['school'] = False
+                                    else:
+                                        try:
+                                            sites['school'] = probe(active_context, 'school')
+                                        except RuntimeError:
+                                            sites['school'] = False
                         if on_state:
                             on_state({'logged_in': all(sites.values()), 'sites': dict(sites)})
             except Exception:

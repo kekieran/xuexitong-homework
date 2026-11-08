@@ -97,7 +97,9 @@ window.HomeworkAI = (() => {
       const protocol = el('select', 'input'); for (const [protocolId, label] of Object.entries(config.protocols)) { const option = el('option', '', label); option.value = protocolId; protocol.append(option); } protocol.value = current.protocol; protocol.disabled = provider !== 'custom';
       const address = el('input', 'input'); address.type = 'url'; address.required = true; address.value = current.base_url || ''; address.readOnly = provider !== 'custom'; address.placeholder = 'https://example.com/v1';
       const grid = el('div', 'ai-form-grid'); grid.append(field('模型名称', model, 'ai-model'), field('API 密钥', secret, 'ai-api-key'), field('配置名称', name, 'ai-profile-name'), field('接口类型', protocol, 'ai-protocol'), field('接口地址', address, 'ai-base-url', 'ai-form-wide')); form.append(grid);
-      const visionRow = el('label', 'ai-checkbox'); const vision = el('input'); vision.type = 'checkbox'; vision.checked = !!current.vision; visionRow.append(vision, el('span', '', '模型支持识图')); form.append(visionRow);
+      // 四家固定平台都能识图；只有自定义接口需要自行声明
+      const vision = el('input'); vision.type = 'checkbox'; vision.checked = provider !== 'custom' || !!current.vision;
+      if (provider === 'custom') { const visionRow = el('label', 'ai-checkbox'); visionRow.append(vision, el('span', '', '模型支持识图')); form.append(visionRow); }
       const note = el('div', 'ai-note'); note.append(icon('info'), el('span', '', '密钥只保存在本机，测试连接会调用你填写的接口。')); form.append(note);
       const status = el('p', 'ai-config-status' + (settingsNotice?.tone ? ' ' + settingsNotice.tone : '')); status.id = 'ai-config-message'; status.setAttribute('role', 'status'); if (settingsNotice) status.textContent = settingsNotice.text; form.append(status);
       const actions = el('div', 'ai-form-actions'), test = btn('测试连接', '', async () => { if (!form.reportValidity() || !(await persist())) return; settingsNotice = {text: '正在测试连接…', tone: ''}; renderSettings(); if (await startAction('ai-test')) {} }), save = btn('保存并使用', 'btn-primary'); save.type = 'submit';
@@ -206,7 +208,7 @@ window.HomeworkAI = (() => {
     const title = el('h2', 'sheet-title', '作答结果'); title.id = 'ai-result-title';
     const stats = el('div', 'stats');
     for (const [n, label, tone] of [[filled.length, '已填写', 'ok'], [templates.length, '简答模板', 'clay'], [skipped.length, '已跳过', 'warn']]) {
-      const s = el('div', 'stat ' + (n ? tone : '')); s.append(el('b', '', String(n)), el('small', '', label)); stats.append(s);
+      stats.append(statCard(n, label, n ? tone : ''));
     }
     body.append(title, stats, el('div', 'section-label', '跳过的题目'));
     const questions = S.records.find(r => r.key === key)?.questions || [];
@@ -218,8 +220,7 @@ window.HomeworkAI = (() => {
       list.append(row);
     }
     const done = el('div', 'sheet-actions'); done.append(btn('完成', 'btn-primary', () => dialog.close()));
-    const note = el('div', 'no-submit'); note.append(icon('lock'), el('span', '', 'AI 只写入助手，不会提交作业。请检查后再前往交作业。'));
-    body.append(list, note, done);
+    body.append(list, noSubmitNote('AI 只写入助手，不会提交作业。请检查后再前往交作业。'), done);
     if (!dialog.open) dialog.showModal();
   }
 

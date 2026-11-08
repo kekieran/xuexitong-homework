@@ -7,6 +7,7 @@ import json
 from html.parser import HTMLParser
 from urllib.parse import urljoin, urlsplit, parse_qs
 
+import homework_school as school
 import homework_shared as shared
 
 VOID = {'img', 'input', 'br', 'hr', 'meta', 'link', 'source', 'wbr', 'area', 'base', 'embed', 'param', 'col'}
@@ -74,8 +75,7 @@ def fields(root):
 
 def platform_url(url):
     try:
-        u = urlsplit(url)
-        return u.scheme in {'https', 'http'} and (u.hostname == 'chaoxing.com' or (u.hostname or '').endswith('.chaoxing.com') or u.hostname in {'mooc.istudy.szpu.edu.cn', 'passport.istudy.szpu.edu.cn'})
+        return school.is_platform_url(url)
     except ValueError:
         return False
 
@@ -109,16 +109,30 @@ def platform_host(host):
     return 'chaoxing' if host == 'chaoxing.com' or host.endswith('.chaoxing.com') else host
 
 
+def query_params(url):
+    """Return lower-cased single-value query parameters for a URL, or {} on malformed URL."""
+    try:
+        return {k.lower(): v[0] for k, v in parse_qs(urlsplit(url or '').query).items() if v}
+    except ValueError:
+        return {}
+
+
+def course_class_pair(url):
+    """Extract (course_id, class_id) from a URL's query parameters, accepting classId or clazzId."""
+    q = query_params(url)
+    return q.get('courseid', ''), q.get('classid') or q.get('clazzid', '')
+
+
 def url_identity(url):
     """Taskref and work IDs are aliases, not interchangeable numbers."""
     try:
         u = urlsplit(url or '')
-        q = {k.lower(): v[0] for k, v in parse_qs(u.query).items() if v}
-        host = platform_host(u.hostname)
-        course, clazz = q.get('courseid', ''), q.get('classid', q.get('clazzid', ''))
-        return [f'{host}:{course}:{clazz}:{k}:{q[k]}' for k in ('taskrefid', 'workid') if q.get(k) and course and clazz]
     except ValueError:
         return []
+    q = query_params(url)
+    host = platform_host(u.hostname)
+    course, clazz = course_class_pair(url)
+    return [f'{host}:{course}:{clazz}:{k}:{q[k]}' for k in ('taskrefid', 'workid') if q.get(k) and course and clazz]
 
 
 # Keep the candidate URL order and identity inputs identical for navigation and
