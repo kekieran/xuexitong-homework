@@ -3,10 +3,15 @@ from pathlib import Path
 import argparse
 import ctypes
 import hashlib
+import json
 import os
+import re
 import shutil
 import subprocess
 import shlex
+import time
+import urllib.request
+from urllib.parse import urlsplit
 
 APP_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = APP_DIR / 'data'
@@ -159,6 +164,69 @@ def chrome_args(url=None, app=False, port=9222):
     return browser_args(url, app, port)
 
 
+class _NoCDPRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _local_cdp_url(value, *, websocket=False):
+    """Reject credentials, redirects and non-loopback debugging endpoints."""
+    if not isinstance(value, str) or re.search(r'[\s\\]', value):
+        raise ValueError('Invalid local debugging address')
+    parsed = urlsplit(value)
+    schemes = {'ws', 'wss'} if websocket else {'http', 'https'}
+    if (parsed.scheme not in schemes or parsed.hostname not in {'127.0.0.1', 'localhost', '::1'}
+            or parsed.username is not None or parsed.password is not None
+            or parsed.query or parsed.fragment):
+        raise ValueError('Invalid local debugging address')
+    port = parsed.port if parsed.port is not None else (443 if parsed.scheme in {'https', 'wss'} else 80)
+    if not 1 <= port <= 65535:
+        raise ValueError('Invalid local debugging port')
+    if websocket:
+        if not re.fullmatch(r'/devtools/browser/[A-Za-z0-9-]+', parsed.path):
+            raise ValueError('Invalid browser debugging endpoint')
+    elif parsed.path not in {'', '/'}:
+        raise ValueError('Invalid local debugging path')
+    return parsed, port
+
+
+def connect_browser_direct(playwright, endpoint, *, timeout=2500):
+    """Discover CDP without inheriting environment or Windows proxy settings.
+
+    Playwright's HTTP discovery honors proxy environment variables even for
+    localhost. Its WebSocket connection is direct, so only discovery needs this
+    small local opener. Nothing changes the process or system proxy settings.
+    """
+    deadline = time.monotonic() + max(timeout, 1) / 1000
+    try:
+        if isinstance(endpoint, str) and endpoint.startswith(('ws:', 'wss:')):
+            _local_cdp_url(endpoint, websocket=True)
+            websocket_url = endpoint
+        else:
+            parsed, port = _local_cdp_url(endpoint)
+            discovery = parsed._replace(path='/json/version', query='', fragment='').geturl()
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoCDPRedirect())
+            with opener.open(discovery, timeout=max(timeout, 1) / 1000) as response:
+                if response.status != 200:
+                    raise ValueError('Browser discovery failed')
+                raw = response.read(65537)
+            if len(raw) > 65536:
+                raise ValueError('Browser discovery response too large')
+            payload = json.loads(raw)
+            websocket_url = payload.get('webSocketDebuggerUrl') if isinstance(payload, dict) else None
+            target, target_port = _local_cdp_url(websocket_url, websocket=True)
+            if (target.hostname != parsed.hostname or target_port != port
+                    or target.scheme != ('wss' if parsed.scheme == 'https' else 'ws')):
+                raise ValueError('Browser discovery changed the local address')
+        remaining = int((deadline - time.monotonic()) * 1000)
+        if remaining <= 0:
+            raise TimeoutError()
+        return playwright.chromium.connect_over_cdp(websocket_url, timeout=remaining)
+    except Exception:
+        # Browser errors can include credentials or page URLs; keep this fixed.
+        raise RuntimeError('无法直连助手专用浏览器，请重新打开助手窗口后重试。') from None
+
+
 def verify_browser_profile(browser):
     """Do not accidentally use another Chrome listening on the same local port."""
     session = browser.new_browser_cdp_session()
@@ -174,6 +242,8 @@ def verify_browser_profile(browser):
         profile = next((value.split('=', 1)[1] for value in arguments if value.startswith('--user-data-dir=')), None)
         if not profile or Path(profile).resolve() != PROFILE_DIR.resolve():
             raise RuntimeError('浏览器调试端口正被其他程序使用，请关闭旧的助手浏览器后重试。')
+        if '--no-proxy-server' not in arguments:
+            raise RuntimeError('旧的助手浏览器尚未启用直连，请关闭助手的浏览器窗口后重新打开；无需更改代理设置。')
     except RuntimeError:
         raise
     except Exception:

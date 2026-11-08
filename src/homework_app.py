@@ -106,7 +106,7 @@ def reminder_snapshot():
     now = datetime.now()
     upcoming = next_reminder_at(now, times) if enabled else None
     return {'enabled': enabled, 'times': times, 'max_times': MAX_REMINDER_TIMES,
-            'next_check': upcoming.isoformat(timespec='minutes') if upcoming else None}
+            'next_check': shared.iso_timestamp(upcoming, timespec='minutes') if upcoming else None}
 
 def set_reminder(enabled, times=None):
     validated_times = normalize_reminder_times(times) if times is not None else None
@@ -317,6 +317,14 @@ def workspace_snapshot():
                 record.pop('content_error', None)
             record['progress'] = workspace.answer_progress(record, {} if record['group'] == 'history' else drafts.get(key, {}))
             record['capabilities'] = workspace.capabilities(record)
+            if record.get('source_kind') == 'lab_report' and record['group'] != 'history':
+                info = record.get('lab_report') or {}
+                record['online_attachments'] = list(info.get('student_attachments') or [])
+                record['review_attachments'] = list(info.get('review_attachments') or [])
+                record['child_tasks'] = list(info.get('child_reports') or [])
+                record['instructions_source'] = info.get('instructions_source')
+                if str(info.get('status_code')) == '5':
+                    record['submission_note'] = '待重做'
             records.append(record)
     return {'assignments': records, 'record_aliases': state.get('record_aliases', {}),
             'last_success': state.get('last_success'), 'last_check': state.get('last_check'),
@@ -429,7 +437,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         url = urllib.parse.urlsplit(self.path)
         try:
-            length = int(self.headers.get("Content-Length", "0"))
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                raise ValueError("请求内容大小不正确") from None
             limit = 30 * 1024 * 1024 if url.path == "/api/upload" else 2 * 1024 * 1024
             if length <= 0 or length > limit:
                 raise ValueError("文件不能超过 30 MB" if url.path == "/api/upload" else "请求内容大小不正确")
@@ -451,7 +462,12 @@ class Handler(BaseHTTPRequestHandler):
                     path.write_bytes(raw)
                 self.send(200, {"id": file_id, "name": name, "path": path.relative_to(APP_DIR).as_posix(), "size": length})
                 return
-            payload = json.loads(raw.decode("utf-8"))
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                raise ValueError("请求数据格式不正确") from None
+            if not isinstance(payload, dict):
+                raise ValueError("请求数据格式不正确")
             # Resolve the assignment key only where a branch needs it:
             # /api/ai/settings, /api/reminder and /api/exit take none at all.
             if url.path == '/api/ai/settings':
@@ -471,13 +487,8 @@ class Handler(BaseHTTPRequestHandler):
                     if not isinstance(draft, dict):
                         raise ValueError("草稿格式不正确")
                     if key != payload.get("key"):
-                        merged = backend.load_draft(key)
-                        merged["answers"] = backend.merge_draft_answers(
-                            merged.get("answers"), draft.get("answers"), incoming_wins=True)
-                        old_text = draft.get("legacy_text", "")
-                        if old_text and old_text not in merged.get("legacy_text", ""):
-                            merged["legacy_text"] = (merged.get("legacy_text", "") + "\n\n" + old_text).strip()
-                        draft = merged
+                        draft = backend.merge_draft_records(
+                            backend.load_draft(key), draft, incoming_wins=True)
                     saved = backend.save_draft(key, draft)
                 self.send(200, saved)
             elif url.path == "/api/assignment-settings":
@@ -619,7 +630,7 @@ def main():
             reachable = False
             try:
                 # HTTPError 403 is expected after the bootstrap redirect without a cookie jar.
-                opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor())
+                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPCookieProcessor())
                 opener.open(url, timeout=2).close()
                 reachable = True
             except urllib.error.HTTPError:

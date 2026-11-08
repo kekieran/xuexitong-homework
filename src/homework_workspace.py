@@ -5,6 +5,7 @@ local midnight; `within_3_days` and `within_7_days` are rolling, overlapping
 windows containing only active assignments. Keys reference /api/state records.
 """
 from datetime import datetime, timedelta
+from homework_shared import iso_timestamp
 
 PROGRESS_STATES = ('unstarted', 'partial', 'complete', 'unread')
 
@@ -98,6 +99,6 @@ def dashboard(records, now=None):
         for days in (3, 7):
             if deadline <= now + timedelta(days=days):
                 keys[f'within_{days}_days'].append(key)
-    return {'version': 1, 'generated_at': now.isoformat(timespec='seconds'),
+    return {'version': 1, 'generated_at': iso_timestamp(now),
             'counts': {name: len(value) for name, value in keys.items()},
             'questions': {'answered': answered, 'total': total}, 'keys': keys}

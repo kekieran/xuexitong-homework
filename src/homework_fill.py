@@ -19,6 +19,11 @@ import homework_dom as dom
 import homework_shared as shared
 
 
+CONTROL_TIMEOUT_MS = 2000
+PAGE_LOAD_TIMEOUT_MS = 25000
+EDITOR_TIMEOUT_MS = 7000
+
+
 def _normalized(value):
     """折叠连续空白并去掉首尾空白；委托 homework_shared.collapse_whitespace。
 
@@ -143,10 +148,10 @@ def _fill_essay(root, value, editor_name=None):
             return '网页已有不同答案，未覆盖'
         if current == expected:
             return None
-        editor.fill(value)
-        editor.dispatch_event('input')
-        editor.dispatch_event('change')
-        editor.dispatch_event('blur')
+        editor.fill(value, timeout=CONTROL_TIMEOUT_MS)
+        editor.dispatch_event('input', timeout=CONTROL_TIMEOUT_MS)
+        editor.dispatch_event('change', timeout=CONTROL_TIMEOUT_MS)
+        editor.dispatch_event('blur', timeout=CONTROL_TIMEOUT_MS)
         return None if _normalized(editor.inner_text()) == expected else '答案回读未通过'
 
     controls = _visible_text_controls(root)
@@ -156,8 +161,8 @@ def _fill_essay(root, value, editor_name=None):
         if current and current != _normalized(value):
             return '网页已有不同答案，未覆盖'
         if not current:
-            control.fill(value)
-            control.dispatch_event('change')
+            control.fill(value, timeout=CONTROL_TIMEOUT_MS)
+            control.dispatch_event('change', timeout=CONTROL_TIMEOUT_MS)
         return None if _normalized(control.input_value()) == _normalized(value) else '答案回读未通过'
     # Standard contenteditable with explicit answer mapping is supported too.
     editable = root.locator('[contenteditable="true"]')
@@ -170,8 +175,8 @@ def _fill_essay(root, value, editor_name=None):
         if current and current != _normalized(value):
             return '网页已有不同答案，未覆盖'
         if not current:
-            editable.fill(value)
-            editable.dispatch_event('change')
+            editable.fill(value, timeout=CONTROL_TIMEOUT_MS)
+            editable.dispatch_event('change', timeout=CONTROL_TIMEOUT_MS)
         return None if _normalized(editable.inner_text()) == _normalized(value) else '答案回读未通过'
     return '未识别到可验证的文本编辑器，请在原网页填写'
 
@@ -384,8 +389,8 @@ def _fill_blanks(root, question, value):
                 if reason:
                     return reason
             else:
-                control.fill(answer)
-                control.dispatch_event('change')
+                control.fill(answer, timeout=CONTROL_TIMEOUT_MS)
+                control.dispatch_event('change', timeout=CONTROL_TIMEOUT_MS)
     for control, answer, _ in controls:
         actual = _editor_info(root, control)[0]['text'] if isinstance(control, str) else control.input_value()
         if _normalized(actual) != _normalized(answer):
@@ -439,7 +444,7 @@ def _fill_choice(root, question, value):
             return '选项只暴露隐藏字段，未模拟填入'
         targets.append((label, False))
     for target, native in targets:
-        target.check() if native else target.click()
+        target.check(timeout=CONTROL_TIMEOUT_MS) if native else target.click(timeout=CONTROL_TIMEOUT_MS)
     actual = {v for v, control in pairs if control.is_checked()}
     return None if actual == expected else '选项回读未通过，请在网页检查'
 
@@ -488,16 +493,16 @@ def _fill_platform_choice(root, question, expected, allowed):
         return None
     for value, option, _ in pairs:
         if value in expected:
-            option.click()
+            option.click(timeout=CONTROL_TIMEOUT_MS)
     return None if visible_selected() == expected and form_selected() == expected else '选项填入后未同步，请在网页检查'
 
 
 def _read_only_url(url):
     path = url.split('?', 1)[0].lower().rstrip('/')
-    return bool(re.search(r'/work/(?:view(?:work|answer|report)?|workreport)(?:/|$)', path) or any(part in path for part in ('viewwork', 'workreport', 'viewanswer')))
+    return bool(re.search(r'/work/view(?:report)?(?:/|$)', path) or any(part in path for part in ('viewwork', 'workreport', 'viewanswer')))
 
 
-def fill_page(page, questions, answers):
+def fill_page(page, questions, answers, progress=None):
     """Fill only matching saved answers in this already-verified document.
 
     Kept independent of disk/network for fixture-based browser regression tests.
@@ -508,7 +513,9 @@ def fill_page(page, questions, answers):
     if len(ids) != len(set(ids)):
         return {'filled': [], 'skipped': [{'id': '', 'reason': '题目编号重复，已停止填入'}]}
     by_id = {str(q['id']): q for q in questions}
-    for qid, saved in answers.items():
+    for index, (qid, saved) in enumerate(answers.items(), 1):
+        if progress:
+            progress(f'正在填入第 {index} / {len(answers)} 题…')
         qid = str(qid)
         reason = None
         question = by_id.get(qid)
@@ -657,7 +664,7 @@ def _open_fill_context(playwright, backend, timeout=12):
     deadline = time.monotonic() + timeout
     while True:
         try:
-            browser = playwright.chromium.connect_over_cdp(backend.CHAOXING_CDP_URL, timeout=1000)
+            browser = backend.runtime.connect_browser_direct(playwright, backend.CHAOXING_CDP_URL, timeout=1000)
         except Exception:
             if time.monotonic() >= deadline:
                 raise RuntimeError('尚未连接到专用学习通窗口，请重新打开后再填入。')
@@ -677,10 +684,69 @@ def _open_fill_context(playwright, backend, timeout=12):
         return context
 
 
+def _wait_for_answer_editors(page, questions, answers):
+    """Share one readiness budget only among the editors this draft will use."""
+    targets = []
+    for question in questions:
+        qid = str(question.get('id', ''))
+        saved = answers.get(qid)
+        if (not re.fullmatch(r'\d+', qid) or not isinstance(saved, dict)
+                or saved.get('signature') != question.get('signature')
+                or (saved.get('value') in (None, '', []) and not saved.get('files'))):
+            continue
+        if question.get('type') not in {'essay', 'blank', 'upload'} and not saved.get('files'):
+            continue
+        targets.append({'id': qid, 'type': question.get('type'),
+                        'names': question.get('blank_names') or [],
+                        'text': saved.get('value') not in (None, '', []),
+                        'files': bool(saved.get('files'))})
+    if not targets:
+        return True
+    try:
+        page.wait_for_function("""targets => targets.every(target => {
+            const id = target.id;
+            const candidateRoots = [...document.querySelectorAll(
+                `.singleQuesId[data="${id}"], .singleQuesId[data-questionid="${id}"], ` +
+                `.questionLi[data="${id}"], .questionLi[data-questionid="${id}"], ` +
+                `.singleQuesId:has(input[name="type${id}"]), ` +
+                `.questionLi:has(input[name="type${id}"]), .TiMu:has(input[name="type${id}"])`)];
+            const leaves = candidateRoots.filter(e => !candidateRoots.some(n => n !== e && e.contains(n)));
+            // Missing or ambiguous roots will be skipped by fill_page, not awaited.
+            if (leaves.length !== 1) return true;
+            const root = leaves[0], name = null;
+        """ + _UE_EDITORS + """
+            const visible = e => !!e.getClientRects().length && getComputedStyle(e).visibility !== 'hidden';
+            const readyEditors = editors.filter(e => e.body.isContentEditable && typeof e.setContent === 'function');
+            const controls = [...root.querySelectorAll('textarea, input:not([type]), input[type=text], input[type=number]')]
+                .filter(e => visible(e) && !e.disabled && !e.readOnly);
+            const hasText = () => controls.length === 1 || readyEditors.length === 1 ||
+                [...root.querySelectorAll('[contenteditable=true]')].some(e => visible(e) && e.isContentEditable) ||
+                [...root.querySelectorAll('iframe')].some(e => {
+                    try { return visible(e) && e.contentDocument?.body?.isContentEditable; }
+                    catch (_) { return false; }
+                });
+            const textReady = !target.text || (target.type === 'blank' ? target.names.every(n =>
+                controls.some(e => e.name === n || e.id === n) ||
+                readyEditors.some(e => [e.key,e.textarea?.id,e.textarea?.name].includes(n))) :
+                target.type !== 'essay' || hasText());
+            const toolbars = [...root.querySelectorAll('.edui-for-attachment_new')].filter(visible);
+            const filesReady = !target.files || (toolbars.length ?
+                toolbars.length === 1 && readyEditors.length === 1 : !!root.querySelector('input[type=file]'));
+            return textReady && filesReady;
+        })""", arg=targets, timeout=EDITOR_TIMEOUT_MS)
+        return True
+    except Exception:
+        # Filling still checks each control and skips anything that is not ready.
+        return False
+
+
 def open_assignment(key):
     b = _backend()
     with b.browser_operation():
         record = _record(key)
+        if record.get('source_kind') == 'lab_report':
+            from homework_lab_fill import open_assignment as open_lab
+            return open_lab(key)
         entry = _entry(record)
         from playwright.sync_api import sync_playwright
         from homework_navigation import resolve_work_page
@@ -704,6 +770,9 @@ def open_assignment(key):
 
 def fill_assignment(key):
     b = _backend()
+    if _record(key).get('source_kind') == 'lab_report':
+        from homework_lab_fill import fill_assignment as fill_lab
+        return fill_lab(key)
     with b.browser_operation():
         return _fill_assignment(key)
 
@@ -738,10 +807,15 @@ def _fill_assignment(key):
     if not dom.record_identities(record):
         return {'filled': [], 'skipped': [], 'message': '作业身份尚未核实，请先刷新。'}
     has_attachments = any(isinstance(v, dict) and v.get('files') for v in answers.values())
-    from playwright.sync_api import sync_playwright
-    b.ensure_chrome(url, app=False)
+    from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+    progress = getattr(b, 'PROGRESS', lambda message: None)
+    progress('正在连接学习通窗口…')
+    # Resolve and validate first; opening the notice/list here would load the
+    # same assignment twice and race the later page lookup during redirects.
+    b.ensure_chrome(app=False)
     with sync_playwright() as p:
         context = None
+        phase = 'connect'
         try:
             context = _open_fill_context(p, b)
             # Never create a disposable browser whose closure would discard the
@@ -752,6 +826,8 @@ def _fill_assignment(key):
             # cached pending status/deadline is insufficient if the teacher closed
             # the assignment since the assistant's last refresh.
             from homework_navigation import resolve_work_page
+            progress('正在核实作业状态…')
+            phase = 'verify'
             detail, detail_final = resolve_work_page(context, record, b.fetch_html)
             url = detail_final
             if not _identity_matches(record, detail, detail_final):
@@ -764,8 +840,14 @@ def _fill_assignment(key):
                 return {'filled': [], 'skipped': [], 'message': reason}
             matches = [existing for existing in context.pages if existing.url == url]
             page = matches[-1] if matches else context.new_page()
+            progress('正在加载学习通作答页…')
+            phase = 'page'
             if not matches:
-                page.goto(url, wait_until='domcontentloaded', timeout=25000)
+                page.goto(url, wait_until='domcontentloaded', timeout=PAGE_LOAD_TIMEOUT_MS)
+            else:
+                # Do not reload a page that may already contain the user's work.
+                page.wait_for_load_state('domcontentloaded', timeout=PAGE_LOAD_TIMEOUT_MS)
+            phase = 'verify'
             page.bring_to_front()
             markup = page.content()
             if dom.is_login(markup, page.url):
@@ -785,7 +867,9 @@ def _fill_assignment(key):
             if not questions:
                 entry = dom.phone_entry(markup, page.url)
                 if entry and dom.platform_url(entry):
-                    page.goto(entry, wait_until='domcontentloaded', timeout=25000)
+                    phase = 'page'
+                    page.goto(entry, wait_until='domcontentloaded', timeout=PAGE_LOAD_TIMEOUT_MS)
+                    phase = 'verify'
                     markup = page.content()
                     if dom.is_login(markup, page.url) or _read_only_url(page.url) or not _identity_matches(record, markup, page.url):
                         return {'filled': [], 'skipped': [], 'message': '作答页面的登录或作业身份校验未通过，未填入。'}
@@ -799,15 +883,8 @@ def _fill_assignment(key):
             diagnostics = dom.question_diagnostics(markup, questions)
             if len({q['id'] for q in questions}) != len(questions):
                 return {'filled': [], 'skipped': [], 'message': '页面题目编号重复，已停止填入。'}
-            # UEditor initializes asynchronously after DOMContentLoaded.
-            try:
-                page.wait_for_function("""() => {
-                    if(document.querySelector('#ananas-editor-answer')) return !!window.ueditor?.body;
-                    const areas=[...document.querySelectorAll('.questionLi textarea[id^=answer]')];
-                    return areas.every(a=>a.offsetParent!==null) || [...Object.values(window.UE?.instants||{}),...Object.values(window.UE?.instances||{})].some(e=>e?.body);
-                }""", timeout=7000)
-            except Exception:
-                pass
+            progress('正在准备答案控件…')
+            _wait_for_answer_editors(page, questions, answers)
             # Page scripts can randomize option order during editor startup.
             # Reparse the actual displayed question immediately before matching.
             markup = page.content()
@@ -827,11 +904,16 @@ def _fill_assignment(key):
                     saved = dict(saved)
                     saved['_local_files'] = _local_attachment_files(b, saved.get('files'))
                 fill_answers[qid] = saved
-            result = fill_page(page, questions, fill_answers)
+            progress('正在填入答案…')
+            result = fill_page(page, questions, fill_answers, progress=progress)
             result['message'] = f"已填入 {len(result['filled'])} 题，跳过 {len(result['skipped'])} 题。"
             if not diagnostics['complete']:
                 result['message'] += ' 当前页面未确认包含全部题目，其他页未自动填入。'
             return result
+        except PlaywrightTimeoutError as exc:
+            if phase == 'page':
+                return {'filled': [], 'skipped': [], 'message': '学习通作答页加载超时，尚未填入答案。已保留网页，请待页面加载完成后重试。'}
+            return {'filled': [], 'skipped': [], 'message': '打开或填入失败：' + b.safe_error(exc)}
         except Exception as exc:
             return {'filled': [], 'skipped': [], 'message': '打开或填入失败：' + b.safe_error(exc)}
         finally:

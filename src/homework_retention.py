@@ -15,14 +15,21 @@ SUMMARY_FIELDS = frozenset(('key', 'title', 'course', 'status', 'availability',
     'deadline_notice_time', 'start', 'first_seen', 'last_seen', 'identities',
     'source_notice_ids', 'entry_url', 'answer_url', 'work_url', 'list_url',
     'metadata_checked_at', 'status_checked_at', 'notice_sent', 'local_settings',
-    'group', 'history_cleaned_at'))
+    'group', 'history_cleaned_at', 'source_kind', 'published_at', 'lab_report'))
 
 
 def summary(record):
-    return {key: value for key, value in record.items() if key in SUMMARY_FIELDS}
+    result = {key: value for key, value in record.items() if key in SUMMARY_FIELDS}
+    if isinstance(result.get('lab_report'), dict):
+        result['lab_report'] = {key: value for key, value in result['lab_report'].items()
+            if key in {'origin', 'fid', 'report_id', 'type', 'upload_type', 'course_id', 'belong_type',
+                       'is_virtual', 'group_mode', 'status_code', 'status_label', 'read_at'}}
+    return result
 
 
 def platform(record):
+    if record.get('source_kind') == 'lab_report':
+        return 'lab'
     for field in ('entry_url', 'work_url', 'answer_url', 'list_url'):
         host = urlsplit(record.get(field) or '').hostname or ''
         if host == 'istudy.szpu.edu.cn' or host.endswith('.istudy.szpu.edu.cn'):

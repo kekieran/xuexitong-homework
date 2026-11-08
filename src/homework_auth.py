@@ -85,6 +85,7 @@ def credential_info():
 
 
 def probe(context, platform: str, *, timeout=12000) -> bool:
+    response = None
     try:
         response = context.request.get(SITES[platform], timeout=timeout)
         if response.status >= 400:
@@ -93,6 +94,8 @@ def probe(context, platform: str, *, timeout=12000) -> bool:
         return bool(markup.strip()) and urlsplit(response.url).hostname == urlsplit(SITES[platform]).hostname and not engine.dom.is_login(markup, response.url)
     except Exception:
         raise RuntimeError('暂时无法核对登录状态，请检查网络后重试') from None
+    finally:
+        engine.lab.dispose_response(response)
 
 
 def _login_error(page):

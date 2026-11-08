@@ -13,11 +13,12 @@ import unicodedata
 import ctypes
 from contextlib import contextmanager
 from datetime import datetime, timedelta
-from urllib.parse import urljoin, urlsplit, parse_qs
+from urllib.parse import urljoin, urlsplit
 from playwright.sync_api import sync_playwright
 import homework_dom as dom
 import homework_runtime as runtime
 import homework_shared as shared
+import homework_lab as lab
 
 DATA_DIR = runtime.DATA_DIR
 PROFILE_DIR = runtime.PROFILE_DIR
@@ -221,6 +222,7 @@ def effective_record(item, overrides=None):
 
 
 def set_local_override(key, completed, deadline):
+    global _OVERRIDES_CACHE
     if not isinstance(completed, bool):
         raise ValueError('完成状态格式不正确')
     if deadline is not None and (not isinstance(deadline, str) or not parse_datetime(deadline)):
@@ -231,10 +233,11 @@ def set_local_override(key, completed, deadline):
             raise ValueError('找不到这份作业，请刷新列表')
         values = dict(local_overrides())
         if completed or deadline:
-            values[key] = {'completed': completed, 'deadline': parse_datetime(deadline).isoformat(timespec='minutes') if deadline else None, 'updated_at': datetime.now().isoformat(timespec='microseconds')}
+            values[key] = {'completed': completed, 'deadline': shared.iso_timestamp(parse_datetime(deadline), timespec='minutes') if deadline else None, 'updated_at': shared.iso_timestamp(timespec='microseconds')}
         else:
             values.pop(key, None)
         write_json(OVERRIDES_FILE, values)
+        _OVERRIDES_CACHE = (None, {})
     return dict(values.get(key, {}))
 
 
@@ -259,6 +262,8 @@ def match_record(records, candidate):
     pair = normalize(candidate.get('course')), normalize(candidate.get('title'))
     matches = []
     for key, r in records.items():
+        if (candidate.get('source_kind') == lab.SOURCE_KIND) != (r.get('source_kind') == lab.SOURCE_KIND):
+            continue
         if (normalize(r.get('course')), normalize(r.get('title'))) != pair:
             continue
         old = r.get('identities') or []
@@ -288,12 +293,20 @@ def merge_record(records, candidate):
         key = 'work:' + hashlib.sha256(identity.encode()).hexdigest()[:24]
         records.setdefault(key, {'key': key, 'first_seen': now_iso(), 'questions': [], 'status': 'unknown'})
     record = records[key]
+    # A verified removal of the deadline must clear an older date. Historical
+    # reminder messages cannot change current platform metadata.
+    if (candidate.get('source_kind') == lab.SOURCE_KIND
+            and candidate.get('deadline_source') == 'detail'
+            and candidate.get('deadline_kind') == 'none'):
+        record.update(deadline=None, deadline_kind='none', deadline_source='detail')
+        record.pop('availability', None)
     incoming_notice = parse_datetime(candidate.get('notice_sent'))
     known_notice = parse_datetime(record.get('deadline_notice_time') or record.get('notice_sent'))
     stale_notice = bool(incoming_notice and known_notice and incoming_notice < known_notice)
     candidate_deadline = candidate.get('deadline')
     accept_deadline = bool(candidate_deadline)
-    if candidate.get('deadline_source') == 'notice' and record.get('deadline'):
+    if candidate.get('deadline_source') == 'notice' and (record.get('deadline')
+            or (record.get('source_kind') == lab.SOURCE_KIND and record.get('deadline_source') == 'detail')):
         if stale_notice:
             accept_deadline = False
         checked = parse_datetime(record.get('metadata_checked_at'))
@@ -312,9 +325,16 @@ def merge_record(records, candidate):
             continue
         if field in {'deadline', 'deadline_source'} and not accept_deadline:
             continue
+        if (field == 'deadline_kind' and candidate.get('source_kind') == lab.SOURCE_KIND
+                and ((candidate.get('deadline_source') == 'notice' and not accept_deadline)
+                     or (value == 'unknown' and record.get(field) in {'known', 'none'}))):
+            continue
         if field in {'entry_url', 'notice_sent'} and stale_notice and record.get(field):
             continue
         if field == 'start' and record.get('start'):
+            continue
+        if field == 'lab_report':
+            record[field] = dict(record.get(field) or {}, **{k: v for k, v in value.items() if v not in (None, '')})
             continue
         record[field] = value
     if parse_datetime(record.get('deadline')):
@@ -331,6 +351,17 @@ def merge_draft_answers(base, incoming, *, incoming_wins=False):
     for qid, answer in (incoming or {}).items():
         if incoming_wins or qid not in merged:
             merged[qid] = answer
+    return merged
+
+
+def merge_draft_records(base, incoming, *, incoming_wins=False):
+    """Merge two draft records (answers and legacy_text) with an explicit conflict policy."""
+    merged = dict(base or {})
+    merged['answers'] = merge_draft_answers(
+        merged.get('answers'), (incoming or {}).get('answers'), incoming_wins=incoming_wins)
+    old_text = (incoming or {}).get('legacy_text') or ''
+    if old_text and old_text not in (merged.get('legacy_text') or ''):
+        merged['legacy_text'] = ((merged.get('legacy_text') or '') + '\n\n' + old_text).strip()
     return merged
 
 def reconcile_aliases(state):
@@ -385,12 +416,7 @@ def reconcile_aliases(state):
                     drafts = read_json(DRAFTS_FILE, {})
                     source = drafts.get(remove)
                     if source:
-                        existing = load_draft(keep)
-                        incoming = load_draft(remove)
-                        existing['answers'] = merge_draft_answers(
-                            existing.get('answers'), incoming.get('answers'))
-                        if incoming.get('legacy_text') and incoming['legacy_text'] != existing.get('legacy_text'):
-                            existing['legacy_text'] = (existing.get('legacy_text', '') + '\n\n' + incoming['legacy_text']).strip()
+                        existing = merge_draft_records(load_draft(keep), load_draft(remove))
                         existing.setdefault('merged_drafts', {})[remove] = source
                         store_draft(keep, existing)
                     del records[remove]
@@ -418,7 +444,7 @@ def open_context(playwright, headless=True):
         BACKGROUND_CONTEXTS[id(context)] = browser
         return context
     try:
-        browser = playwright.chromium.connect_over_cdp(CHAOXING_CDP_URL, timeout=2500)
+        browser = runtime.connect_browser_direct(playwright, CHAOXING_CDP_URL, timeout=2500)
     except Exception:
         browser = None
     if browser and browser.contexts:
@@ -449,12 +475,16 @@ def close_context(context):
 
 def request(context, url, **kwargs):
     for attempt in range(2):
+        response = None
         try:
             response = context.request.get(url, timeout=15000, **kwargs)
             if response.status >= 400:
-                raise RuntimeError(f'服务器返回 HTTP {response.status}')
+                status = response.status
+                lab.dispose_response(response)
+                raise RuntimeError(f'服务器返回 HTTP {status}')
             return response
         except Exception as exc:
+            lab.dispose_response(response)
             if attempt:
                 raise RuntimeError(safe_error(exc)) from None
             time.sleep(0.5)
@@ -463,7 +493,10 @@ def fetch_html(context, url):
     if not dom.platform_url(url):
         raise ValueError('作业地址不属于已支持的学习通平台')
     response = request(context, url)
-    markup, final = response.text(), response.url
+    try:
+        markup, final = response.text(), response.url
+    finally:
+        lab.dispose_response(response)
     if dom.is_login(markup, final):
         raise RuntimeError('LOGIN_REQUIRED:' + (urlsplit(url).hostname or ''))
     if not markup.strip():
@@ -488,6 +521,8 @@ def collect_notices(context, state, stats):
     cursor, used, fresh_ids = '', set(), []
     page_limit = 30 if not state.get('notice_backfilled') else 10
     ended = False
+    lab_replay = not state.get('lab_notices_scanned')
+    lab_cutoff = datetime.now() - timedelta(days=30)
     pending_cursors = list(state.get('notice_pending_cursors') or [])
     if state.get('notice_backfill_cursor') and state['notice_backfill_cursor'] not in pending_cursors:
         pending_cursors.append(state['notice_backfill_cursor'])
@@ -508,6 +543,8 @@ def collect_notices(context, state, stats):
             payload = response.json()
         except Exception:
             raise RuntimeError('通知读取失败，可能需要重新登录') from None
+        finally:
+            lab.dispose_response(response)
         container = payload.get('notices') if isinstance(payload, dict) else None
         # The real API terminates pagination with {"status": true}, without a
         # notices object. Only accept that form after a nonempty cursor.
@@ -518,6 +555,12 @@ def collect_notices(context, state, stats):
         notices = container.get('list') or []
         ids = [str(n.get('idCode')) for n in notices if n.get('idCode')]
         for n in notices:
+            candidate = lab.parse_notice(n)
+            if candidate:
+                existing = match_record(state['assignments'], candidate)
+                if lab.should_import(candidate, existing=bool(existing)):
+                    merge_record(state['assignments'], candidate)
+                continue
             content = str(n.get('content') or '')
             def field(label):
                 m = re.search(re.escape(label) + r'\s*[：:]\s*([^\r\n]+)', content)
@@ -534,12 +577,19 @@ def collect_notices(context, state, stats):
                     'source_notice_ids': [str(n['idCode'])] if n.get('idCode') else [], 'status': 'unknown'}
             merge_record(state['assignments'], item)
         fresh_ids.extend(ids)
+        # Existing installations have already marked these notices seen, but
+        # have never inspected their rich text. Replay just the recent window.
+        sent = [parse_datetime(standard_time(n.get('sendTime'))) for n in notices]
+        if lab_replay and (not notices or (sent and all(t and t < lab_cutoff for t in sent))
+                           or str(container.get('lastPage')) == '1'):
+            lab_replay = False
+            state['lab_notices_scanned'] = True
         page_known = bool(ids) and all(i in seen for i in ids)
         at_end = not notices or str(container.get('lastPage')) == '1'
         next_cursor = str(container.get('lastGetId') or '')
         if (page_known or at_end) and pending_cursors:
             next_cursor = pending_cursors.pop(0)
-        elif at_end or (state.get('notice_backfilled') and page_known):
+        elif at_end or (state.get('notice_backfilled') and page_known and not lab_replay):
             ended = True
             break
         if not next_cursor or next_cursor in used:
@@ -561,13 +611,78 @@ def collect_notices(context, state, stats):
 def course_ids(record):
     """(courseId, classId) of the course that owns this record, or None."""
     for name in ('entry_url', 'work_url', 'list_url', 'answer_url'):
-        u = urlsplit(record.get(name) or '')
-        q = {k.lower(): v[0] for k, v in parse_qs(u.query).items() if v}
-        course = q.get('courseid')
-        clazz = q.get('classid') or q.get('clazzid')
+        course, clazz = dom.course_class_pair(record.get(name))
         if course and clazz:
             return course, clazz
     return None
+
+
+def collect_lab_reports(context, state, stats, only=None):
+    """Use the ordinary assignment store; only eligible reports get details."""
+    from homework_lab_auth import ensure_session
+    from homework_lab_courses import discover_courses
+    targets = {}
+    def add(target):
+        origin, fid = lab.trusted_origin(target.get('origin')), str(target.get('fid') or '')
+        if origin and fid:
+            targets[(origin, fid, str(target.get('course_id') or '0'))] = dict(target, origin=origin, fid=fid)
+    if not only:
+        discovered, warnings = discover_courses(context)
+        stats['warnings'].extend(warnings)
+        for target in discovered:
+            add(target)
+        add({'origin': lab.DEFAULT_ORIGIN, 'fid': lab.DEFAULT_FID, 'course_id': '0'})
+    for key, record in state['assignments'].items():
+        if only and key != only:
+            continue
+        if record.get('source_kind') == lab.SOURCE_KIND:
+            add(record.get('lab_report') or {})
+        elif not only:
+            for field in ('entry_url', 'work_url', 'list_url', 'answer_url'):
+                raw = record.get(field) or ''
+                course_id = dom.query_params(raw).get('courseid')
+                if urlsplit(raw).hostname == 'mooc.istudy.szpu.edu.cn' and course_id:
+                    add({'origin': lab.DEFAULT_ORIGIN, 'fid': lab.DEFAULT_FID,
+                         'course_id': course_id, 'course': record.get('course', '')})
+    checked, sessions = set(), {}
+    for target in targets.values():
+        try:
+            session_key = (target['origin'], target['fid'])
+            if session_key not in sessions:
+                try:
+                    sessions[session_key] = ensure_session(context, *session_key)
+                except Exception as exc:
+                    sessions[session_key] = RuntimeError(safe_error(exc))
+            origin = sessions[session_key]
+            if isinstance(origin, Exception):
+                raise origin
+            course_key = (origin, target['fid'], str(target.get('course_id') or '0'))
+            if course_key in checked:
+                continue
+            checked.add(course_key)
+            candidates, warnings = lab.collect_reports(context, [dict(target, origin=origin)])
+            stats['course_lists'] += 1
+            stats['warnings'].extend(warnings)
+            for candidate in candidates:
+                existing = match_record(state['assignments'], candidate)
+                if only and existing != only:
+                    continue
+                if lab.should_import(candidate, existing=bool(existing)):
+                    if not candidate.get('course'):
+                        candidate['course'] = target.get('course') or target.get('title') or '未命名课程'
+                    merge_record(state['assignments'], candidate)
+            if warnings:
+                raise RuntimeError(warnings[0])
+        except Exception as exc:
+            reason = safe_error(exc)
+            reason = '该课程的平台需要重新登录' if 'LOGIN_REQUIRED' in reason else reason
+            stats['warnings'].append(reason)
+            for record in state['assignments'].values():
+                info = record.get('lab_report') or {}
+                if (record.get('source_kind') == lab.SOURCE_KIND and record_group(record) != 'history'
+                        and info.get('fid') == target['fid']
+                        and str(info.get('course_id') or '0') == str(target.get('course_id') or '0')):
+                    record['content_error'] = reason
 
 
 def collect_course_rows(context, state, stats, only=None):
@@ -595,10 +710,11 @@ def collect_course_rows(context, state, stats, only=None):
         if record_group(r) == 'history':
             continue
         for name in ('entry_url', 'work_url', 'list_url', 'answer_url'):
-            u = urlsplit(r.get(name) or '')
-            q = {k.lower(): v[0] for k, v in parse_qs(u.query).items() if v}
-            if u.hostname == 'mooc.istudy.szpu.edu.cn' and q.get('courseid') and q.get('classid'):
-                targets[(u.hostname, q['courseid'], q['classid'])] = r.get('course', '')
+            raw = r.get(name) or ''
+            u = urlsplit(raw)
+            course, clazz = dom.course_class_pair(raw)
+            if u.hostname == 'mooc.istudy.szpu.edu.cn' and course and clazz:
+                targets[(u.hostname, course, clazz)] = r.get('course', '')
     for (host, cid, clazz), name in targets.items():
         if only and (cid, clazz) != only:
             continue
@@ -653,6 +769,7 @@ def asset_downloader(context):
         existing = list(folder.glob(name + '.*'))
         if existing:
             return '/assets/' + existing[0].name
+        response = None
         try:
             response = request(context, url)
             suffix = IMAGE_MIME_SUFFIX.get(response.headers.get('content-type', '').split(';')[0])
@@ -665,6 +782,8 @@ def asset_downloader(context):
                 return '/assets/' + name + suffix
         except Exception:
             pass
+        finally:
+            lab.dispose_response(response)
         return url
     return download
 
@@ -694,6 +813,18 @@ def update_metadata(record, markup, url):
     return text
 
 def read_content(context, record, stats):
+    if record.get('source_kind') == lab.SOURCE_KIND:
+        from homework_lab_auth import ensure_session
+        target = record.get('lab_report') or {}
+        origin = ensure_session(context, target.get('origin'), target.get('fid'))
+        current = dict(record, lab_report=dict(target, origin=origin))
+        stats['details'] += 1
+        patch = lab.read_report(context, current)
+        if patch.get('questions'):
+            patch['content_version'] = CONTENT_VERSION
+        record.update(patch)
+        record.pop('metadata_needs_check', None)
+        return
     url = record.get('entry_url') or record.get('list_url') or record.get('work_url')
     if not url:
         record['content_status'] = '缺少作答入口，等待通知或课程列表补全'
@@ -706,20 +837,10 @@ def read_content(context, record, stats):
     record['work_url'] = final
     if record_group(record) == 'history':
         return
-    questions = dom.parse_questions(markup, final)
-    if not questions:
-        entry = dom.phone_entry(markup, final)
-        if entry:
-            markup, final = fetch_html(context, entry)
-            update_metadata(record, markup, final)
-            if record_group(record) == 'history':
-                return
-            questions = dom.parse_questions(markup, final)
-    record['work_url'] = final
+    questions = dom.parse_questions(markup, final, asset_downloader(context))
     if not questions:
         record['content_status'] = '页面没有可识别的原题，未把摘要或题号列表存为题目'
         return
-    questions = dom.parse_questions(markup, final, asset_downloader(context))
     record['questions'] = questions
     # Old versions collected links from the entire page, including plugin updates.
     # Keep that snapshot, but display only links inside verified question content.
@@ -811,7 +932,7 @@ def _check_once(headless=True, force_key=None, on_auth=None):
                         stats['warnings'].append('部分站点尚未登录')
                 if not force_key:
                     log('正在同步通知与课程作业状态…')
-                    for collector in (collect_notices, collect_course_rows):
+                    for collector in (collect_notices, collect_course_rows, collect_lab_reports):
                         try:
                             collector(context, state, stats)
                             connected = True
@@ -823,7 +944,10 @@ def _check_once(headless=True, force_key=None, on_auth=None):
                     # task-list row: after submitting, that row is the page that
                     # says 已提交/待批阅, while the detail page may keep showing
                     # the pending form and never archive the assignment.
-                    ids = course_ids(state['assignments'].get(force_key) or {})
+                    selected = state['assignments'].get(force_key) or {}
+                    if selected.get('source_kind') == lab.SOURCE_KIND:
+                        collect_lab_reports(context, state, stats, only=force_key)
+                    ids = None if selected.get('source_kind') == lab.SOURCE_KIND else course_ids(selected)
                     if ids:
                         try:
                             collect_course_rows(context, state, stats, only=ids)
@@ -840,13 +964,19 @@ def _check_once(headless=True, force_key=None, on_auth=None):
                         # page is read-only now and would only add a warning.
                         stats['cache_hits'] += 1
                         continue
-                    identity_probe = needs_identity_probe(record, state['assignments'])
-                    entry_upgrade = needs_entry_upgrade(record)
+                    if record.get('source_kind') == lab.SOURCE_KIND and record_group(record) == 'history':
+                        # List metadata can reopen an extended/redo assignment;
+                        # an expired or submitted one never needs its old body.
+                        stats['cache_hits'] += 1
+                        continue
+                    identity_probe = record.get('source_kind') != lab.SOURCE_KIND and needs_identity_probe(record, state['assignments'])
+                    entry_upgrade = record.get('source_kind') != lab.SOURCE_KIND and needs_entry_upgrade(record)
                     if record_group(record) == 'history' and key != force_key and not record.get('metadata_needs_check') and not identity_probe:
                         continue
                     attempted = parse_datetime(record.get('content_attempted_at'))
                     valid = record.get('content_version') == CONTENT_VERSION and bool(record.get('questions'))
-                    checked = parse_datetime(record.get('metadata_checked_at'))
+                    checked = parse_datetime(record.get('content_last_read') if record.get('source_kind') == lab.SOURCE_KIND
+                                             else record.get('metadata_checked_at'))
                     due = record.get('metadata_needs_check') or not checked or datetime.now() - checked > METADATA_MAX_AGE
                     if skipped_by_cache(record, force_key=bool(force_key), valid=valid, due=due,
                                         attempted=attempted, identity_probe=identity_probe,
@@ -1013,14 +1143,14 @@ def login_mode(platform='chaoxing'):
     # opening its URLs. Create visible windows through its verified connection.
     with browser_operation(), sync_playwright() as playwright:
         try:
-            browser = playwright.chromium.connect_over_cdp(CHAOXING_CDP_URL, timeout=1000)
+            browser = runtime.connect_browser_direct(playwright, CHAOXING_CDP_URL, timeout=1000)
         except Exception:
             ensure_chrome()
             browser = None
             deadline = time.monotonic() + 12
             while time.monotonic() < deadline:
                 try:
-                    browser = playwright.chromium.connect_over_cdp(CHAOXING_CDP_URL, timeout=500)
+                    browser = runtime.connect_browser_direct(playwright, CHAOXING_CDP_URL, timeout=500)
                     break
                 except Exception:
                     time.sleep(.25)

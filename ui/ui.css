@@ -722,14 +722,10 @@ body.no-dock .toasts{bottom:24px}
 .reminder-time-list{display:grid;gap:6px;margin-bottom:8px}
 .reminder-time-item{display:flex;align-items:center;gap:12px;min-width:0;padding:6px 6px 6px 14px;border:1px solid var(--line);border-radius:var(--r);background:var(--surface)}
 .rem-time{width:112px;padding:3px 0;border:0;border-radius:6px;background:none;font-family:var(--serif);font-size:22px;color:var(--text);font-variant-numeric:tabular-nums;cursor:pointer}
-.rem-time::-webkit-calendar-picker-indicator{opacity:.4;cursor:pointer}
 .rem-time:focus-visible{outline:2px solid var(--clay-ring);outline-offset:2px}
 .reminder-time-meta{flex:1;min-width:0;font-size:12.5px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .reminder-time-item .icon-only{flex:0 0 32px;width:32px;height:32px}
 .reminder-empty{margin:0 0 4px;padding:14px;border:1px dashed var(--line-strong);border-radius:var(--r);color:var(--muted);font-size:12.5px;text-align:center}
-.rem-add-form{display:flex;align-items:flex-end;gap:12px;padding:12px 14px;border:1px solid var(--clay-ring);border-radius:var(--r);background:var(--clay-tint)}
-.rem-add-label{display:grid;gap:6px;flex:1;min-width:0;font-size:12.5px;color:var(--text-2)}
-.rem-add-label .input{width:100%;min-width:0}
 .rem-add-actions{display:flex;gap:6px;flex-shrink:0}
 .rem-add-actions .btn{min-height:36px}
 .rem-error{margin:8px 0 0;color:var(--danger);font-size:12.5px;line-height:1.4}
@@ -745,14 +741,11 @@ body.no-dock .toasts{bottom:24px}
   .rem-time{grid-column:1;grid-row:1}
   .reminder-time-meta{grid-column:1;grid-row:2}
   .reminder-time-item .icon-only{grid-column:2;grid-row:1/3}
-  .rem-add-form{flex-wrap:wrap;gap:10px}
-  .rem-add-label{flex-basis:100%}
   .rem-add-actions{margin-left:auto}
 }
 
 /* AI settings: one list, inline editor */
 #ai-settings-dialog{width:min(680px,calc(100vw - 24px));max-width:680px}
-#ai-settings-dialog .sheet-body{width:100%}
 .ai-config-list-page{min-width:0}
 .ai-config-list{display:grid;gap:8px;margin-top:8px}
 .ai-profile-card,.ai-config-editor{background:var(--surface);border-color:var(--line-strong);border-radius:var(--r);overflow:hidden}
@@ -803,6 +796,114 @@ body.no-dock .toasts{bottom:24px}
 .item.fresh{animation:fresh 4.2s ease-out both}
 .detail.is-refreshing .overview-metric strong,.detail.is-refreshing .big-progress i,.detail.is-refreshing .up-item{animation:breathe 1.5s ease-in-out infinite}
 .detail.is-refreshing .up-item:nth-child(2n){animation-delay:.2s}
+
+/* ==========================================================================
+   Polish layer · 只做视觉精修，不改变布局与结构
+   ========================================================================== */
+:root{
+  /* Georgia 默认是旧式数字（0 像字母 o、1 偏矮），数字统一改用带等高数字的衬线字体 */
+  --serif-num:Cambria,"Cambria Math","Noto Serif SC","Source Han Serif SC",Georgia,serif;
+  --shadow-sm:0 1px 2px rgba(31,30,29,.05),0 0 0 .5px rgba(31,30,29,.02);
+  --shadow:0 1px 2px rgba(31,30,29,.04),0 4px 14px -2px rgba(31,30,29,.06);
+  --shadow-lg:0 2px 6px rgba(31,30,29,.05),0 18px 44px -6px rgba(31,30,29,.14);
+  --clay-grad:linear-gradient(180deg,#d26d4a,#c25d3c);
+}
+
+/* ---------- 数字：等高、等宽 ---------- */
+.overview-metric strong,.up-date b,.q-num,.stat b,.rem-time,.rem-status-text strong,
+.deadline-strip strong,.reason-q{font-family:var(--serif-num);font-variant-numeric:lining-nums tabular-nums}
+
+/* ---------- 滚动条 ---------- */
+*{scrollbar-color:rgba(31,30,29,.18) transparent}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:rgba(31,30,29,.14);border:3px solid transparent;border-radius:999px;background-clip:padding-box}
+::-webkit-scrollbar-thumb:hover{background-color:rgba(31,30,29,.26)}
+::-webkit-scrollbar-corner{background:transparent}
+
+/* ---------- 背景氛围 ---------- */
+.main{background:radial-gradient(900px 420px at 50% -120px,rgba(201,100,66,.07),transparent 70%),var(--bg)}
+.sidebar{background:linear-gradient(180deg,#f6f4ee 0%,var(--side) 38%,#f1eee6 100%)}
+.spark{transition:transform .6s var(--ease)}
+.brand:hover .spark,.greet .spark:hover{transform:rotate(45deg)}
+
+/* ---------- 按钮 ---------- */
+.btn{box-shadow:0 1px 1px rgba(31,30,29,.03)}
+.btn:hover{border-color:#cbc5b4}
+.btn-ghost,.btn-quiet{box-shadow:none}
+.btn-ghost:hover,.btn-quiet:hover{border-color:transparent}
+.btn-primary{background:var(--clay-grad);border-color:#bb5736;box-shadow:inset 0 1px 0 rgba(255,255,255,.18),0 1px 2px rgba(143,63,39,.25),0 3px 10px -3px rgba(201,100,66,.45)}
+.btn-primary:hover{background:linear-gradient(180deg,#c9633f,#b3553a);border-color:#a54d33;box-shadow:inset 0 1px 0 rgba(255,255,255,.16),0 1px 2px rgba(143,63,39,.3),0 5px 14px -4px rgba(201,100,66,.55)}
+.btn-dark{box-shadow:inset 0 1px 0 rgba(255,255,255,.1),0 1px 2px rgba(31,30,29,.2)}
+.btn-danger{box-shadow:inset 0 1px 0 rgba(255,255,255,.14),0 1px 2px rgba(149,43,33,.25)}
+
+/* ---------- 侧边栏 ---------- */
+.nav-item{transition:background .15s,color .15s}
+.nav-item[aria-current="page"]{background:rgba(255,255,255,.75);box-shadow:var(--shadow-sm),inset 0 0 0 1px var(--line)}
+.nav-item[aria-current="page"] .icon{color:var(--clay)}
+.search{box-shadow:inset 0 1px 1px rgba(31,30,29,.03)}
+.tab-count{transition:background .15s,color .15s}
+.tab[data-group="active"] .tab-count.has{background:var(--clay-grad);box-shadow:0 1px 2px rgba(143,63,39,.25)}
+.item{transition:background .15s,box-shadow .15s}
+.item[aria-current="true"]{box-shadow:0 1px 2px rgba(31,30,29,.05),0 4px 12px -4px rgba(31,30,29,.1),inset 0 0 0 1px var(--line)}
+.item[aria-current="true"] .item-title{color:var(--clay-deep)}
+.mini-progress i{width:38px;height:4px;background:rgba(31,30,29,.09)}
+.mini-progress i b{border-radius:2px}
+.list-section{text-transform:none;letter-spacing:.5px}
+.avatar{background:linear-gradient(145deg,#3a3935,var(--text));box-shadow:0 1px 3px rgba(31,30,29,.25)}
+.account-menu-card{animation:rise .18s var(--ease)}
+
+/* ---------- 首页 ---------- */
+.greet h1{letter-spacing:1px}
+.overview-metric{overflow:hidden;padding-top:16px}
+.overview-metric.hot::before,.overview-metric.caution::before{content:"";position:absolute;left:16px;top:0;width:22px;height:3px;border-radius:0 0 3px 3px;background:var(--clay);transition:width .25s var(--ease)}
+.overview-metric.caution::before{background:#d49a2a}
+.overview-metric:hover::before{width:38px}
+.overview-metric.hot{background:linear-gradient(160deg,var(--clay-tint),#fff 85%)}
+.panel{box-shadow:var(--shadow)}
+.big-progress{box-shadow:inset 0 1px 1px rgba(31,30,29,.05)}
+.big-progress i,.progress i,.mini-progress i b{background:linear-gradient(90deg,#d7825f,var(--clay))}
+.mini-progress.complete i b{background:var(--ok)}
+.up-date{box-shadow:inset 0 0 0 1px rgba(31,30,29,.04)}
+.up-item.urgent .up-date{background:var(--clay-grad);box-shadow:0 2px 8px -2px rgba(201,100,66,.5)}
+.up-item.soon .up-date{box-shadow:inset 0 0 0 1px var(--warn-line)}
+.up-item:hover .up-main strong{color:var(--clay-deep)}
+.callout{box-shadow:var(--shadow)}
+
+/* ---------- 作业详情 ---------- */
+.hero h1{letter-spacing:.5px}
+.deadline-strip{background:linear-gradient(120deg,#d4714d,var(--clay) 55%,#b9563a)}
+.q-num{background:linear-gradient(145deg,#3a3935,var(--text));box-shadow:0 1px 3px rgba(31,30,29,.2)}
+.qdot{transition:background .15s,border-color .15s,color .15s,transform .15s}
+.qdot:hover{transform:translateY(-1px)}
+.option{box-shadow:0 1px 1px rgba(31,30,29,.02)}
+.option:hover{box-shadow:0 2px 8px -3px rgba(31,30,29,.1)}
+.option:has(input:checked){box-shadow:0 0 0 1px var(--clay) inset,0 3px 10px -4px rgba(201,100,66,.35)}
+.option:has(input:checked) .mark{background:var(--clay-grad)}
+.input,.textarea{box-shadow:inset 0 1px 2px rgba(31,30,29,.035)}
+.input:focus,.textarea:focus{box-shadow:0 0 0 3px var(--clay-soft),inset 0 1px 2px rgba(31,30,29,.02)}
+.file{transition:border-color .15s,box-shadow .15s}
+.file:hover{border-color:var(--line-strong);box-shadow:var(--shadow-sm)}
+.end-note{color:var(--faint)}
+.end-note::before,.end-note::after{content:"";width:48px;height:1px;background:linear-gradient(90deg,transparent,var(--line-strong))}
+.end-note::after{background:linear-gradient(90deg,var(--line-strong),transparent)}
+
+/* ---------- 底部操作栏 ---------- */
+.dock-card{background:rgba(255,255,255,.86);backdrop-filter:saturate(1.4) blur(14px);-webkit-backdrop-filter:saturate(1.4) blur(14px);border-color:rgba(214,209,194,.85)}
+.ring{box-shadow:inset 0 0 0 1px rgba(31,30,29,.03)}
+
+/* ---------- 弹窗 ---------- */
+dialog::backdrop{background:rgba(31,30,29,.26);backdrop-filter:blur(3px)}
+.sheet-body{border-radius:var(--r-xl);background:linear-gradient(180deg,#fff 0,var(--bg) 160px);border-color:rgba(214,209,194,.7)}
+.sheet[open]{animation:sheet-in .26s var(--ease)}
+@keyframes sheet-in{from{opacity:0;transform:translateY(10px) scale(.985)}to{opacity:1;transform:none}}
+.switch{box-shadow:inset 0 1px 2px rgba(31,30,29,.12)}
+.switch[aria-checked="true"]{background:var(--clay-grad)}
+.reminder-time-item,.manage-item,.stat,.reason{transition:border-color .15s,box-shadow .15s}
+.reminder-time-item:hover,.manage-item:hover{border-color:var(--line-strong);box-shadow:var(--shadow-sm)}
+
+/* ---------- 提示 ---------- */
+.toast{backdrop-filter:blur(10px)}
 
 /* ==========================================================================
    提醒时间设置与时间轮盘美化

@@ -3,7 +3,7 @@ from __future__ import annotations
 import html
 import json
 import re
-from urllib.parse import urljoin, urlsplit, parse_qs, urlencode
+from urllib.parse import urljoin, urlsplit, urlencode
 import homework_dom as dom
 import homework_shared as shared
 
@@ -42,8 +42,7 @@ def _school_entry(context, record, markup, url, fetch_html):
     anchors = root.all('a', cls='inspectTask')
     if not anchors:
         return None
-    q = {k.lower(): v[0] for k, v in parse_qs(urlsplit(url).query).items() if v}
-    course, clazz = q.get('courseid'), q.get('classid', q.get('clazzid'))
+    course, clazz = dom.course_class_pair(url)
     host = dom.platform_host(urlsplit(url).hostname)
     expected = identities(record)
     prefix = f'{host}:{course}:{clazz}:'
@@ -135,7 +134,7 @@ def _redirect_aliases(record, entry, final, markup):
     """
     start = urlsplit(entry)
     end = urlsplit(final)
-    q = {k.lower(): v[0] for k,v in parse_qs(start.query).items() if v}
+    q = dom.query_params(entry)
     if not start.path.lower().endswith('/examapi/intoexamorwork') or q.get('workorexam') != 'work':
         return set()
     if end.path.lower() not in {'/mooc-ans/mooc2/work/view', '/mooc-ans/mooc2/work/dowork', '/mooc-ans/work/dohomeworknew'}:
