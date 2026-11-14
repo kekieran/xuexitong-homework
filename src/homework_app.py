@@ -229,6 +229,13 @@ def auth_snapshot():
     with AUTH_LOCK:
         snapshot = dict(AUTH, sites=dict(AUTH['sites']))
     snapshot['credentials'] = homework_auth.credential_info()
+    if hasattr(homework_auth, 'school'):
+        try:
+            school_name = (homework_auth.school.load_config().get('school_name') or '').strip()
+            if school_name:
+                snapshot['school_name'] = school_name
+        except Exception:
+            pass
     return snapshot
 
 def set_auth(value):
@@ -574,7 +581,8 @@ def auth_watch_loop():
         if not job_snapshot()['busy']:
             try:
                 result = homework_auth.status(restore=False)
-                set_auth(result)
+                if not job_snapshot()['busy']:
+                    set_auth(result)
                 if not result['logged_in']:
                     delay = 30
             except homework_auth.BrowserUnavailable:

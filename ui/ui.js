@@ -22,14 +22,89 @@ const S = {
   // Refresh feedback: when the running job began, how the last refresh ended,
   // and which records the last refresh added or changed (key -> timestamp).
   jobStart: 0, outcome: null, fresh: null, diff: null,
+  firstListAnimated: false, tabDir: 0, prevCounts: null,
+  addedKeys: null, deadlineChangedKeys: null,
+  waveState: '', acctRevealState: '',
+  watchingSub: new Map(), subCheckKey: null,
+  navDir: '', prevDoneDots: new Map(), aiHintKeys: new Map(),
+  welcomeAnimated: false, bellRingUntil: 0, remOpenedKey: null,
+  dockPct: null, filterEnter: false, prevFilterCount: -1,
+  lastImage: null, prevDockKey: null, listSelBox: null,
 };
+const GROUP_IDX = {active: 0, review: 1, history: 2};
+function switchGroup(nextGroup) {
+  if (nextGroup && nextGroup !== S.group) {
+    S.tabDir = (GROUP_IDX[nextGroup] ?? 0) > (GROUP_IDX[S.group] ?? 0) ? 1 : -1;
+    S.group = nextGroup;
+  }
+}
 const OUTCOME_MS = 4500, FRESH_MS = 4200;
+const REDUCED_MOTION = () => window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
 const drafts = new Map(), dirty = new Map(), timers = new Map(), saving = new Map(), saveState = new Map();
 const draftChanges = new Map();
 let loginPhase = 'form', loginError = '';
 let fillPhase = 'check', fillResult = null;
 let accountMenuOpen = false;
 let warningDismissal;
+
+function restartAnim(node, cls) {
+  if (!node) return;
+  node.classList.remove(cls);
+  void node.offsetWidth;
+  node.classList.add(cls);
+}
+function animateNumber(node, target, suffix = '', fromStart = false) {
+  if (!node) return;
+  const end = Math.max(0, Math.round(Number(target) || 0));
+  const prev = fromStart ? 0 : (node.dataset.numVal !== undefined ? Number(node.dataset.numVal) : end);
+  node.dataset.numVal = String(end);
+  if (REDUCED_MOTION() || prev === end) {
+    node.textContent = String(end) + suffix;
+    return;
+  }
+  const t0 = performance.now(), dur = 420;
+  const tick = now => {
+    const p = Math.min(1, (now - t0) / dur);
+    const eased = 1 - Math.pow(1 - p, 3);
+    node.textContent = String(Math.round(prev + (end - prev) * eased)) + suffix;
+    if (p < 1) requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
+}
+function appendHighlighted(node, text, query) {
+  const s = String(text ?? '');
+  const q = (query || '').trim();
+  if (!q) { node.append(document.createTextNode(s)); return; }
+  const lower = s.toLowerCase(), ql = q.toLowerCase();
+  let pos = 0;
+  while (pos < s.length) {
+    const idx = lower.indexOf(ql, pos);
+    if (idx < 0) { node.append(document.createTextNode(s.slice(pos))); break; }
+    if (idx > pos) node.append(document.createTextNode(s.slice(pos, idx)));
+    node.append(el('mark', '', s.slice(idx, idx + q.length)));
+    pos = idx + q.length;
+  }
+}
+function animRing(ring, fromPct, toPct) {
+  if (!ring) return;
+  const start = Math.max(0, Math.min(100, Number(fromPct) || 0));
+  const end = Math.max(0, Math.min(100, Number(toPct) || 0));
+  ring._animPct = end;
+  ring.classList.toggle('done', end >= 100);
+  if (REDUCED_MOTION() || start === end) {
+    ring.style.setProperty('--p', String(end));
+    return;
+  }
+  const t0 = performance.now(), dur = 340;
+  const tick = now => {
+    if (ring._animPct !== end) return;
+    const p = Math.min(1, (now - t0) / dur);
+    const eased = 1 - Math.pow(1 - p, 3);
+    ring.style.setProperty('--p', (start + (end - start) * eased).toFixed(2));
+    if (p < 1) requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
+}
 
 /* ---------- Small helpers ---------- */
 const ICONS = {
@@ -69,6 +144,8 @@ const ICONS = {
 };
 function icon(name, cls = '') {
   const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('width', '16');
+  svg.setAttribute('height', '16');
   svg.setAttribute('viewBox', '0 0 24 24');
   svg.setAttribute('fill', 'none');
   svg.setAttribute('stroke', 'currentColor');
@@ -82,6 +159,8 @@ function icon(name, cls = '') {
 }
 function spark(cls = 'spark') {
   const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('width', '20');
+  svg.setAttribute('height', '20');
   svg.setAttribute('viewBox', '0 0 24 24');
   svg.setAttribute('class', cls);
   svg.setAttribute('aria-hidden', 'true');
@@ -503,24 +582,40 @@ function overview() {
   return HomeworkWorkspace.dashboard(S.records.map(r => ({...r, progress: progressFor(r)})));
 }
 function showWorkspaceList(group, progress = 'all', dueRange = 'all') {
-  S.group = group; S.sub = 'all'; S.progressFilter = progress; S.dueFilter = dueRange;
+  switchGroup(group); S.sub = 'all'; S.progressFilter = progress; S.dueFilter = dueRange;
   $('#search').value = '';
   renderList(); setView('list');
 }
 async function goHome() {
-  ++S.selecting; S.printed = null;
+  ++S.selecting; S.printed = null; S.dockPct = null; S.prevDockKey = null;
   $('.main').querySelector('.reading')?.remove();
+  const fromDetail = !!S.key;
   try { await flushAll(); } catch {}
-  S.key = null;
+  if (fromDetail) snapshotView(-1);
+  S.key = null; S.navDir = fromDetail ? 'left' : '';
   setView('detail'); renderList(); renderWelcome();
   try { await load(); }
   catch (e) { toast('首页显示本机数据，更新失败：' + e.message, 'warn'); }
 }
 function renderList() {
+  const prevCounts = S.prevCounts;
+  const nextCounts = {};
   for (const g of Object.keys(GROUPS)) {
     const n = S.records.filter(r => r.group === g).length, count = $('#count-' + g);
+    nextCounts[g] = n;
     count.textContent = n;
     count.classList.toggle('has', n > 0 && g !== 'history');
+    if (S.loaded && prevCounts && prevCounts[g] !== undefined && prevCounts[g] !== n) {
+      count.classList.remove('bump');
+      void count.offsetWidth;
+      count.classList.add('bump');
+    }
+  }
+  if (S.loaded) S.prevCounts = nextCounts;
+  const tabsBar = $('.tabs');
+  if (tabsBar) {
+    tabsBar.classList.add('has-pill');
+    tabsBar.style.setProperty('--tab-idx', String(GROUP_IDX[S.group] ?? 0));
   }
   document.querySelectorAll('.tab').forEach(t => t.setAttribute('aria-selected', String(t.dataset.group === S.group)));
   $('#home').setAttribute('aria-current', S.key ? 'false' : 'page');
@@ -539,13 +634,17 @@ function renderList() {
       chip.type = 'button';
       chip.append(el('span', 'n', String(inGroup.filter(r => matchesSub(r, id)).length)));
       chip.setAttribute('aria-pressed', String(S.sub === id));
-      chip.onclick = () => { S.sub = id; renderList(); };
+      chip.onclick = () => { S.sub = id; S.filterEnter = true; renderList(); };
       box.append(chip);
     }
   }
   const list = $('#assignment-list');
+  const previousSel = list.querySelector('.list-sel');
   list.replaceChildren();
+  const sel = previousSel || el('div', 'list-sel');
+  list.append(sel);
   if (!S.loaded) {
+    sel.style.opacity = '0';
     if (S.loadError) {
       const empty = el('div', 'list-empty'), row = el('div', 'row');
       empty.append(el('strong', '', '作业读取失败'), el('span', '', S.loadError));
@@ -557,14 +656,56 @@ function renderList() {
     }
     return;
   }
-  const query = $('#search').value.trim().toLowerCase();
-  const match = r => !query || `${r.course || ''} ${r.title || ''}`.toLowerCase().includes(query);
+  const firstIn = !S.firstListAnimated;
+  S.firstListAnimated = true;
+  const tabDir = S.tabDir;
+  S.tabDir = 0;
+  const filterEnter = S.filterEnter;
+  S.filterEnter = false;
+  const query = $('#search').value.trim();
+  const qLower = query.toLowerCase();
+  const match = r => !qLower || `${r.course || ''} ${r.title || ''}`.toLowerCase().includes(qLower);
   const dueKeys = S.group === 'active' && S.dueFilter !== 'all' ? new Set(overview().keys[S.dueFilter] || []) : null;
   const items = S.records.filter(r => r.group === S.group && matchesSub(r, S.sub) && match(r) &&
     (S.group !== 'active' || S.progressFilter === 'all' || progressFor(r).state === S.progressFilter) &&
     (!dueKeys || dueKeys.has(r.key))).sort(sorter(S.group));
-  if (!items.length) { list.append(listEmpty(query, match)); return; }
-  let section = null;
+  const hasFilter = !!(qLower || S.sub !== 'all' || (S.group === 'active' && (S.progressFilter !== 'all' || S.dueFilter !== 'all')));
+  const metaBox = $('#search-meta');
+  if (metaBox) {
+    metaBox.hidden = !hasFilter;
+    if (hasFilter) {
+      let countEl = metaBox.querySelector('.search-count');
+      if (!countEl) {
+        metaBox.replaceChildren(
+          countEl = el('span', 'search-count', `已找到 ${items.length} 项`),
+          btn('清除筛选', 'search-clear', () => {
+            $('#search').value = '';
+            S.sub = 'all'; S.progressFilter = S.dueFilter = 'all';
+            S.filterEnter = true;
+            renderList();
+            $('#search').focus();
+          })
+        );
+      } else {
+        countEl.textContent = `已找到 ${items.length} 项`;
+      }
+      if (S.prevFilterCount !== items.length) {
+        S.prevFilterCount = items.length;
+        restartAnim(countEl, 'bump');
+      }
+    } else {
+      S.prevFilterCount = -1;
+    }
+  }
+  if (!items.length) {
+    sel.style.opacity = '0';
+    const emptyNode = listEmpty(qLower, match);
+    emptyNode.classList.add('anim-in');
+    if (tabDir) { emptyNode.classList.add('tab-in'); emptyNode.style.setProperty('--dx', String(tabDir)); emptyNode.style.setProperty('--i', '0'); }
+    list.append(emptyNode);
+    return;
+  }
+  let section = null, idx = 0;
   for (const r of items) {
     if (S.group === 'active') {
       const s = sectionOf(r);
@@ -575,19 +716,81 @@ function renderList() {
         list.append(heading);
       }
     }
-    list.append(listItem(r));
+    list.append(listItem(r, idx++, firstIn, tabDir, filterEnter, query));
+  }
+  placeListSel(sel, true);
+  if (S.job.busy && S.job.action === 'refresh' && !S.jobKey) {
+    list.querySelectorAll('.item').forEach((n, i) => { n.style.setProperty('--i', String(Math.min(i, 8))); n.classList.add('wave'); });
   }
 }
-function listItem(r) {
+function placeListSel(sel, animate = true) {
+  const item = $('#assignment-list .item[aria-current="true"]');
+  if (!sel) return;
+  if (!item) {
+    sel.style.transition = 'none';
+    sel.style.opacity = '0';
+    sel.dataset.ready = '';
+    S.listSelBox = null;
+    return;
+  }
+  const top = item.offsetTop, height = item.offsetHeight;
+  const prev = S.listSelBox;
+  S.listSelBox = { top, height, group: S.group };
+  if (!animate || !sel.dataset.ready || !prev || prev.group !== S.group) {
+    sel.style.transition = 'none';
+    sel.style.transform = `translateY(${top}px)`;
+    sel.style.height = height + 'px';
+    sel.style.opacity = '1';
+    void sel.offsetWidth;
+    sel.style.transition = '';
+    sel.dataset.ready = '1';
+    return;
+  }
+  if (prev.top !== top || prev.height !== height) {
+    sel.style.transition = 'none';
+    sel.style.transform = `translateY(${prev.top}px)`;
+    sel.style.height = prev.height + 'px';
+    sel.style.opacity = '1';
+    void sel.offsetWidth;
+    sel.style.transition = '';
+  }
+  sel.style.opacity = '1';
+  sel.style.transform = `translateY(${top}px)`;
+  sel.style.height = height + 'px';
+}
+function listItem(r, idx = 0, firstIn = false, tabDir = 0, filterEnter = false, query = '') {
   const d = due(r), b = el('button', 'item' + (r.group === 'active' && d.tone === 'urgent' ? ' urgent' : ''));
   b.type = 'button';
+  b.dataset.key = r.key;
   if (r.key === S.key) b.setAttribute('aria-current', 'true');
   // New or changed since the last refresh: continue the highlight where it was
   // even if the list is rebuilt mid-animation.
+  const addedAge = S.addedKeys?.has(r.key) ? Date.now() - S.addedKeys.get(r.key) : FRESH_MS;
   const age = S.fresh?.has(r.key) ? Date.now() - S.fresh.get(r.key) : FRESH_MS;
-  if (age < FRESH_MS) { b.classList.add('fresh'); b.style.animationDelay = -age + 'ms'; }
+  if (addedAge < FRESH_MS) {
+    b.classList.add('fresh-new');
+    b.style.animationDelay = -addedAge + 'ms';
+  } else if (age < FRESH_MS) {
+    b.classList.add('fresh');
+    b.style.animationDelay = -age + 'ms';
+  } else if (firstIn && idx < 12) {
+    b.classList.add('list-in');
+    b.style.setProperty('--i', String(idx));
+  } else if (tabDir && idx < 14) {
+    b.classList.add('tab-in');
+    b.style.setProperty('--dx', String(tabDir));
+    b.style.setProperty('--i', String(idx));
+  } else if (filterEnter && idx < 12) {
+    b.classList.add('filter-in');
+    b.style.setProperty('--i', String(idx));
+  }
   b.title = `${r.course || '未命名课程'}\n${r.title || '未命名作业'}`;
-  b.append(el('span', 'item-title', r.course || '未命名课程'), el('span', 'item-sub', r.title || '未命名作业'));
+  const titleEl = el('span', 'item-title');
+  if (addedAge < FRESH_MS) titleEl.prepend(el('span', 'new-badge', '新'));
+  appendHighlighted(titleEl, r.course || '未命名课程', query);
+  const subEl = el('span', 'item-sub');
+  appendHighlighted(subEl, r.title || '未命名作业', query);
+  b.append(titleEl, subEl);
   const foot = el('span', 'item-foot');
   if (r.group === 'review') {
     foot.append(el('span', 'flag warn', statusInfo(r).label));
@@ -595,6 +798,9 @@ function listItem(r) {
     foot.append(el('span', 'flag', statusInfo(r).label), dueTag(r, true));
   } else {
     foot.append(dueTag(r));
+    if (S.watchingSub.get(r.key)?.state === 'unsubmitted') {
+      foot.append(el('span', 'flag warn warn-blink', '未提交'));
+    }
     const p = progressFor(r);
     if (p.total) {
       const mp = el('span', 'mini-progress' + (p.state === 'complete' ? ' complete' : '')), bar = el('i'), fill = el('b');
@@ -612,7 +818,8 @@ function listItem(r) {
   return b;
 }
 function dueTag(r, plain = false) {
-  const d = due(r), tag = el('span', 'due ' + (plain ? '' : d.tone));
+  const chgAge = !plain && S.deadlineChangedKeys?.has(r.key) ? Date.now() - S.deadlineChangedKeys.get(r.key) : FRESH_MS;
+  const d = due(r), tag = el('span', 'due ' + (plain ? '' : d.tone) + (chgAge < FRESH_MS ? ' due-chg' : ''));
   if (!plain) tag.append(icon('clock'));
   tag.append(document.createTextNode(!plain && d.tone === 'urgent' && d.left ? d.left.replace('还剩 ', '剩 ') : d.short));
   return tag;
@@ -629,7 +836,7 @@ function listEmpty(query, match) {
   if (query) {
     box.append(el('strong', '', '没有匹配的作业'));
     const others = Object.keys(GROUPS).filter(g => g !== S.group).map(g => [g, S.records.filter(r => r.group === g && match(r)).length]).filter(([, n]) => n);
-    for (const [g, n] of others) row.append(btn(`${GROUPS[g]}中有 ${n} 项`, 'btn-sm', () => { S.group = g; S.sub = 'all'; renderList(); }));
+    for (const [g, n] of others) row.append(btn(`${GROUPS[g]}中有 ${n} 项`, 'btn-sm', () => { switchGroup(g); S.sub = 'all'; renderList(); }));
     row.append(btn('清除搜索', 'btn-sm btn-ghost', () => { $('#search').value = ''; renderList(); $('#search').focus(); }));
     box.append(row);
     return box;
@@ -644,15 +851,20 @@ function listEmpty(query, match) {
   if (S.group === 'active') box.append(el('span', '', '可以休息一下了。'));
   return box;
 }
+function userInitial(username) {
+  const ch = (username || '').trim().charAt(0);
+  return ch ? ch.toUpperCase() : '学';
+}
 function renderAccount() {
   const box = $('#account');
   box.replaceChildren();
   const a = S.auth || {state: 'checking', sites: {}};
-  const loggingIn = S.job.busy && S.job.action === 'login';
-  const checking = loggingIn || a.state === 'checking';
+  const loggingIn = S.job.busy && S.job.action === 'login' && !S.acctRevealState;
+  const checking = (loggingIn || a.state === 'checking') && !S.acctRevealState;
   const loggedIn = a.state === 'logged_in';
   const username = a.credentials?.username?.trim();
-  const row = el('button', 'account-row'), avatar = el('div', 'avatar' + (loggedIn ? '' : ' off')),
+  const schoolLabel = a.school_name || '作业通';
+  const row = el('button', 'account-row'), avatar = el('div', 'avatar' + (loggedIn ? ' clay-ava' : ' off')),
     text = el('div', 'account-text');
   row.type = 'button';
   row.id = 'account-button';
@@ -660,14 +872,25 @@ function renderAccount() {
   row.setAttribute('aria-controls', 'account-menu');
   row.setAttribute('aria-expanded', String(accountMenuOpen));
   if (checking) {
+    avatar.classList.remove('clay-ava');
     avatar.append(icon('loader'));
     text.append(el('strong', '', loggingIn ? '正在登录…' : '正在检查登录'));
     text.append(el('small', '', loggingIn && S.job.message !== '正在处理…' ? S.job.message : '请稍候'));
     row.disabled = true;
   } else {
-    avatar.textContent = loggedIn ? '学' : '未';
+    avatar.textContent = loggedIn ? userInitial(username) : '未';
+    if (S.acctRevealState === 'hiding') {
+      avatar.classList.add('ava-hide');
+      text.classList.add('info-hide');
+    } else if (S.acctRevealState === 'landing') {
+      avatar.classList.add('land-soft');
+      if (!avatar.querySelector('.ring-wave')) avatar.append(el('span', 'ring-wave'));
+      if (!text.classList.contains('pop-ribbon')) {
+        setTimeout(() => { if (text.isConnected && S.acctRevealState === 'landing') text.classList.add('pop-ribbon'); }, 120);
+      }
+    }
     text.append(el('strong', '', loggedIn ? (username || '作业通账号') : '登录作业通'));
-    text.append(el('small', '', loggedIn ? '作业通' : everLoggedIn() ? '登录已失效' : '尚未登录'));
+    text.append(el('small', '', loggedIn ? schoolLabel : everLoggedIn() ? '登录已失效' : '尚未登录'));
     row.onclick = e => { e.stopPropagation(); toggleAccountMenu(); };
   }
   if (!checking) row.append(icon('chevron', 'account-chevron'));
@@ -678,6 +901,12 @@ function renderAccount() {
 function renderAccountMenu() {
   const menu = $('#account-menu'), a = S.auth || {state: 'checking', sites: {}};
   menu.hidden = !accountMenuOpen;
+  if (accountMenuOpen) {
+    menu.classList.remove('open');
+    requestAnimationFrame(() => { if (accountMenuOpen && !menu.hidden) menu.classList.add('open'); });
+  } else {
+    menu.classList.remove('open');
+  }
   menu.setAttribute('role', 'menu');
   const username = a.credentials?.username?.trim();
   $('#account-menu-name').textContent = username || (a.state === 'logged_in' ? '作业通账号' : '作业助手');
@@ -685,12 +914,27 @@ function renderAccountMenu() {
   $('#account-login-state').textContent = a.state === 'logged_in' ? '重新登录' : '登录';
 }
 function toggleAccountMenu() {
-  accountMenuOpen = !accountMenuOpen;
+  if (accountMenuOpen) { closeAccountMenu(); return; }
+  accountMenuOpen = true;
   renderAccount();
-  if (accountMenuOpen) $('#account-login-button').focus({preventScroll: true});
+  $('#account-login-button').focus({preventScroll: true});
 }
 function closeAccountMenu() {
   if (!accountMenuOpen) return;
+  const menu = $('#account-menu');
+  if (menu && !menu.hidden && !REDUCED_MOTION()) {
+    const r = menu.getBoundingClientRect();
+    if (r.width > 0 && r.height > 0) {
+      const ghost = menu.cloneNode(true);
+      ghost.classList.remove('open');
+      ghost.hidden = false;
+      const host = mountGhost(ghost, { left: r.left, top: r.top, width: r.width, height: r.height, z: 45, bg: 'transparent', radius: '12px' });
+      host.style.overflow = 'visible';
+      ghost.classList.add('account-menu-ghost');
+      requestAnimationFrame(() => ghost.classList.add('closing'));
+      setTimeout(() => host.remove(), 190);
+    }
+  }
   accountMenuOpen = false;
   renderAccount();
 }
@@ -716,15 +960,36 @@ function renderSyncLine() {
     line.append(el('span', '', S.lastSuccess ? '更新于 ' + stamp(S.lastSuccess) : '尚未更新'));
   }
   const refresh = $('#refresh'), refreshing = S.job.busy && S.job.action === 'refresh' && !S.jobKey;
-  refresh.replaceChildren(icon('refresh', refreshing ? 'spin' : ''), el('span', '', refreshing ? '刷新中…' : '刷新全部'));
+  const justFinishedRefresh = !refreshing && S.waveState === 'settle';
+  refresh.replaceChildren(icon('refresh', refreshing ? 'spin' : justFinishedRefresh ? 'settle' : ''), el('span', '', refreshing ? '刷新中…' : '刷新全部'));
   refresh.classList.toggle('is-busy', refreshing);
   refresh.setAttribute('aria-busy', String(refreshing));
   refresh.disabled = S.job.busy || !S.online;
   refresh.title = !S.online ? '网络不可用' : refreshing ? '正在刷新作业…' : S.job.busy ? '请等待当前操作完成' : '更新所有课程的作业列表、截止时间和提交状态';
   $('#assignment-list').classList.toggle('refreshing', refreshing);
   $('#detail').classList.toggle('is-refreshing', refreshing);
+  syncListWave(refreshing);
   setRail(S.job.busy);
   renderSyncBadge();
+}
+function syncListWave(refreshing) {
+  const list = $('#assignment-list');
+  if (!list) return;
+  if (refreshing) {
+    if (S.waveState === 'on') return;
+    S.waveState = 'on';
+    list.querySelectorAll('.item').forEach((n, i) => { n.style.setProperty('--i', String(Math.min(i, 8))); n.classList.add('wave'); });
+    return;
+  }
+  if (S.waveState === 'on') {
+    S.waveState = 'settle';
+    list.querySelectorAll('.item.wave').forEach(n => n.classList.remove('wave'));
+    setTimeout(() => {
+      if (S.waveState !== 'settle') return;
+      S.waveState = '';
+      renderSyncBadge();
+    }, 700);
+  }
 }
 
 /* Thin progress rail along the top edge while any job runs. */
@@ -743,14 +1008,14 @@ function elapsedText() {
 function renderSyncBadge() {
   const badge = $('#sync-badge');
   const refreshing = S.job.busy && S.job.action === 'refresh' && !S.jobKey;
-  const recent = S.outcome && Date.now() - S.outcome.at < OUTCOME_MS ? S.outcome : null;
+  const recent = S.outcome && Date.now() - S.outcome.at < (S.outcome.latest ? 1700 : OUTCOME_MS) ? S.outcome : null;
   let tone = '', iconName = '', text = '', hint = '';
   if (refreshing) { tone = 'busy'; text = elapsedText(); hint = '正在从学习通读取作业'; }
   else if (!S.online) { tone = 'warn'; iconName = 'offline'; text = '网络不可用'; }
   else if (recent) {
     tone = recent.tone;
     iconName = recent.tone === 'ok' ? 'check' : 'alert';
-    text = recent.tone === 'ok' ? '已更新' : recent.tone === 'warn' ? '部分未更新' : '刷新失败';
+    text = recent.latest ? '已是最新' : recent.tone === 'ok' ? '已更新' : recent.tone === 'warn' ? '部分未更新' : '刷新失败';
   } else if (S.loaded && S.lastSuccess) {
     const d = parseDate(S.lastSuccess);
     if (d) { text = '更新于 ' + (dayLabel(d) === '今天' ? hm(d) : dayLabel(d)); hint = '上次更新：' + stamp(S.lastSuccess); }
@@ -847,7 +1112,20 @@ function warningsBanner(warnings) {
   d.append(ul);
   b.append(d);
   const actions = el('div', 'banner-actions');
-  const close = btn('关闭', 'btn-sm btn-ghost', dismissUpdateWarnings, 'x');
+  const close = btn('关闭', 'btn-sm btn-ghost', () => {
+    if (!REDUCED_MOTION()) {
+      const r = b.getBoundingClientRect();
+      if (r.width > 0 && r.height > 0) {
+        const ghost = b.cloneNode(true);
+        const host = mountGhost(ghost, { left: r.left, top: r.top, width: r.width, height: r.height, z: 32, bg: 'transparent', radius: '10px' });
+        host.animate([
+          { height: r.height + 'px', opacity: 1, transform: 'scaleY(1)' },
+          { height: '0px', opacity: 0, transform: 'scaleY(.92)' }
+        ], { duration: 240, easing: 'cubic-bezier(.4, 0, .2, 1)', fill: 'forwards' }).finished.then(() => host.remove());
+      }
+    }
+    dismissUpdateWarnings();
+  }, 'x');
   close.setAttribute('aria-label', '关闭本次读取失败提示');
   actions.append(close);
   b.append(actions);
@@ -923,10 +1201,23 @@ function renderWelcome() {
   $('#crumb').textContent = '首页';
   $('#home-top').hidden = true;
   const detail = $('#detail');
-  const w = el('div', 'welcome'), greet = el('div', 'greet');
-  greet.append(spark(), el('h1', '', greeting()));
   const active = S.records.filter(r => r.group === 'active').sort(sorter('active'));
   const review = S.records.filter(r => r.group === 'review').length;
+  const entering = S.navDir === 'left';
+  const welcomeSig = S.loaded
+    ? JSON.stringify([S.loadError, S.auth?.state, S.job.busy, S.online, S.lastSuccess, review, active.map(r => [r.key, r.deadline, progressFor(r).answered, progressFor(r).total])])
+    : '';
+  if (!entering && welcomeSig && S.welcomeSig === welcomeSig && detail.querySelector('.welcome')) {
+    S.navDir = '';
+    return;
+  }
+  const animHome = entering || (!S.welcomeAnimated && S.loaded);
+  if (S.loaded) { S.welcomeAnimated = true; S.welcomeSig = welcomeSig; }
+  const w = el('div', 'welcome' + (entering ? ' page-in-left' : animHome ? '' : ' no-anim')), greet = el('div', 'greet stg');
+  greet.style.setProperty('--i', '0');
+  S.navDir = '';
+  const mount = () => { detail.replaceChildren(w); if (entering) staggerView(w, true); };
+  greet.append(spark(), el('h1', '', greeting()));
   const line = el('p');
   if (!S.loaded) line.textContent = S.loadError ? '本地作业读取失败：' + S.loadError : '正在读取本地作业…';
   else if (!S.records.length) line.textContent = '还没有作业记录。';
@@ -940,17 +1231,19 @@ function renderWelcome() {
   if (S.auth?.state === 'login_required') {
     const b = btn('登录作业通', 'btn-primary', openLogin);
     b.disabled = S.job.busy;
-    w.append(callout('login', 'lock', everLoggedIn() ? '登录已失效' : '登录作业通', '登录后才能读取作业和填入答案。', b));
+    const c = callout('login', 'lock', everLoggedIn() ? '登录已失效' : '登录作业通', '登录后才能读取作业和填入答案。', b);
+    c.classList.add('stg'); c.style.setProperty('--i', '1');
+    w.append(c);
   }
-  if (!S.loaded) { detail.replaceChildren(w); return; }
+  if (!S.loaded) { mount(); return; }
   if (!S.records.length) {
-    const empty = el('div', 'empty'), ic = el('div', 'empty-icon'), row = el('div', 'notice-actions');
+    const empty = el('div', 'empty anim-in'), ic = el('div', 'empty-icon'), row = el('div', 'notice-actions');
     ic.append(icon('inbox'));
     empty.append(ic, el('h2', '', '还没有作业'), el('p', '', S.auth?.state === 'logged_in' ? '刷新后会读取学习通里的作业。' : '登录后刷新即可看到作业。'));
     if (S.auth?.state === 'logged_in') row.append(Object.assign(btn('刷新作业', 'btn-primary', () => startAction('refresh'), 'refresh'), {disabled: S.job.busy || !S.online}));
     empty.append(row);
     w.append(empty);
-    detail.replaceChildren(w);
+    mount();
     return;
   }
 
@@ -958,9 +1251,12 @@ function renderWelcome() {
   const today = active.filter(r => summary.keys.today.includes(r.key));
   if (today.length) {
     const first = today[0], d = due(first);
-    w.append(callout('urgent', 'clock', `今天有 ${today.length} 项作业截止`, `${first.course || '未命名课程'} · ${d.left || d.short}`, btn(today.length > 1 ? '查看' : '去完成', 'btn-primary', () => today.length > 1 ? showWorkspaceList('active', 'all', 'today') : select(first.key))));
+    const uc = callout('urgent pulse', 'clock', `今天有 ${today.length} 项作业截止`, `${first.course || '未命名课程'} · ${d.left || d.short}`, btn(today.length > 1 ? '查看' : '去完成', 'btn-primary', () => today.length > 1 ? showWorkspaceList('active', 'all', 'today') : select(first.key)));
+    uc.classList.add('stg'); uc.style.setProperty('--i', '1');
+    w.append(uc);
   }
-  const metrics = el('div', 'metrics');
+  const metrics = el('div', 'metrics stg');
+  metrics.style.setProperty('--i', '2');
   for (const [key, title, group, range] of [
     ['today', '今天截止', 'active', 'today'], ['within_3_days', '3 天内截止', 'active', 'within_3_days'],
     ['within_7_days', '7 天内截止', 'active', 'within_7_days'], ['review', '待核实', 'review', 'all'],
@@ -968,19 +1264,28 @@ function renderWelcome() {
     const n = summary.counts[key];
     const metric = btn('', 'overview-metric' + (!n ? ' zero' : key === 'today' ? ' hot' : key === 'review' ? ' caution' : ''), () => showWorkspaceList(group, 'all', range));
     metric.dataset.overview = key;
-    metric.append(el('strong', '', String(n)), el('span', '', title));
+    const strong = el('strong', '', String(n));
+    if (animHome && n > 0) animateNumber(strong, n, '', true);
+    metric.append(strong, el('span', '', title));
     metrics.append(metric);
   }
   w.append(metrics);
 
-  const progress = el('section', 'panel'), head = el('div', 'panel-head');
+  const progress = el('section', 'panel stg'), head = el('div', 'panel-head');
+  progress.style.setProperty('--i', '3');
   const {answered, total} = summary.questions, percent = total ? Math.round(answered * 100 / total) : 0;
   head.append(el('h2', '', '作答进度'), el('span', '', total ? `已写 ${answered} / ${total} 题` : '暂无已读取的题目'));
   const bar = el('div', 'big-progress'), fill = el('i');
-  fill.style.width = percent + '%';
+  if (animHome && percent > 0 && !REDUCED_MOTION()) {
+    fill.style.width = '0%';
+    requestAnimationFrame(() => requestAnimationFrame(() => { if (fill.isConnected) fill.style.width = percent + '%'; }));
+  } else {
+    fill.style.width = percent + '%';
+  }
   bar.append(fill);
-  const meta = el('div', 'progress-meta');
-  meta.append(el('b', '', percent + '%'), el('span', '', '写完后仍需在学习通提交'));
+  const meta = el('div', 'progress-meta'), pctEl = el('b', '', percent + '%');
+  if (animHome && percent > 0) animateNumber(pctEl, percent, '%', true);
+  meta.append(pctEl, el('span', '', '写完后仍需在学习通提交'));
   const chips = el('div', 'state-chips');
   for (const [state, label] of Object.entries(HomeworkWorkspace.labels)) {
     const chip = el('button', 'chip', label);
@@ -994,10 +1299,12 @@ function renderWelcome() {
   w.append(progress);
 
   if (active.length) {
-    const panel = el('section', 'panel'), ph = el('div', 'panel-head'), list = el('div', 'upcoming');
+    const panel = el('section', 'panel stg'), ph = el('div', 'panel-head'), list = el('div', 'upcoming');
+    panel.style.setProperty('--i', '4');
     ph.append(el('h2', '', '近期截止'), el('span', '', `共 ${active.length} 项待完成`));
-    for (const r of active.slice(0, 5)) {
-      const d = due(r), row = el('button', 'up-item ' + d.tone), main = el('span', 'up-main'), side = el('span', 'up-side');
+    active.slice(0, 5).forEach((r, idx) => {
+      const d = due(r), row = el('button', 'up-item ' + d.tone + (animHome ? ' enter' : '')), main = el('span', 'up-main'), side = el('span', 'up-side');
+      if (animHome) row.style.setProperty('--i', String(idx));
       row.type = 'button';
       main.append(el('strong', '', r.course || '未命名课程'), el('span', '', r.title || '未命名作业'));
       const p = progressFor(r);
@@ -1005,7 +1312,7 @@ function renderWelcome() {
       row.append(dateBadge(r), main, side);
       row.onclick = () => select(r.key);
       list.append(row);
-    }
+    });
     panel.append(ph, list);
     if (active.length > 5) {
       const more = btn(`查看全部 ${active.length} 项`, 'btn-ghost btn-sm', () => showWorkspaceList('active'), 'arrow');
@@ -1014,22 +1321,197 @@ function renderWelcome() {
     }
     w.append(panel);
   }
-  if (review) w.append(callout('warn', 'alert', `${review} 项作业信息待核实`, '截止时间或提交状态不确定，核实前不会计入待完成。', btn('去核实', '', () => showWorkspaceList('review'))));
-  const foot = el('div', 'home-foot');
+  if (review) {
+    const rc = callout('warn stg', 'alert', `${review} 项作业信息待核实`, '截止时间或提交状态不确定，核实前不会计入待完成。', btn('去核实', '', () => showWorkspaceList('review')));
+    rc.style.setProperty('--i', '5');
+    w.append(rc);
+  }
+  const foot = el('div', 'home-foot stg');
+  foot.style.setProperty('--i', '5');
   foot.append(el('span', '', S.lastSuccess ? '更新于 ' + stamp(S.lastSuccess) : '尚未更新'));
   foot.append(Object.assign(btn('刷新', 'btn-ghost btn-sm', () => startAction('refresh'), 'refresh'), {disabled: S.job.busy || !S.online}));
   w.append(foot);
-  detail.replaceChildren(w);
+  mount();
 }
 
 /* ---------- Detail ---------- */
 function fingerprint(r) {
   return JSON.stringify([r.questions, r.group, r.status, r.deadline, r.deadline_kind, r.content_complete, r.content_warnings, r.content_error, r.content_status, r.instructions_html, r.instructions_text, r.instructions_source, r.attachments, r.online_attachments, r.review_attachments, r.child_tasks, r.submission_note, r.title, r.course, r.local_settings]);
 }
-function setView(v) { $('#app').dataset.view = v; }
+function setView(v) {
+  $('#app').dataset.view = v;
+  if (v === 'list') requestAnimationFrame(() => placeListSel($('#assignment-list .list-sel'), false));
+}
+function scrubGhost(root) {
+  root.setAttribute('aria-hidden', 'true');
+  root.setAttribute('inert', '');
+  for (const attr of [...root.attributes]) if (attr.name.startsWith('data-')) root.removeAttribute(attr.name);
+  root.querySelectorAll('[id]').forEach(n => n.removeAttribute('id'));
+  root.querySelectorAll('*').forEach(n => {
+    for (const attr of [...n.attributes]) if (attr.name.startsWith('data-')) n.removeAttribute(attr.name);
+    n.style.animation = 'none';
+    n.style.transition = 'none';
+  });
+}
+let ghostSheet = null, ghostCssText = '';
+function applyGhostStyles(shadow) {
+  if (!ghostCssText) {
+    const rules = [];
+    for (const s of document.styleSheets) {
+      try { for (const r of s.cssRules) rules.push(r.cssText); } catch {}
+    }
+    ghostCssText = rules.join('\n');
+    if (ghostCssText && typeof CSSStyleSheet !== 'undefined' && 'replaceSync' in CSSStyleSheet.prototype) {
+      try { ghostSheet = new CSSStyleSheet(); ghostSheet.replaceSync(ghostCssText); } catch { ghostSheet = null; }
+    }
+  }
+  if (ghostSheet && 'adoptedStyleSheets' in shadow) {
+    shadow.adoptedStyleSheets = [ghostSheet];
+  } else if (ghostCssText) {
+    const style = document.createElement('style');
+    style.textContent = ghostCssText;
+    shadow.append(style);
+  } else {
+    const link = document.createElement('link');
+    link.rel = 'stylesheet';
+    link.href = '/ui.css';
+    shadow.append(link);
+  }
+}
+function mountGhost(clone, { left, top, width, height, z = 35, bg = 'transparent', radius = '12px', cls = '', cloneLeft = 0, cloneTop = 0, cloneWidth = '100%', cloneHeight = '100%' }) {
+  scrubGhost(clone);
+  const host = document.createElement('div');
+  if (cls) host.className = cls;
+  Object.assign(host.style, {
+    position: 'fixed', left: left + 'px', top: top + 'px', width: width + 'px', height: height + 'px',
+    zIndex: String(z), pointerEvents: 'none', overflow: 'hidden', borderRadius: radius, background: bg
+  });
+  host.setAttribute('aria-hidden', 'true');
+  host.setAttribute('inert', '');
+  const shadow = host.attachShadow({ mode: 'closed' });
+  applyGhostStyles(shadow);
+  Object.assign(clone.style, {
+    position: 'absolute',
+    left: typeof cloneLeft === 'number' ? cloneLeft + 'px' : String(cloneLeft),
+    top: typeof cloneTop === 'number' ? cloneTop + 'px' : String(cloneTop),
+    right: 'auto',
+    bottom: 'auto',
+    width: typeof cloneWidth === 'number' ? cloneWidth + 'px' : String(cloneWidth),
+    height: typeof cloneHeight === 'number' ? cloneHeight + 'px' : String(cloneHeight),
+    margin: '0'
+  });
+  shadow.append(clone);
+  document.body.append(host);
+  return host;
+}
+function snapshotView(dir) {
+  if (REDUCED_MOTION()) return;
+  document.querySelectorAll('.view-ghost-host').forEach(n => n.remove());
+  const detail = $('#detail');
+  const old = detail.querySelector('.column, .welcome');
+  if (!old) return;
+  const detailRect = detail.getBoundingClientRect();
+  const r = old.getBoundingClientRect();
+  if (r.width <= 0 || r.height <= 0 || r.bottom <= detailRect.top || r.top >= detailRect.bottom) return;
+  const ghost = old.cloneNode(true);
+  ghost.querySelectorAll('.stg-item, .stg, .enter').forEach(n => n.classList.remove('stg-item', 'stg', 'enter'));
+  ghost.classList.remove('page-in-right', 'page-in-left', 'no-anim');
+  ghost.classList.add('view-ghost', dir > 0 ? 'page-out-left' : 'page-out-right');
+  const host = mountGhost(ghost, {
+    left: detailRect.left,
+    top: detailRect.top,
+    width: detailRect.width,
+    height: Math.max(0, Math.min(detailRect.height, innerHeight - detailRect.top)),
+    z: 4,
+    bg: 'transparent',
+    radius: '0',
+    cls: 'view-ghost-host',
+    cloneLeft: r.left - detailRect.left,
+    cloneTop: r.top - detailRect.top,
+    cloneWidth: r.width,
+    cloneHeight: r.height
+  });
+  setTimeout(() => host.remove(), 360);
+}
+function staggerView(root, on) {
+  if (!on || !root) return;
+  [...root.children].slice(0, 10).forEach((n, i) => {
+    if (n.matches('.reading')) return;
+    n.classList.add('stg-item');
+    n.style.setProperty('--si', String(i));
+  });
+}
+function snapshotListOut(dir) {
+  if (REDUCED_MOTION()) return;
+  document.querySelectorAll('.list-ghost-host').forEach(n => n.remove());
+  const list = $('#assignment-list');
+  if (!list || !list.children.length) return;
+  const r = list.getBoundingClientRect();
+  if (r.width <= 0 || r.height <= 0) return;
+  const ghost = list.cloneNode(true);
+  ghost.classList.add('list-ghost', dir > 0 ? 'tab-out-left' : 'tab-out-right');
+  const host = mountGhost(ghost, {
+    left: r.left, top: r.top, width: r.width, height: r.height,
+    z: 36, bg: 'transparent', radius: '0', cls: 'list-ghost-host'
+  });
+  ghost.scrollTop = list.scrollTop;
+  setTimeout(() => host.remove(), 240);
+}
+function openSheet(dialog) {
+  if (!dialog) return;
+  dialog.classList.remove('closing');
+  if (!dialog.open) dialog.showModal();
+}
+function closeSheet(dialog) {
+  if (!dialog || !dialog.open) return;
+  const card = dialog.querySelector('.sheet-body');
+  const r = card?.getBoundingClientRect();
+  if (!REDUCED_MOTION() && r && r.width > 0 && r.height > 0) {
+    const scrim = document.createElement('div');
+    Object.assign(scrim.style, {
+      position: 'fixed', inset: '0', zIndex: '48', pointerEvents: 'none',
+      background: 'rgba(31, 30, 29, .24)', backdropFilter: 'blur(2px)'
+    });
+    scrim.setAttribute('aria-hidden', 'true');
+    document.body.append(scrim);
+    scrim.animate([{ opacity: 1 }, { opacity: 0 }], { duration: 180, easing: 'ease-out', fill: 'forwards' })
+      .finished.then(() => scrim.remove(), () => scrim.remove());
+
+    const ghost = card.cloneNode(true);
+    ghost.style.maxHeight = r.height + 'px';
+    const host = mountGhost(ghost, {
+      left: r.left, top: r.top, width: r.width, height: r.height,
+      z: 50, bg: 'transparent', radius: getComputedStyle(card).borderRadius || '20px'
+    });
+    host.style.boxShadow = 'var(--shadow-lg)';
+    host.animate([
+      { transform: 'scale(1)', opacity: 1, filter: 'blur(0)' },
+      { transform: 'scale(.93) translateY(8px)', opacity: 0, filter: 'blur(4px)' }
+    ], { duration: 200, easing: 'cubic-bezier(.4, 0, .6, 1)', fill: 'forwards' })
+      .finished.then(() => host.remove(), () => host.remove());
+  }
+  dialog.classList.remove('closing');
+  dialog.close();
+}
+function animateRemovedItems(keys) {
+  for (const key of keys) {
+    const node = document.querySelector(`#assignment-list .item[data-key="${CSS.escape(key)}"]`);
+    if (!node) continue;
+    const r = node.getBoundingClientRect();
+    if (r.bottom < 0 || r.top > innerHeight) continue;
+    const ghost = node.cloneNode(true);
+    ghost.classList.add('item-ghost');
+    const host = mountGhost(ghost, { left: r.left, top: r.top, width: r.width, height: r.height, z: 34, bg: 'var(--surface)', radius: '10px' });
+    ghost.animate([
+      { height: '100%', opacity: 1, transform: 'none' },
+      { height: '0%', opacity: 0, transform: 'translateX(30px)' }
+    ], { duration: 300, easing: 'cubic-bezier(.5,0,.75,0)', fill: 'forwards' }).finished.then(() => host.remove());
+  }
+}
 async function select(key, keep = false) {
   const generation = ++S.selecting;
   if (S.key && S.key !== key && dirty.has(S.key)) flush(S.key).catch(() => {});
+  if (!keep) { S.navDir = 'right'; S.dockPct = null; S.prevDockKey = null; }
   S.key = key;
   const selected = record();
   if (selected && S.group !== selected.group) { S.group = selected.group; S.sub = 'all'; }
@@ -1037,16 +1519,26 @@ async function select(key, keep = false) {
   setView('detail');
   renderList();
   const detail = $('#detail');
-  if (!drafts.has(key)) {
-    const loading = el('div', 'empty');
-    loading.append(icon('loader'), el('p', '', '正在打开…'));
-    detail.replaceChildren(loading);
+  const hadDraft = drafts.has(key);
+  let snapped = false;
+  let loadingTimer = null;
+  if (!hadDraft) {
+    loadingTimer = setTimeout(() => {
+      if (generation !== S.selecting) return;
+      if (!keep && !snapped) { snapped = true; snapshotView(1); }
+      const loading = el('div', 'empty page-in-right');
+      loading.append(icon('loader'), el('p', '', '正在打开…'));
+      detail.replaceChildren(loading);
+    }, 150);
   }
   try {
     const draft = await getDraft(key);
+    if (loadingTimer) clearTimeout(loadingTimer);
     if (generation !== S.selecting) return;
+    if (!keep && !snapped) { snapped = true; snapshotView(1); }
     renderDetail(record(), draft, keep);
   } catch (e) {
+    if (loadingTimer) clearTimeout(loadingTimer);
     if (generation !== S.selecting) return;
     const box = el('div', 'empty'), ic = el('div', 'empty-icon');
     ic.append(icon('alert'));
@@ -1089,11 +1581,36 @@ function renderContentWarning(r) {
       : btn('登录作业通', 'btn-sm btn-primary', openLogin)])
     : notice('danger', 'alert', '题目读取失败', [r.content_error], [rereadButton(r)]));
 }
+function renderSubWatchBar(r) {
+  const watch = S.watchingSub.get(r.key);
+  if (!watch || r.group === 'history') return null;
+  const checking = S.job.busy && S.job.action === 'refresh' && S.jobKey === r.key;
+  const isWarn = watch.state === 'unsubmitted' && !checking;
+  const bar = el('div', 'sub-watch' + (checking ? ' busy' : isWarn ? ' warn' : ''));
+  bar.id = 'sub-watch-bar';
+  if (checking) {
+    bar.append(el('span', 'pulse-dot'), el('span', 'sub-watch-text', '正在核对学习通提交状态…'));
+  } else if (isWarn) {
+    bar.append(icon('alert'), el('span', 'sub-watch-text', '未检测到提交（若已在网页保存，仍需在网页点击提交），作业仍保留在待完成'));
+    const retry = btn('再检查', 'btn-sm', () => triggerSubmissionCheck(r.key), 'refresh');
+    retry.disabled = S.job.busy || !S.online;
+    bar.append(retry);
+  } else {
+    bar.append(el('span', 'pulse-dot'), el('span', 'sub-watch-text', '已在学习通打开作业，提交后切回本窗口将自动移入历史'));
+    const checkNow = btn('我已提交，立即检查', 'btn-sm', () => triggerSubmissionCheck(r.key), 'check');
+    checkNow.disabled = S.job.busy || !S.online;
+    bar.append(checkNow);
+  }
+  return bar;
+}
 function renderDetail(r, draft, keep = false) {
   if (!r) return;
   const detail = $('#detail');
   const scroll = keep ? detail.scrollTop : 0;
-  const col = el('div', 'column');
+  const animCls = keep ? ' no-anim' : S.navDir === 'right' ? ' page-in-right' : '';
+  const entering = !keep && animCls === ' page-in-right';
+  S.navDir = '';
+  const col = el('div', 'column' + animCls);
   const live = r.group !== 'history';
 
   const hero = el('header', 'hero'), top = el('div', 'hero-top'), titles = el('div', 'hero-titles');
@@ -1120,10 +1637,13 @@ function renderDetail(r, draft, keep = false) {
   }
   hero.append(facts);
   col.append(hero);
+  const subWatch = renderSubWatchBar(r);
+  if (subWatch) col.append(subWatch);
 
   if (!live) {
     col.append(notice('soft', 'info', '', ['历史作业只保留基本信息。']));
     detail.replaceChildren(col);
+    if (entering) staggerView(col, true);
     S.printed = fingerprint(r);
     $('#crumb').textContent = `${GROUPS[r.group]} · ${r.course || '未命名课程'}`;
     renderDock(r); renderSave(); renderReading(r);
@@ -1209,7 +1729,12 @@ function renderDetail(r, draft, keep = false) {
       const dot = el('button', 'qdot', String(i + 1));
       dot.type = 'button';
       dot.id = 'qd-' + q.id;
-      dot.onclick = () => document.getElementById('q-' + q.id)?.scrollIntoView({block: 'start'});
+      dot.onclick = () => {
+        const target = document.getElementById('q-' + q.id);
+        if (!target) return;
+        target.scrollIntoView({block: 'start'});
+        restartAnim(target, 'q-flash');
+      };
       dots.append(dot);
     });
     nav.append(label, dots);
@@ -1221,6 +1746,7 @@ function renderDetail(r, draft, keep = false) {
   }
 
   detail.replaceChildren(col);
+  if (entering) staggerView(col, true);
   renderContentWarning(r);
   S.printed = fingerprint(r);
   $('#crumb').textContent = `${GROUPS[r.group]} · ${r.course || '未命名课程'}`;
@@ -1287,8 +1813,16 @@ function updateProgress() {
     }
   }
   const total = r.questions.length, percent = Math.round(done * 100 / total);
+  const prevPct = S.dockPct ?? percent;
+  S.dockPct = percent;
   const ring = document.querySelector('.dock .ring');
-  if (ring) { ring.style.setProperty('--p', percent); ring.classList.toggle('complete', done === total); }
+  if (ring) {
+    ring.classList.toggle('complete', done === total);
+    animRing(ring, prevPct, percent);
+  }
+  if (done === total && total > 0 && prevPct < 100) {
+    restartAnim(document.querySelector('.dock .dock-actions .btn-primary'), 'btn-pulse');
+  }
   const count = $('#dock-count');
   if (count) count.textContent = done === total ? `全部 ${total} 题已作答` : `已作答 ${done} / ${total}`;
 }
@@ -1357,11 +1891,23 @@ function questionCard(q, index, draft, key) {
     input.oninput = () => update(input.value);
     art.append(input);
   } else if (['single', 'multiple', 'judgment'].includes(q.type)) {
-    art.append(choiceInput(q, index, cur, update));
+    const aiHint = S.aiHintKeys.get(key);
+    const isAiFilled = aiHint && Date.now() - aiHint.at < 2400 && aiHint.filled?.has(String(q.id));
+    const choiceBox = choiceInput(q, index, cur, update);
+    if (isAiFilled) choiceBox.querySelectorAll('input:checked').forEach(inp => inp.closest('.option')?.classList.add('ai-hint-pulse'));
+    art.append(choiceBox);
   } else if (q.type === 'blank') {
-    art.append(blankInput(q, index, cur, update));
+    const aiHint = S.aiHintKeys.get(key);
+    const isAiFilled = aiHint && Date.now() - aiHint.at < 2400 && aiHint.filled?.has(String(q.id));
+    const blankBox = blankInput(q, index, cur, update);
+    if (isAiFilled) blankBox.querySelectorAll('.input').forEach(inp => inp.classList.add('ai-hint-pulse'));
+    art.append(blankBox);
   } else if (q.type === 'essay') {
-    art.append(essayInput(q, index, cur, update));
+    const aiHint = S.aiHintKeys.get(key);
+    const isAiFilled = aiHint && Date.now() - aiHint.at < 2400 && aiHint.filled?.has(String(q.id));
+    const essayBox = essayInput(q, index, cur, update);
+    if (isAiFilled) essayBox.querySelector('.textarea')?.classList.add('ai-hint-pulse');
+    art.append(essayBox);
   }
   art.append(filesBlock(q, draft, key, q.type === 'upload', paintStale));
   const template = window.HomeworkAI?.templateCard(q, draft, key);
@@ -1407,6 +1953,15 @@ function choiceInput(q, index, cur, update) {
     const letter = letterAt(i);
     const prefixed = new RegExp('^\\s*' + letter + '\\s*[.、．:：)）\\s]').test(text.textContent || '');
     const mark = el('span', 'mark', judge || prefixed ? '' : letter);
+    label.addEventListener('pointerdown', e => {
+      if (input.disabled) return;
+      const rect = label.getBoundingClientRect();
+      const rip = el('span', 'opt-ripple');
+      rip.style.left = (e.clientX - rect.left) + 'px';
+      rip.style.top = (e.clientY - rect.top) + 'px';
+      label.append(rip);
+      setTimeout(() => rip.remove(), 560);
+    });
     input.onchange = () => {
       update(multi ? [...wrap.querySelectorAll('input:checked')].map(x => x.value) : input.value);
       paint();
@@ -1467,11 +2022,13 @@ function formatSize(n) {
 function filesBlock(q, draft, key, prominent, onChange) {
   const box = el('div', 'files'), list = el('div', 'files-list'), status = el('div', 'uploading'), hint = el('div', 'files-hint');
   status.hidden = true;
+  let justAddedId = null, dragDepth = 0;
   const paint = () => {
     list.replaceChildren();
     const files = draft.answers[q.id]?.files || [];
     list.hidden = !files.length;
     for (const f of files) {
+      const wrap = el('div', 'file-wrap' + (f.id === justAddedId ? ' entering' : '')), inner = el('div');
       const row = el('div', 'file'), fi = el('span', 'file-icon'), main = el('div', 'file-main');
       fi.append(icon('file'));
       main.append(el('span', 'file-name', f.name || '答案附件'), el('span', 'file-size', formatSize(Number(f.size))));
@@ -1489,6 +2046,10 @@ function filesBlock(q, draft, key, prominent, onChange) {
           return;
         }
         remove.disabled = true;
+        if (!REDUCED_MOTION()) {
+          wrap.classList.add('removing');
+          await new Promise(res => setTimeout(res, 220));
+        }
         const a = editable(q, draft);
         a.files = (a.files || []).filter(x => x.id !== f.id);
         draft.answers[q.id] = a;
@@ -1503,8 +2064,11 @@ function filesBlock(q, draft, key, prominent, onChange) {
         }
       };
       row.append(fi, main, open, remove);
-      list.append(row);
+      inner.append(row);
+      wrap.append(inner);
+      list.append(wrap);
     }
+    justAddedId = null;
     hint.hidden = !prominent && !files.length;
     hint.textContent = prominent
       ? '单个文件不超过 30 MB，自动填入时会尝试上传。'
@@ -1520,6 +2084,7 @@ function filesBlock(q, draft, key, prominent, onChange) {
         const f = await api('/api/upload?' + new URLSearchParams({key, qid: q.id, name: file.name}), file, true);
         const a = editable(q, draft);
         a.files = [...(a.files || []), f];
+        justAddedId = f.id;
         draft.answers[q.id] = a;
         markDirty(key, q.id);
         await flush(key);
@@ -1539,9 +2104,10 @@ function filesBlock(q, draft, key, prominent, onChange) {
   if (prominent) {
     const zone = el('label', 'dropzone');
     zone.append(icon('clip'), el('strong', '', '添加答案文件'), el('span', '', '点击选择，或把文件拖到这里'), input);
+    zone.ondragenter = e => { e.preventDefault(); dragDepth++; zone.classList.add('over'); };
     zone.ondragover = e => { e.preventDefault(); zone.classList.add('over'); };
-    zone.ondragleave = () => zone.classList.remove('over');
-    zone.ondrop = e => { e.preventDefault(); zone.classList.remove('over'); upload(e.dataTransfer.files); };
+    zone.ondragleave = () => { dragDepth = Math.max(0, dragDepth - 1); if (!dragDepth) zone.classList.remove('over'); };
+    zone.ondrop = e => { e.preventDefault(); dragDepth = 0; zone.classList.remove('over'); upload(e.dataTransfer.files); };
     box.append(zone);
   } else {
     const add = el('label', 'add-file');
@@ -1567,9 +2133,10 @@ function renderSave() {
   if (!S.key) return;
   const [tone, iconName, text] = saveText(S.key);
   const pill = $('#top-save');
+  const wasHidden = pill.hidden;
   pill.hidden = false;
-  pill.className = 'save-pill ' + tone;
-  pill.replaceChildren(icon(iconName), el('span', '', text));
+  pill.className = 'save-pill ' + tone + (wasHidden ? ' entering' : '');
+  pill.replaceChildren(tone === 'saving' ? el('span', 'save-dot') : icon(iconName), el('span', '', text));
   if (tone === 'failed') {
     const retry = el('button', 'link', '重试');
     retry.type = 'button';
@@ -1590,13 +2157,19 @@ function fillBlocker(r) {
 function renderDock(r) {
   const dock = $('#dock');
   if (r.group === 'history' || r.capabilities?.show_submission_bar === false) {
-    dock.hidden = true; dock.replaceChildren(); setDock(false); return;
+    dock.hidden = true; dock.replaceChildren(); setDock(false); S.prevDockKey = null; return;
   }
+  const wasHidden = dock.hidden;
+  const keyChanged = S.prevDockKey !== r.key;
+  S.prevDockKey = r.key;
+  if (wasHidden && !REDUCED_MOTION()) dock.classList.add('dock-pre');
   dock.hidden = false;
   setDock(true);
   const card = el('div', 'dock-card'), row = el('div', 'dock-row'), progress = el('div', 'dock-progress'), actions = el('div', 'dock-actions');
   const busy = S.job.busy, act = S.job.action, mine = S.jobKey === r.key;
-  const ring = el('span', 'ring'), text = el('div', 'dock-text'), count = el('strong', '', r.questions?.length ? '' : '题目待读取');
+  const ring = el('span', 'ring'), checkEl = el('span', 'ring-check'), text = el('div', 'dock-text'), count = el('strong', '', r.questions?.length ? '' : '题目待读取');
+  checkEl.append(icon('check'));
+  ring.append(checkEl);
   count.id = 'dock-count';
   const blocker = fillBlocker(r);
   const sub = el('span', blocker && !busy ? 'warn' : '', blocker && !busy ? '暂不能填入：' + blocker : '填入后需在学习通提交');
@@ -1615,8 +2188,13 @@ function renderDock(r) {
   row.append(progress, actions);
   card.append(row);
   dock.replaceChildren(card);
+  if (keyChanged && S.dockPct === null) S.dockPct = progressFor(r).percentage;
   updateProgress();
   renderSave();
+  if (wasHidden && !REDUCED_MOTION()) {
+    void dock.offsetHeight;
+    requestAnimationFrame(() => dock.classList.remove('dock-pre'));
+  }
 }
 if ('ResizeObserver' in window) new ResizeObserver(() => {
   const h = $('#dock').offsetHeight;
@@ -1642,7 +2220,7 @@ function openAssignmentManager(r) {
   body.append(title, el('p', 'sheet-text', r.title || '未命名作业'));
   const list = el('div', 'manage-list');
   const settings = intent => { dialog.close(); openAssignmentSettings(r, intent); };
-  const run = async action => { if (await startAction(action, r.key)) dialog.close(); };
+  const run = async action => { if (await startAction(action, r.key)) closeSheet(dialog); };
   const openItem = manageItem('查看原作业', '在学习通打开这份作业', 'external', () => run('open'));
   openItem.disabled = S.job.busy || !S.online || r.capabilities?.can_open === false;
   list.append(openItem);
@@ -1653,7 +2231,7 @@ function openAssignmentManager(r) {
   else local.append(manageItem('标记已完成', '移入历史，并清理题目和答案', 'check', () => settings('completed')));
   local.append(manageItem(own ? '修改截止时间' : '设置截止时间', own ? '当前自设：' + stamp(own) + '，可在其中撤销' : '平台时间不准确时使用', 'calendar', () => settings('deadline')));
   body.append(local);
-  dialog.showModal();
+  openSheet(dialog);
 }
 async function goToAssignment(r) {
   try {
@@ -1678,29 +2256,32 @@ function openAssignmentSettings(r, intent = '') {
   }
   state.value = intent === 'completed' || r.local_settings?.completed ? 'completed' : 'platform';
   statusLabel.append(el('span', '', '完成状态'), state);
+  const dangerSlot = el('div', 'danger-slot'), dangerInner = el('div');
   const danger = notice('danger', 'alert', '标记完成会清理本机内容', ['题目、答案和附件将被删除，无法恢复。']);
+  dangerInner.append(danger);
+  dangerSlot.append(dangerInner);
   const dateLabel = el('label', 'form-field'), date = el('input', 'input');
   date.id = 'assignment-deadline'; date.type = 'datetime-local';
   date.value = r.local_settings?.deadline?.slice(0, 16) || '';
   dateLabel.append(el('span', '', '自设截止时间'), date);
-  form.append(statusLabel, danger, dateLabel, el('p', 'field-foot', '留空则使用学习通的截止时间。'));
+  form.append(statusLabel, dangerSlot, dateLabel, el('p', 'field-foot', '留空则使用学习通的截止时间。'));
   const error = el('p', 'settings-error'); error.setAttribute('role', 'alert'); form.append(error);
   const actions = el('div', 'sheet-actions'), save = btn('保存设置', 'btn-primary'); save.type = 'submit';
   const reset = btn('撤销本机设置', 'btn-ghost', () => persist(false, null));
   reset.disabled = !r.local_settings?.completed && !r.local_settings?.deadline;
   const sync = () => {
     const destructive = state.value === 'completed' && !r.local_settings?.completed;
-    danger.hidden = !destructive;
+    dangerSlot.classList.toggle('open', destructive);
     save.className = 'btn ' + (destructive ? 'btn-danger' : 'btn-primary');
   };
   state.onchange = sync; sync();
-  actions.append(reset, el('span', 'spacer'), btn('取消', '', () => dialog.close()), save); form.append(actions);
+  actions.append(reset, el('span', 'spacer'), btn('取消', '', () => closeSheet(dialog)), save); form.append(actions);
   async function persist(completed, deadline) {
     save.disabled = reset.disabled = true;
     error.textContent = '';
     try {
       await api('/api/assignment-settings', {key: r.key, completed, deadline});
-      dialog.close();
+      closeSheet(dialog);
       await load();
       const updated = S.records.find(x => x.key === canonicalKey(r.key));
       if (updated) { S.group = updated.group; S.sub = 'all'; renderList(); }
@@ -1714,7 +2295,7 @@ function openAssignmentSettings(r, intent = '') {
   }
   form.onsubmit = event => { event.preventDefault(); if (form.reportValidity()) persist(state.value === 'completed', date.value || null); };
   body.append(form);
-  dialog.showModal();
+  openSheet(dialog);
   (intent === 'deadline' ? date : state).focus();
 }
 
@@ -1731,6 +2312,7 @@ async function startAction(name, key = null, extra = {}) {
     S.jobKey = key;
     applyJob(job);
     renderStatus(true);
+    schedulePoll(name === 'login' ? 280 : 180);
     return true;
   } catch (e) {
     toast(e.message, 'error');
@@ -1748,13 +2330,91 @@ function applyJob(job) {
   }
   if (job.reminder) S.reminder = job.reminder;
 }
+function markWatchingSubmission(key) {
+  if (!key) return;
+  const cKey = canonicalKey(key);
+  const r = S.records.find(x => x.key === cKey);
+  if (!r || r.group === 'history') return;
+  S.watchingSub.set(cKey, {
+    state: 'watching',
+    readyAt: Date.now(),
+    blurred: document.visibilityState === 'hidden' || !document.hasFocus(),
+  });
+  if (S.key === cKey && drafts.has(cKey)) renderDetail(r, drafts.get(cKey), true);
+}
+async function triggerSubmissionCheck(key) {
+  const cKey = canonicalKey(key);
+  if (!cKey || S.job.busy || !S.online) return;
+  S.subCheckKey = cKey;
+  const ok = await startAction('refresh', cKey);
+  if (!ok) S.subCheckKey = null;
+  else if (S.key === cKey && drafts.has(cKey)) renderDetail(record(), drafts.get(cKey), true);
+}
+function playSubmittedArchiveAnim(r) {
+  const hero = document.querySelector('#detail .hero');
+  if (hero && S.key === r.key) {
+    hero.querySelector('.submitted-stamp')?.remove();
+    const stampEl = el('div', 'submitted-stamp thud', '已提交');
+    hero.append(stampEl);
+    restartAnim(hero, 'thud');
+    document.getElementById('sub-watch-bar')?.classList.add('ok');
+  }
+  const srcEl = (S.key === r.key && hero) || document.querySelector(`#assignment-list .item[data-key="${CSS.escape(r.key)}"]`);
+  const histTab = document.querySelector('.tab[data-group="history"]');
+  if (srcEl && histTab) {
+    const sRect = srcEl.getBoundingClientRect(), tRect = histTab.getBoundingClientRect();
+    const card = el('div', 'fly-card');
+    card.style.left = Math.max(12, sRect.left + sRect.width * 0.1) + 'px';
+    card.style.top = Math.max(12, sRect.top + 8) + 'px';
+    card.style.width = Math.min(250, Math.max(180, sRect.width * 0.65)) + 'px';
+    const row = el('div');
+    row.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:6px';
+    row.append(el('b', '', r.course || '未命名课程'), el('span', 'flag ok', '✓ 已提交'));
+    card.append(row, el('span', '', r.title || '未命名作业'));
+    document.body.append(card);
+    const dx = (tRect.left + tRect.width / 2) - (sRect.left + sRect.width * 0.35);
+    const dy = (tRect.top + tRect.height / 2) - (sRect.top + 24);
+    card.animate([
+      {transform: 'translate(0, 0) scale(1) rotate(0deg)', opacity: 1},
+      {transform: `translate(${dx * 0.45}px, ${Math.min(-34, dy * 0.35 - 28)}px) scale(.72) rotate(-4deg)`, opacity: .95, offset: .45},
+      {transform: `translate(${dx}px, ${dy}px) scale(.18) rotate(-8deg)`, opacity: 0},
+    ], {duration: 620, easing: 'cubic-bezier(.22, 1, .36, 1)', fill: 'forwards'});
+    setTimeout(() => {
+      card.remove();
+      const cnt = $('#count-history');
+      if (cnt) { cnt.classList.remove('bump'); void cnt.offsetWidth; cnt.classList.add('bump'); }
+    }, 620);
+  }
+}
 function onJobDone(job, key) {
   const failed = !!job.result?.error;
   if (job.action === 'login') return loginDone(job);
-  if (job.action === 'fill') return fillDone(job, key);
+  if (job.action === 'fill') {
+    if (!failed && key) markWatchingSubmission(key);
+    return fillDone(job, key);
+  }
   if (job.action === 'ai' || job.action === 'ai-test') return window.HomeworkAI?.jobDone(job);
-  if (job.action === 'open') return toast(job.message || (failed ? '打开失败' : '已打开'), failed ? 'error' : 'ok');
+  if (job.action === 'open') {
+    if (!failed && key) markWatchingSubmission(key);
+    return toast(job.message || (failed ? '打开失败' : '已打开'), failed ? 'error' : 'ok');
+  }
   if (job.action === 'refresh') {
+    const cKey = key ? canonicalKey(key) : null;
+    if (cKey && (S.subCheckKey === cKey || S.watchingSub.has(cKey))) {
+      S.subCheckKey = null;
+      const r = S.records.find(x => x.key === cKey);
+      if (!failed && r && (r.status === 'submitted' || r.group === 'history')) {
+        S.watchingSub.delete(cKey);
+        renderList();
+        playSubmittedArchiveAnim(r);
+        return toast('已检测到提交，已自动移入历史', 'ok');
+      } else if (!failed && r && S.watchingSub.has(cKey)) {
+        S.watchingSub.set(cKey, {state: 'unsubmitted', readyAt: Date.now(), blurred: false});
+        renderList();
+        if (S.key === cKey && drafts.has(cKey)) renderDetail(r, drafts.get(cKey), true);
+        return toast('暂未检测到提交，作业仍保留在待完成', 'warn');
+      }
+    }
     if (!key) setOutcome(failed ? 'error' : /部分/.test(job.message || '') ? 'warn' : 'ok');
     if (failed) {
       const msg = job.message || '刷新失败', named = /刷新失败/.test(msg);
@@ -1763,6 +2423,12 @@ function onJobDone(job, key) {
     if (key) return toast('题目已重新读取', 'ok');
     const n = S.records.filter(r => r.group === 'active').length, m = S.records.filter(r => r.group === 'review').length, d = S.diff || {added: 0, changed: 0};
     const partial = /部分/.test(job.message || '');
+    if (!partial && !d.added && !d.changed) {
+      S.outcome = {tone: 'ok', at: Date.now(), latest: true};
+      renderSyncBadge();
+      setTimeout(renderSyncBadge, 1800);
+      return;
+    }
     const detail = [`待完成 ${n} 项`, m && `待核实 ${m} 项`, d.added && `新增 ${d.added} 项`, d.changed && `${d.changed} 项有变动`].filter(Boolean).join('，');
     toast(job.message || '作业已更新', partial ? 'warn' : 'ok', {title: job.message || '作业已更新', detail});
   }
@@ -1778,13 +2444,12 @@ function openLogin() {
   loginPhase = S.job.busy && S.job.action === 'login' ? 'running' : 'form';
   loginError = '';
   renderLogin();
-  const d = $('#login-dialog');
-  if (!d.open) d.showModal();
+  openSheet($('#login-dialog'));
   $('#login-account')?.focus();
 }
 function titled(id, text) { const h = el('h2', 'sheet-title', text); h.id = id; return h; }
 function closeButton(dialog) {
-  const b = btn('', 'btn-quiet icon-only sheet-close', () => dialog.close(), 'x');
+  const b = btn('', 'btn-quiet icon-only sheet-close', () => closeSheet(dialog), 'x');
   b.setAttribute('aria-label', '关闭');
   return b;
 }
@@ -1798,30 +2463,83 @@ function siteList(sites, logged) {
   }
   return box;
 }
+function loginProgressState() {
+  const a = S.auth || {};
+  const raw = S.job.message && S.job.message !== '正在处理…' ? S.job.message : '正在连接学习通主站…';
+  let pct = 26;
+  if (a.sites?.chaoxing || /主站.*已|正在识别所属学校/.test(raw)) pct = 58;
+  if (a.school_name || /已识别学校|学校学习通/.test(raw)) pct = 82;
+  if (a.sites?.school) pct = 95;
+  const schoolName = a.school_name || (raw.match(/已识别学校[：:]\s*(\S+)/)?.[1]) || '';
+  return {raw, offset: Math.round(283 * (1 - pct / 100)), schoolName};
+}
+function setLoginRoll(text) {
+  const box = document.getElementById('login-roll');
+  if (!box) return;
+  const cur = box.lastElementChild;
+  if (cur && cur.textContent === text) return;
+  const next = el('span', 'down', text);
+  box.append(next);
+  void next.offsetWidth;
+  next.classList.remove('down');
+  if (cur) { cur.classList.add('up'); setTimeout(() => cur.remove(), 420); }
+}
+function buildLoginOrb(titleText = '正在登录作业通') {
+  const {raw, offset, schoolName} = loginProgressState();
+  const wrap = el('div', 'login-orb');
+  wrap.id = 'login-orb';
+  const title = titled('login-title', titleText);
+  title.classList.add('sr-only');
+  const halo = el('div', 'login-halo');
+  halo.id = 'login-halo';
+  const aura = el('div', 'aura');
+  const ringspin = el('div', 'login-ringspin');
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('viewBox', '0 0 100 100');
+  svg.setAttribute('class', 'login-ring');
+  svg.innerHTML = `<circle class="track" cx="50" cy="50" r="45"/><circle class="arc" id="login-arc" cx="50" cy="50" r="45" style="stroke-dashoffset:${offset}"/>`;
+  ringspin.append(svg);
+  const burst1 = el('span', 'burst'), burst2 = el('span', 'burst b2');
+  const emblem = el('div', 'login-emblem', '作');
+  emblem.id = 'login-emblem';
+  halo.append(aura, ringspin, burst1, burst2, emblem);
+  const roll = el('div', 'login-roll');
+  roll.id = 'login-roll';
+  roll.append(el('span', '', raw));
+  const school = el('div', 'login-school' + (schoolName ? ' show' : ''), schoolName ? '🏫 ' + schoolName : '');
+  school.id = 'login-school';
+  wrap.append(title, halo, roll, school);
+  return wrap;
+}
 function renderLogin() {
   const body = $('#login-body'), dialog = $('#login-dialog');
+  dialog.classList.remove('a4-to-circle');
   if (loginPhase === 'running' && !(S.job.busy && S.job.action === 'login')) return;
   const savedAccount = S.auth?.credentials?.username || '';
   const account = $('#login-account')?.value || savedAccount;
-  body.replaceChildren(closeButton(dialog));
-  body.append(el('div', 'sheet-eyebrow', '作业通'));
   const a = S.auth || {};
   if (loginPhase === 'running') {
-    body.append(titled('login-title', '正在登录作业通'));
-    body.append(el('p', 'sheet-text', '助手正在检查两个学习通站点，并只为尚未登录的站点补登录。这可能需要几十秒。'));
-    const steps = el('ol', 'steps');
-    for (const text of ['检查两个站点的登录状态', '为尚未登录的站点补登录', '确认两个站点均已登录']) {
-      const step = el('li', 'step now'), mark = el('span', 'step-mark');
-      mark.append(icon('loader'));
-      step.append(mark, el('span', '', text));
-      steps.append(step);
+    dialog.classList.add('login-running');
+    if (document.getElementById('login-orb')) {
+      const {raw, offset, schoolName} = loginProgressState();
+      const arc = document.getElementById('login-arc');
+      if (arc) arc.style.strokeDashoffset = String(offset);
+      setLoginRoll(raw);
+      const sc = document.getElementById('login-school');
+      if (sc && schoolName) { sc.textContent = '🏫 ' + schoolName; sc.classList.add('show'); }
+      return;
     }
-    body.append(steps);
-    const actions = el('div', 'sheet-actions');
-    actions.append(btn('在后台继续', '', () => dialog.close()));
+    body.replaceChildren(closeButton(dialog));
+    body.append(buildLoginOrb('正在登录作业通'));
+    const actions = el('div', 'sheet-actions login-bg-actions');
+    actions.append(btn('在后台继续', 'btn-ghost btn-sm', () => closeSheet(dialog)));
     body.append(actions);
     return;
   }
+  dialog.classList.remove('login-running');
+  $('#assignment-list')?.classList.remove('login-ghost');
+  body.replaceChildren(closeButton(dialog));
+  if (loginPhase === 'success' || loginPhase === 'failed') body.append(el('div', 'sheet-eyebrow', '作业通'));
   if (loginPhase === 'success') {
     const hero = el('div', 'result-hero'), ic = el('div', 'result-icon ok');
     ic.append(icon('check'));
@@ -1830,8 +2548,8 @@ function renderLogin() {
     hero.append(ic, t);
     body.append(hero, siteList(a.sites, true));
     const actions = el('div', 'sheet-actions');
-    actions.append(btn('完成', '', () => dialog.close()));
-    actions.append(Object.assign(btn('刷新作业', 'btn-primary', () => { dialog.close(); startAction('refresh'); }, 'refresh'), {disabled: S.job.busy || !S.online}));
+    actions.append(btn('完成', '', () => closeSheet(dialog)));
+    actions.append(Object.assign(btn('刷新作业', 'btn-primary', () => { closeSheet(dialog); startAction('refresh'); }, 'refresh'), {disabled: S.job.busy || !S.online}));
     body.append(actions);
     return;
   }
@@ -1845,18 +2563,20 @@ function renderLogin() {
     if (loginError) body.append(el('div', 'form-error', loginError));
     body.append(siteList(a.sites, false));
     const actions = el('div', 'sheet-actions');
-    actions.append(btn('关闭', '', () => dialog.close()), btn('重新输入', 'btn-primary', () => { loginPhase = 'form'; loginError = ''; renderLogin(); $('#login-account').value = account; $('#login-password').focus(); }));
+    actions.append(btn('关闭', '', () => closeSheet(dialog)), btn('重新输入', 'btn-primary', () => { loginPhase = 'form'; loginError = ''; renderLogin(); $('#login-account').value = account; $('#login-password').focus(); }));
     body.append(actions);
     return;
   }
-  body.append(titled('login-title', a.state === 'logged_in' ? '重新登录作业通' : '登录作业通'));
-  if (a.state === 'logged_in') body.append(notice('soft', 'info', '', ['重新登录将替换已保存的账号。']));
+  const pane = el('div', 'login-pane');
+  pane.append(el('div', 'sheet-eyebrow', '作业通'));
+  pane.append(titled('login-title', a.state === 'logged_in' ? '重新登录作业通' : '登录作业通'));
+  if (a.state === 'logged_in') pane.append(notice('soft', 'info', '', ['重新登录将替换已保存的账号。']));
   const form = el('form');
   form.autocomplete = 'on';
-  const f1 = el('label', 'form-field'), user = el('input', 'input');
+  const f1 = el('label', 'form-field' + (loginError ? ' shake' : '')), user = el('input', 'input');
   user.id = 'login-account'; user.name = 'username'; user.autocomplete = 'username'; user.required = true; user.value = account;
   f1.append(el('span', '', '账号'), user);
-  const f2 = el('label', 'form-field'), wrap = el('div', 'pw-wrap'), pw = el('input', 'input');
+  const f2 = el('label', 'form-field' + (loginError ? ' shake' : '')), wrap = el('div', 'pw-wrap'), pw = el('input', 'input');
   const savedPassword = !!a.credentials?.saved && account === savedAccount;
   pw.id = 'login-password'; pw.name = 'password'; pw.type = 'password'; pw.autocomplete = 'current-password';
   pw.required = !savedPassword;
@@ -1870,32 +2590,126 @@ function renderLogin() {
   const hint = el('div', 'form-hint');
   hint.append(icon('lock'), el('span', '', savedPassword ? '登录信息已加密保存在这台电脑上。' : '账号密码只加密保存在这台电脑上。'));
   form.append(hint);
-  const actions = el('div', 'sheet-actions'), submit = el('button', 'btn btn-primary', '登录作业通');
+  const actions = el('div', 'sheet-actions'), submit = el('button', 'btn btn-primary login-submit', '登录作业通');
   submit.type = 'submit';
   submit.disabled = S.job.busy || !S.online;
-  actions.append(btn('取消', '', () => dialog.close()), submit);
+  actions.append(btn('取消', '', () => closeSheet(dialog)), submit);
   form.append(actions);
   if (S.job.busy) form.append(el('p', 'sheet-text', '当前有其他操作在进行，完成后才能登录。'));
   else if (!S.online) form.append(el('p', 'sheet-text', '网络不可用，联网后才能登录。'));
-  form.onsubmit = async e => {
+  form.onsubmit = e => {
     e.preventDefault();
     const username = user.value.trim(), password = pw.value;
     const reuseSaved = !!a.credentials?.saved && username === savedAccount && !password;
     if (!username || (!password && !reuseSaved)) { loginError = '请输入账号和密码'; renderLogin(); $('#login-account').value = username; return; }
     pw.value = '';
     submit.disabled = true;
-    const ok = await startAction('login', null, {username, password, saved: reuseSaved});
-    if (ok) { loginPhase = 'running'; renderLogin(); }
-    else { submit.disabled = false; }
+    actions.classList.add('morphing');
+    submit.classList.add('morphb');
+    submit.replaceChildren(icon('loader'));
+    const req = startAction('login', null, {username, password, saved: reuseSaved});
+    setTimeout(() => pane.classList.add('out'), 160);
+    setTimeout(async () => {
+      const ok = await req;
+      if (ok) { if (loginPhase === 'form') { loginPhase = 'running'; renderLogin(); } }
+      else {
+        pane.classList.remove('out');
+        actions.classList.remove('morphing');
+        submit.classList.remove('morphb');
+        submit.textContent = '登录作业通';
+        submit.disabled = false;
+      }
+    }, 260);
   };
-  body.append(form);
+  pane.append(form);
+  body.append(pane);
+}
+function playLoginA4Ending() {
+  const dialog = $('#login-dialog'), body = $('#login-body');
+  if (!dialog.open) return;
+  const username = S.auth?.credentials?.username?.trim() || '';
+  const initial = userInitial(username);
+  const schoolName = S.auth?.school_name || '作业通';
+  S.acctRevealState = 'hiding';
+  $('#assignment-list')?.classList.add('login-ghost');
+  renderAccount();
+  if (!document.getElementById('login-orb')) {
+    body.replaceChildren(closeButton(dialog), buildLoginOrb('登录成功'));
+  }
+  body.querySelector('.login-bg-actions')?.remove();
+  const loginTitle = document.getElementById('login-title');
+  if (loginTitle) loginTitle.textContent = '登录成功';
+  const halo = document.getElementById('login-halo');
+  halo?.classList.add('ok');
+  const arc = document.getElementById('login-arc');
+  if (arc) { arc.style.strokeDashoffset = '0'; arc.style.stroke = 'var(--ok)'; }
+  setLoginRoll('登录成功');
+  const sc = document.getElementById('login-school');
+  if (sc && schoolName) { sc.textContent = '🏫 ' + schoolName; sc.classList.add('show'); }
+  const emblem = document.getElementById('login-emblem');
+  let flipEl = emblem;
+  if (emblem) {
+    const flip = el('div', 'emblem-3d'), front = el('div', 'face front'), back = el('div', 'face back', initial);
+    front.append(icon('check'));
+    flip.append(front, back);
+    emblem.replaceWith(flip);
+    flip.id = 'login-emblem';
+    flipEl = flip;
+  }
+  setTimeout(() => {
+    if (!dialog.open) { $('#assignment-list')?.classList.remove('login-ghost'); S.acctRevealState = ''; renderAccount(); return; }
+    flipEl?.classList.add('flip');
+  }, 420);
+  setTimeout(() => {
+    if (!dialog.open) { $('#assignment-list')?.classList.remove('login-ghost'); S.acctRevealState = ''; renderAccount(); return; }
+    const hRect = (halo || dialog).getBoundingClientRect();
+    const cx = hRect.left + hRect.width / 2 - 31, cy = hRect.top + hRect.height / 2 - 31;
+    dialog.classList.add('a4-to-circle');
+    setTimeout(() => {
+      if (dialog.open) dialog.close();
+      dialog.classList.remove('a4-to-circle');
+      const targetAva = document.querySelector('#account .avatar');
+      if (!targetAva) { $('#assignment-list')?.classList.remove('login-ghost'); S.acctRevealState = ''; renderAccount(); return; }
+      const tRect = targetAva.getBoundingClientRect();
+      const orb = el('div', 'fly-orb', initial);
+      orb.style.cssText = `left:${cx}px;top:${cy}px;width:62px;height:62px;font-size:26px`;
+      document.body.append(orb);
+      const tx = tRect.left + tRect.width / 2 - (cx + 31);
+      const ty = tRect.top + tRect.height / 2 - (cy + 31);
+      const endScale = tRect.width / 62;
+      orb.animate([
+        { transform: 'translate(0,0) scale(1) rotate(-18deg)' },
+        { transform: `translate(${tx * .52}px,${ty * .38 - 16}px) scale(.74) rotate(-6deg)`, offset: .5 },
+        { transform: `translate(${tx}px,${ty}px) scale(${endScale}) rotate(0deg)` }
+      ], { duration: 440, easing: 'cubic-bezier(.55,0,.25,1)', fill: 'forwards' }).finished.then(() => {
+        orb.remove();
+        if (!targetAva.isConnected) { $('#assignment-list')?.classList.remove('login-ghost'); S.acctRevealState = ''; renderAccount(); return; }
+        S.acctRevealState = 'landing';
+        renderAccount();
+        setTimeout(() => {
+          if (S.acctRevealState === 'landing') {
+            $('#assignment-list')?.classList.remove('login-ghost');
+            S.firstListAnimated = false;
+            renderList();
+          }
+        }, 240);
+        setTimeout(() => {
+          if (S.acctRevealState === 'landing') S.acctRevealState = '';
+        }, 1400);
+      });
+    }, 240);
+  }, 680);
 }
 function loginDone(job) {
   const ok = !job.result?.error && S.auth?.state === 'logged_in';
   loginPhase = ok ? 'success' : 'failed';
   loginError = ok ? '' : job.message || '登录失败，请重试';
-  if ($('#login-dialog').open) renderLogin();
-  else toast(ok ? '作业通已登录' : loginError, ok ? 'ok' : 'error');
+  if ($('#login-dialog').open) {
+    if (ok) playLoginA4Ending();
+    else renderLogin();
+  } else {
+    toast(ok ? '作业通已登录' : loginError, ok ? 'ok' : 'error');
+  }
 }
 
 /* ---------- Fill ---------- */
@@ -1944,50 +2758,74 @@ function reasonRow(label, kind, detail, files) {
   li.append(el('span', 'reason-q', label), main);
   return li;
 }
+let lastFillPhase = '';
 async function openFill(r) {
   try { await flush(r.key); } catch (e) { toast('答案尚未保存成功，暂不能填入：' + e.message, 'error'); return; }
   fillPhase = 'check';
+  lastFillPhase = '';
   fillResult = null;
   renderFill();
-  $('#fill-dialog').showModal();
+  openSheet($('#fill-dialog'));
 }
 function renderFill() {
   const r = record(), draft = drafts.get(S.key), dialog = $('#fill-dialog'), body = $('#fill-body');
   if (!r || !draft) { dialog.close(); return; }
-  body.replaceChildren(closeButton(dialog), el('div', 'sheet-eyebrow', '自动填入'));
+  const phaseChanged = lastFillPhase !== fillPhase;
+  lastFillPhase = fillPhase;
+  const stage = el('div', phaseChanged ? 'phase-enter' : '');
+  body.replaceChildren(closeButton(dialog), el('div', 'sheet-eyebrow', '自动填入'), stage);
   if (fillPhase === 'check') {
     const {ready, skipped} = analyze(r, draft);
-    body.append(titled('fill-title', '填入前检查'));
+    stage.append(titled('fill-title', '填入前检查'));
     const stats = el('div', 'stats');
-    stats.append(statCard(ready.length, '将填入', 'ok'), statCard(skipped.length, '将跳过', skipped.length ? 'warn' : ''), statCard(r.questions.length, '共计题目'));
-    body.append(stats);
+    const c1 = statCard(ready.length, '将填入', 'ok'), c2 = statCard(skipped.length, '将跳过', skipped.length ? 'warn' : ''), c3 = statCard(r.questions.length, '共计题目');
+    stats.append(c1, c2, c3);
+    stage.append(stats);
+    if (phaseChanged) {
+      if (ready.length) animateNumber(c1.querySelector('b'), ready.length, '', true);
+      if (skipped.length) animateNumber(c2.querySelector('b'), skipped.length, '', true);
+      if (r.questions.length) animateNumber(c3.querySelector('b'), r.questions.length, '', true);
+    }
     if (skipped.length) {
-      body.append(el('div', 'section-label', '以下题目不会自动填入'));
+      stage.append(el('div', 'section-label', '以下题目不会自动填入'));
       const ul = el('ul', 'reasons');
       ul.append(...reasonRows(skipped.map(x => ({i: x.index, kind: x.kind, reason: ''}))));
-      body.append(ul);
+      stage.append(ul);
     }
-    if (r.content_complete === false) body.append(notice('warn', 'alert', '', ['题目未读全，其余题目需在学习通完成。']));
-    if (fillBlocker(r)) body.append(notice('warn', 'info', '暂不能填入', [fillBlocker(r)]));
-    body.append(noSubmitNote());
+    if (r.content_complete === false) stage.append(notice('warn', 'alert', '', ['题目未读全，其余题目需在学习通完成。']));
+    if (fillBlocker(r)) stage.append(notice('warn', 'info', '暂不能填入', [fillBlocker(r)]));
+    stage.append(noSubmitNote());
     const actions = el('div', 'sheet-actions'), go = btn(ready.length ? `开始填入 ${ready.length} 题` : '没有可以自动填入的答案', 'btn-primary', async () => {
       go.disabled = true;
       if (await startAction('fill', r.key)) { fillPhase = 'running'; renderFill(); } else go.disabled = false;
     }, 'pen');
     go.disabled = !ready.length || S.job.busy || !!fillBlocker(r);
-    actions.append(btn('取消', '', () => dialog.close()), Object.assign(btn('仅打开作业网页', '', async () => { if (await startAction('open', r.key)) dialog.close(); }, 'external'), {disabled: S.job.busy || !S.online}), go);
-    body.append(actions);
+    actions.append(btn('取消', '', () => closeSheet(dialog)), Object.assign(btn('仅打开作业网页', '', async () => { if (await startAction('open', r.key)) closeSheet(dialog); }, 'external'), {disabled: S.job.busy || !S.online}), go);
+    stage.append(actions);
     return;
   }
   if (fillPhase === 'running') {
-    body.append(titled('fill-title', '正在自动填入'));
-    body.append(el('p', 'sheet-text', '填入期间请勿操作学习通窗口。'));
+    stage.append(titled('fill-title', '正在自动填入'));
+    stage.append(el('p', 'sheet-text', '填入期间请勿操作学习通窗口。'));
+    const msg = S.job.message || '正在处理…';
+    const stepIdx = /核|完|存|校验/.test(msg) ? 2 : /写|填|传|第/.test(msg) ? 1 : 0;
+    const steps = el('div', 'steps');
+    ['检查题目结构', '写入答案内容', '校对保存状态'].forEach((label, idx) => {
+      const s = el('div', 'step' + (idx < stepIdx ? ' done' : idx === stepIdx ? ' active' : ''));
+      const dot = el('span', 'step-dot');
+      if (idx < stepIdx) dot.append(icon('check')); else dot.textContent = String(idx + 1);
+      s.append(dot, el('span', '', label));
+      steps.append(s);
+    });
+    const prog = el('div', 'fill-prog'), bar = el('div', 'fill-prog-bar');
+    bar.style.width = stepIdx === 0 ? '28%' : stepIdx === 1 ? '66%' : '90%';
+    prog.append(bar);
     const live = el('div', 'live');
-    live.append(icon('loader'), document.createTextNode(' ' + (S.job.message || '正在处理…')));
-    body.append(live, noSubmitNote());
+    live.append(icon('loader'), document.createTextNode(' ' + msg));
+    stage.append(steps, prog, live, noSubmitNote());
     const actions = el('div', 'sheet-actions');
-    actions.append(btn('在后台等待', '', () => dialog.close()));
-    body.append(actions);
+    actions.append(btn('在后台等待', '', () => closeSheet(dialog)));
+    stage.append(actions);
     return;
   }
   const res = fillResult || {};
@@ -1999,8 +2837,8 @@ function renderFill() {
   const title = failed ? '自动填入失败' : notRun ? '未执行填入' : filled.length ? `已填入 ${filled.length} 题` : '没有题目被填入';
   t.append(titled('fill-title', title));
   hero.append(ic, t);
-  body.append(hero);
-  if (res.message) body.append(el('p', 'sheet-text', res.message));
+  stage.append(hero);
+  if (res.message) stage.append(el('p', 'sheet-text', res.message));
   if (!failed && !notRun) {
     const indexOf = id => r.questions.findIndex(q => String(q.id) === String(id));
     const reported = new Set([...filled.map(String), ...skipped.map(s => String(s.id))]);
@@ -2013,28 +2851,33 @@ function renderFill() {
     rows.sort((a, b) => (a.i < 0 ? 1e9 : a.i) - (b.i < 0 ? 1e9 : b.i));
     const uploads = rows.filter(x => x.kind === 'upload').length;
     const stats = el('div', 'stats');
-      stats.append(statCard(filled.length, '已填入', 'ok'), statCard(rows.length, '已跳过', rows.length ? 'warn' : ''), statCard(uploads, '需手动上传', uploads ? 'warn' : ''));
-    body.append(stats);
+    const s1 = statCard(filled.length, '已填入', 'ok'), s2 = statCard(rows.length, '已跳过', rows.length ? 'warn' : ''), s3 = statCard(uploads, '需手动上传', uploads ? 'warn' : '');
+    stats.append(s1, s2, s3);
+    stage.append(stats);
+    if (phaseChanged) {
+      if (filled.length) animateNumber(s1.querySelector('b'), filled.length, '', true);
+      if (rows.length) animateNumber(s2.querySelector('b'), rows.length, '', true);
+      if (uploads) animateNumber(s3.querySelector('b'), uploads, '', true);
+    }
     if (rows.length) {
-      body.append(el('div', 'section-label', '跳过的题目与原因'));
+      stage.append(el('div', 'section-label', '跳过的题目与原因'));
       const ul = el('ul', 'reasons');
       ul.append(...reasonRows(rows));
-      body.append(ul);
+      stage.append(ul);
     }
   }
-  body.append(noSubmitNote());
+  stage.append(noSubmitNote());
   const actions = el('div', 'sheet-actions');
   if (failed || notRun) actions.append(Object.assign(btn('重新检查', '', () => { fillPhase = 'check'; renderFill(); }), {disabled: S.job.busy}));
-  actions.append(btn('知道了', 'btn-dark', () => dialog.close()));
-  body.append(actions);
+  actions.append(btn('知道了', 'btn-dark', () => closeSheet(dialog)));
+  stage.append(actions);
 }
 function fillDone(job, key) {
   fillPhase = 'result';
   fillResult = {...(job.result || {}), message: job.message || job.result?.message};
   if (key && key !== S.key) { toast(job.message || '自动填入已结束', job.result?.error ? 'error' : 'ok'); return; }
   renderFill();
-  const d = $('#fill-dialog');
-  if (!d.open) d.showModal();
+  openSheet($('#fill-dialog'));
 }
 
 /* ---------- Reminder & exit ---------- */
@@ -2114,7 +2957,9 @@ function renderReminderEditor(draft) {
   const wheels = el('div', 'tw'), columns = {}, presets = el('div', 'rem-chips');
   const error = el('p', 'rem-error', S.reminderError || ''); error.setAttribute('role', 'alert');
   const update = () => {
-    preview.textContent = reminderDraftTime(draft);
+    const nextVal = reminderDraftTime(draft);
+    if (preview.textContent && preview.textContent !== nextVal) restartAnim(preview, 'bump');
+    preview.textContent = nextVal;
     presets.querySelectorAll('button').forEach(chip => chip.setAttribute('aria-pressed', String(chip.dataset.time === preview.textContent)));
   };
   const editable = () => S.reminderEditing === draft && !S.reminderSaving && S.reminder?.enabled;
@@ -2137,7 +2982,10 @@ function renderReminderEditor(draft) {
     const paint = () => {
       column.setAttribute('aria-valuenow', String(draft[field]));
       column.setAttribute('aria-valuetext', `${String(draft[field]).padStart(2, '0')} ${label}`);
-      options.forEach((option, value) => option.classList.toggle('selected', value === draft[field]));
+      options.forEach((option, value) => {
+        option.classList.toggle('selected', value === draft[field]);
+        option.classList.toggle('near', Math.abs(value - draft[field]) === 1);
+      });
     };
     const choose = (value, align = true) => {
       if (!editable() || disposed) return;
@@ -2284,7 +3132,7 @@ function renderReminder() {
   if (!r) { body.append(el('p', 'sheet-text', '正在读取…')); return; }
 
   const slots = reminderSlots(r), next = slots[0], todayCount = slots.filter(slot => slot.day === '今天').length;
-  const card = el('div', 'rem-status' + (r.enabled ? '' : ' off')), mark = el('span', 'rem-bell'), text = el('div', 'rem-status-text');
+  const card = el('div', 'rem-status' + (r.enabled ? '' : ' off')), mark = el('span', 'rem-bell' + (r.enabled && Date.now() < S.bellRingUntil ? ' ringing' : '')), text = el('div', 'rem-status-text');
   mark.append(icon('bell'));
   if (!r.enabled) {
     text.append(el('small', '', '提醒已关闭'), el('strong', '', '不会再弹出提醒'), el('span', '', '时间已保留，开启后恢复'));
@@ -2301,13 +3149,28 @@ function renderReminder() {
   sw.setAttribute('aria-label', '作业提醒');
   sw.disabled = !!S.reminderSaving;
   sw.onclick = async () => {
+    const turningOn = !S.reminder.enabled;
+    if (turningOn) S.bellRingUntil = Date.now() + 700;
     S.reminderEditing = null;
-    await saveReminder({enabled: !S.reminder.enabled, times: S.reminder.times});
+    await saveReminder({enabled: turningOn, times: S.reminder.times});
     if (dialog.open) $('#reminder-body .switch')?.focus({preventScroll: true});
   };
   card.append(mark, text, sw);
   body.append(card);
 
+  const editKey = S.reminderEditing && r.enabled ? (S.reminderEditing.originalValue ?? '__new__') : null;
+  if (!editKey) S.remOpenedKey = null;
+  const buildRemSlot = draft => {
+    const slot = el('div', 'rem-slot'), inner = el('div');
+    inner.append(renderReminderEditor(draft));
+    slot.append(inner);
+    if (S.remOpenedKey === editKey || REDUCED_MOTION()) slot.classList.add('open');
+    else {
+      S.remOpenedKey = editKey;
+      requestAnimationFrame(() => { if (slot.isConnected) slot.classList.add('open'); });
+    }
+    return slot;
+  };
   const wrap = el('div', 'rem-body' + (r.enabled ? '' : ' off'));
   const schedule = el('section', 'rem-section'), count = el('div', 'rem-head');
   count.append(el('strong', '', '提醒时间'), el('span', 'rem-count', `${(r.times || []).length} / ${r.max_times || 12}`));
@@ -2332,14 +3195,14 @@ function renderReminder() {
     remove.setAttribute('aria-label', `删除 ${value}`);
     remove.disabled = !r.enabled || !!S.reminderSaving;
     item.append(trigger, meta, remove); entry.append(item);
-    if (editing && r.enabled) entry.append(renderReminderEditor(S.reminderEditing));
+    if (editing && r.enabled) entry.append(buildRemSlot(S.reminderEditing));
     list.append(entry);
   });
   if (!(r.times || []).length) list.append(el('p', 'reminder-empty', '还没有提醒时间，点下方「添加时间」设置第一个。'));
   schedule.append(list);
 
   if (S.reminderEditing?.originalValue === null && r.enabled) {
-    schedule.append(renderReminderEditor(S.reminderEditing));
+    schedule.append(buildRemSlot(S.reminderEditing));
   } else {
     const add = btn('添加时间', 'btn-sm rem-add-btn', () => openReminderEditor(), 'plus');
     add.id = 'reminder-add';
@@ -2389,15 +3252,29 @@ async function load({diff = false} = {}) {
   const data = await api('/api/state');
   // After a refresh, remember which records are new or changed so the list can show it.
   const before = diff && S.loaded ? new Map(S.records.map(r => [r.key, recordSig(r)])) : null;
+  const beforeDeadlines = diff && S.loaded ? new Map(S.records.map(r => [r.key, r.deadline || ''])) : null;
+  const flipRects = diff && S.loaded ? new Map([...document.querySelectorAll('#assignment-list .item[data-key]')].map(n => [n.dataset.key, n.getBoundingClientRect().top])) : null;
+  const nextKeys = new Set((data.assignments || []).map(r => r.key));
+  const removedKeys = before ? [...before.keys()].filter(k => !nextKeys.has(k)) : [];
   S.records = data.assignments || [];
   if (before) {
     const now = Date.now();
     S.fresh = new Map();
+    S.addedKeys = new Map();
+    S.deadlineChangedKeys = new Map();
     S.diff = {added: 0, changed: 0};
     for (const r of S.records) {
       const was = before.get(r.key);
       if (was === recordSig(r)) continue;
-      S.diff[was === undefined ? 'added' : 'changed']++;
+      if (was === undefined) {
+        S.diff.added++;
+        S.addedKeys.set(r.key, now);
+      } else {
+        S.diff.changed++;
+        if (beforeDeadlines && beforeDeadlines.get(r.key) !== (r.deadline || '')) {
+          S.deadlineChangedKeys.set(r.key, now);
+        }
+      }
       S.fresh.set(r.key, now);
     }
   }
@@ -2412,7 +3289,18 @@ async function load({diff = false} = {}) {
   const prev = S.key;
   S.key = S.key ? canonicalKey(S.key) : null;
   for (const k of [...drafts.keys()]) if (!dirty.has(k) && !saving.has(k) && !(k === S.key && k === prev)) drafts.delete(k);
+  if (removedKeys.length) animateRemovedItems(removedKeys);
   renderList();
+  if (flipRects && flipRects.size) {
+    for (const node of document.querySelectorAll('#assignment-list .item[data-key]')) {
+      const oldTop = flipRects.get(node.dataset.key);
+      if (oldTop === undefined) continue;
+      const dy = oldTop - node.getBoundingClientRect().top;
+      if (Math.abs(dy) > 4 && Math.abs(dy) < 360) {
+        node.animate([{transform: `translateY(${dy}px)`}, {transform: 'translateY(0)'}], {duration: 480, easing: 'cubic-bezier(.22, 1.28, .5, 1)'});
+      }
+    }
+  }
   renderStatus(true);
   if (S.key) {
     const r = record();
@@ -2432,6 +3320,9 @@ async function load({diff = false} = {}) {
   }
   return data;
 }
+let pollTimer = null;
+function schedulePoll(ms) { clearTimeout(pollTimer); pollTimer = setTimeout(poll, ms); }
+
 async function poll() {
   if (S.exited) return;
   try {
@@ -2451,7 +3342,7 @@ async function poll() {
     S.serverLost = true;
   }
   renderStatus();
-  setTimeout(poll, S.job.busy ? 1000 : 2000);
+  schedulePoll(S.job.busy ? (S.job.action === 'login' ? 250 : 500) : 2000);
 }
 async function boot() {
   S.loadError = null;
@@ -2471,41 +3362,122 @@ async function boot() {
 /* ---------- Wiring ---------- */
 document.querySelectorAll('[data-icon]').forEach(n => n.replaceWith(icon(n.dataset.icon)));
 $('#image-close').append(icon('x'));
-document.querySelectorAll('.tab').forEach(t => t.onclick = () => { S.group = t.dataset.group; S.sub = 'all'; S.progressFilter = S.dueFilter = 'all'; renderList(); });
+document.querySelectorAll('.tab').forEach(t => t.onclick = () => {
+  const next = t.dataset.group;
+  if (next !== S.group) snapshotListOut((GROUP_IDX[next] ?? 0) > (GROUP_IDX[S.group] ?? 0) ? 1 : -1);
+  switchGroup(next); S.sub = 'all'; S.progressFilter = S.dueFilter = 'all'; renderList();
+});
 $('#home').onclick = goHome;
 $('#home-top').onclick = goHome;
-$('#progress-filter').onchange = e => { S.progressFilter = e.target.value; renderList(); };
-$('#due-filter').onchange = e => { S.dueFilter = e.target.value; renderList(); };
-$('#search').oninput = renderList;
-$('#search').onkeydown = e => { if (e.key === 'Escape') { e.target.value = ''; renderList(); } };
+$('#progress-filter').onchange = e => { S.progressFilter = e.target.value; S.filterEnter = true; renderList(); };
+$('#due-filter').onchange = e => { S.dueFilter = e.target.value; S.filterEnter = true; renderList(); };
+$('#search').oninput = () => { S.filterEnter = true; renderList(); };
+$('#search').onkeydown = e => { if (e.key === 'Escape' && e.target.value) { e.target.value = ''; S.filterEnter = true; renderList(); } };
 $('#refresh').onclick = () => startAction('refresh');
 $('#back').onclick = () => setView('list');
 $('#account-login-button').onclick = () => { closeAccountMenu(); openLogin(); };
 $('#reminder-button').onclick = () => {
   closeAccountMenu();
-  S.reminderEditing = null; S.reminderError = '';
-  renderReminder(); $('#reminder-dialog').showModal();
+  S.reminderEditing = null; S.reminderError = ''; S.remOpenedKey = null;
+  renderReminder(); openSheet($('#reminder-dialog'));
 };
 $('#reminder-dialog').addEventListener('cancel', e => {
-  if (S.reminderEditing) { e.preventDefault(); cancelReminderEditor(); }
+  if (S.reminderEditing) { e.preventDefault(); cancelReminderEditor(); return; }
+  e.preventDefault();
+  closeSheet($('#reminder-dialog'));
 });
 $('#reminder-dialog').addEventListener('close', () => {
-  S.reminderEditing = null; S.reminderError = ''; clearReminderWheel();
+  S.reminderEditing = null; S.reminderError = ''; S.remOpenedKey = null; clearReminderWheel();
 });
-$('#account-exit-button').onclick = () => { closeAccountMenu(); $('#exit-dialog').showModal(); };
-$('#exit-cancel').onclick = () => $('#exit-dialog').close();
+$('#account-exit-button').onclick = () => { closeAccountMenu(); openSheet($('#exit-dialog')); };
+$('#exit-cancel').onclick = () => closeSheet($('#exit-dialog'));
 $('#exit-confirm').onclick = exitApp;
-$('#image-close').onclick = () => $('#image-dialog').close();
-$('.viewer-stage').onclick = e => { if (e.target.tagName === 'IMG') e.currentTarget.classList.toggle('actual'); else $('#image-dialog').close(); };
+function openImageViewer(img) {
+  const dlg = $('#image-dialog'), large = $('#image-large'), stage = $('.viewer-stage');
+  const srcRect = img.getBoundingClientRect();
+  S.lastImage = { el: img, rect: srcRect };
+  large.src = img.src;
+  stage.classList.remove('actual');
+  dlg.classList.remove('v-closing', 'v-open');
+  if (!dlg.open) dlg.showModal();
+  requestAnimationFrame(() => {
+    dlg.classList.add('v-open');
+    if (REDUCED_MOTION() || !srcRect.width || !srcRect.height) return;
+    const play = () => {
+      const dstRect = large.getBoundingClientRect();
+      if (!dstRect.width || !dstRect.height) return;
+      const dx = (srcRect.left + srcRect.width / 2) - (dstRect.left + dstRect.width / 2);
+      const dy = (srcRect.top + srcRect.height / 2) - (dstRect.top + dstRect.height / 2);
+      const sx = Math.max(0.08, srcRect.width / dstRect.width);
+      const sy = Math.max(0.08, srcRect.height / dstRect.height);
+      large.animate([
+        { transform: `translate(${dx}px, ${dy}px) scale(${sx}, ${sy})`, borderRadius: '8px' },
+        { transform: 'none', borderRadius: '10px' }
+      ], { duration: 400, easing: 'cubic-bezier(.22, 1.18, .36, 1)' });
+    };
+    if (large.complete && large.naturalWidth) play();
+    else requestAnimationFrame(play);
+  });
+}
+function closeImageViewer() {
+  const dlg = $('#image-dialog'), large = $('#image-large');
+  if (!dlg || !dlg.open) return;
+  const curRect = large.getBoundingClientRect();
+  const srcEl = S.lastImage?.el;
+  const targetRect = srcEl?.isConnected ? srcEl.getBoundingClientRect() : null;
+  if (!REDUCED_MOTION() && curRect.width > 0 && curRect.height > 0 && large.src) {
+    const scrim = document.createElement('div');
+    Object.assign(scrim.style, {
+      position: 'fixed', inset: '0', zIndex: '55', pointerEvents: 'none',
+      background: 'rgba(20, 19, 18, .72)'
+    });
+    scrim.setAttribute('aria-hidden', 'true');
+    document.body.append(scrim);
+    scrim.animate([{ opacity: 1 }, { opacity: 0 }], { duration: 220, easing: 'ease-out', fill: 'forwards' })
+      .finished.then(() => scrim.remove(), () => scrim.remove());
+
+    const fly = document.createElement('img');
+    fly.src = large.src;
+    fly.alt = '';
+    fly.setAttribute('aria-hidden', 'true');
+    Object.assign(fly.style, {
+      position: 'fixed', left: curRect.left + 'px', top: curRect.top + 'px',
+      width: curRect.width + 'px', height: curRect.height + 'px',
+      zIndex: '56', pointerEvents: 'none', objectFit: 'contain', borderRadius: '10px', margin: '0'
+    });
+    document.body.append(fly);
+    let toTransform = 'scale(.9)', toOpacity = 0.05;
+    if (targetRect && targetRect.width > 0 && targetRect.height > 0) {
+      const dx = (targetRect.left + targetRect.width / 2) - (curRect.left + curRect.width / 2);
+      const dy = (targetRect.top + targetRect.height / 2) - (curRect.top + curRect.height / 2);
+      const sx = Math.max(0.08, targetRect.width / curRect.width);
+      const sy = Math.max(0.08, targetRect.height / curRect.height);
+      toTransform = `translate(${dx}px, ${dy}px) scale(${sx}, ${sy})`;
+      toOpacity = 0.25;
+    }
+    fly.animate([
+      { transform: 'none', opacity: 1 },
+      { transform: toTransform, opacity: toOpacity }
+    ], { duration: 230, easing: 'cubic-bezier(.4, 0, .2, 1)', fill: 'forwards' })
+      .finished.then(() => fly.remove(), () => fly.remove());
+  }
+  dlg.classList.remove('v-open', 'v-closing');
+  dlg.close();
+}
+$('#image-close').onclick = closeImageViewer;
+$('#image-dialog').addEventListener('cancel', e => { e.preventDefault(); closeImageViewer(); });
+$('.viewer-stage').onclick = e => { if (e.target.tagName === 'IMG') e.currentTarget.classList.toggle('actual'); else closeImageViewer(); };
+document.querySelectorAll('dialog.sheet').forEach(dlg => {
+  dlg.addEventListener('click', e => { if (e.target === dlg) closeSheet(dlg); });
+  if (dlg.id !== 'reminder-dialog') dlg.addEventListener('cancel', e => { e.preventDefault(); closeSheet(dlg); });
+});
 $('#detail').addEventListener('click', e => {
   const act = e.target.closest('[data-act]');
   if (act && S.key) { startAction(act.dataset.act === 'open' ? 'open' : 'refresh', S.key); return; }
   const img = e.target.closest('.rich img');
   if (img && !img.closest('a')) {
     e.preventDefault();
-    $('#image-large').src = img.src;
-    $('.viewer-stage').classList.remove('actual');
-    $('#image-dialog').showModal();
+    openImageViewer(img);
   }
 });
 $('#detail').addEventListener('scroll', () => document.querySelector('.qnav')?.classList.toggle('stuck', $('#detail').scrollTop > 180), {passive: true});
@@ -2534,7 +3506,31 @@ window.addEventListener('pagehide', () => {
     } catch {}
   }
 });
-document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') flushAll().catch(() => {}); });
+function onWindowAway() {
+  for (const w of S.watchingSub.values()) w.blurred = true;
+}
+function onWindowReturn() {
+  if (S.exited || S.job.busy || !S.online || !S.watchingSub.size) return;
+  const now = Date.now();
+  const candidates = [S.key, ...S.watchingSub.keys()].filter(Boolean);
+  for (const k of candidates) {
+    const w = S.watchingSub.get(k);
+    const r = S.records.find(x => x.key === k);
+    if (!w || !r || r.group === 'history') { S.watchingSub.delete(k); continue; }
+    if (w.blurred && now - w.readyAt >= 2500) {
+      w.blurred = false;
+      w.readyAt = now;
+      triggerSubmissionCheck(k);
+      break;
+    }
+  }
+}
+window.addEventListener('blur', onWindowAway);
+window.addEventListener('focus', onWindowReturn);
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') { onWindowAway(); flushAll().catch(() => {}); }
+  else if (document.visibilityState === 'visible') onWindowReturn();
+});
 setInterval(tickElapsed, 1000);
 setInterval(() => {
   if (!S.exited && !S.job.busy) {

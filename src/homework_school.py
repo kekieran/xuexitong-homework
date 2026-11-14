@@ -8,6 +8,7 @@ import homework_runtime as runtime
 from homework_shared import collapse_whitespace, read_json_file, write_json_file
 
 CHAOXING_BASE_URL = 'https://i.chaoxing.com/base'
+_DEFAULT_CHAOXING_BASE_URL = CHAOXING_BASE_URL
 NOTICE_API_URL = 'https://notice.chaoxing.com/pc/notice/getNoticeList'
 
 FALLBACK_ORIGIN = 'https://mooc.istudy.szpu.edu.cn'
@@ -545,8 +546,13 @@ def discover_school(context, state=None, username=None):
         except Exception:
             pass
 
+    if not candidate_origin and fid in KNOWN_SCHOOL_SITES:
+        known = KNOWN_SCHOOL_SITES[fid]
+        candidate_origin = known['school_origin']
+        school_name = school_name or known.get('school_name', '')
+
     req = getattr(context, 'request', None)
-    if req and hasattr(req, 'get'):
+    if req and hasattr(req, 'get') and not (candidate_origin and fid and school_name and CHAOXING_BASE_URL == _DEFAULT_CHAOXING_BASE_URL):
         try:
             sep = '&' if '?' in CHAOXING_BASE_URL else '?'
             resp = req.get(f'{CHAOXING_BASE_URL}{sep}t={int(time.time() * 1000)}', timeout=12000)
@@ -583,6 +589,11 @@ def discover_school(context, state=None, username=None):
             if candidate_origin:
                 break
 
+    if not candidate_origin and fid in KNOWN_SCHOOL_SITES:
+        known = KNOWN_SCHOOL_SITES[fid]
+        candidate_origin = known['school_origin']
+        school_name = school_name or known.get('school_name', '')
+
     if not candidate_origin and req and hasattr(req, 'post') and fetched_base:
         try:
             resp = req.post(
@@ -609,14 +620,10 @@ def discover_school(context, state=None, username=None):
         except Exception:
             pass
 
-    if not candidate_origin and fid in KNOWN_SCHOOL_SITES:
-        known = KNOWN_SCHOOL_SITES[fid]
-        candidate_origin = known['school_origin']
-        school_name = school_name or known.get('school_name', '')
-
     if not fetched_base and not candidate_origin and not fid and cfg.get('mode') == 'unknown':
         return cfg
 
+    prev_fid = cfg.get('fid', '')
     cfg['uid'] = uid
     cfg['fid'] = fid
     cfg['school_name'] = school_name
@@ -624,7 +631,17 @@ def discover_school(context, state=None, username=None):
 
     if candidate_origin:
         known = KNOWN_SCHOOL_SITES.get(fid, {})
-        a_origin, login_url = _probe_school_login_entry(context, candidate_origin, fid=fid)
+        if (cfg.get('mode') == 'school_site' and cfg.get('school_origin') == candidate_origin
+                and cfg.get('auth_origin') and cfg.get('login_url') and (not fid or prev_fid == fid)):
+            a_origin = cfg['auth_origin']
+            login_url = cfg['login_url']
+            if fid and 'fid=0' in login_url:
+                login_url = re.sub(r'([?&])fid=0\b', rf'\g<1>fid={fid}', login_url, count=1)
+        elif known.get('school_origin') == candidate_origin and known.get('auth_origin'):
+            a_origin = known['auth_origin']
+            login_url = f'{a_origin}/login?fid={fid or FALLBACK_FID}&refer={quote(candidate_origin + "/visit/interaction", safe="")}'
+        else:
+            a_origin, login_url = _probe_school_login_entry(context, candidate_origin, fid=fid)
         if not a_origin and known.get('school_origin') == candidate_origin:
             a_origin = known.get('auth_origin', '')
             if a_origin and not login_url:

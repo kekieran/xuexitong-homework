@@ -1,11 +1,42 @@
 'use strict';
 /* AI UI uses the existing controls; requests and keys stay in the local backend. */
 window.HomeworkAI = (() => {
-  let config = null, selected = null, newProvider = 'openai', settingsNotice = null;
+  let config = null, selected = null, prevSelected = null, lastProvRect = null, newProvider = 'openai', settingsNotice = null;
   const deleteTimers = new Map();
   const settling = new Set();
   const settingsDialog = $('#ai-settings-dialog');
 
+  function setConfigStatus(node, text, tone = '') {
+    if (!node) return;
+    node.className = 'ai-config-status' + (tone ? ' ' + tone : '');
+    if (!text) { node.replaceChildren(); return; }
+    node.replaceChildren(el('span', 'st-dot'), document.createTextNode(text));
+  }
+  function syncProvPill(providers, animate) {
+    const active = providers?.querySelector('.ai-provider[aria-selected="true"]');
+    const pill = providers?.querySelector('.prov-pill');
+    if (!providers || !active || !pill) return;
+    const target = {left: active.offsetLeft, top: active.offsetTop, width: active.offsetWidth, height: active.offsetHeight};
+    const setRect = r => {
+      providers.style.setProperty('--px', r.left + 'px');
+      providers.style.setProperty('--py', r.top + 'px');
+      providers.style.setProperty('--pw', r.width + 'px');
+      providers.style.setProperty('--ph', r.height + 'px');
+    };
+    if (animate && lastProvRect && lastProvRect.card === selected) {
+      providers.classList.add('pill-instant');
+      setRect(lastProvRect);
+      void providers.offsetWidth;
+      providers.classList.remove('pill-instant');
+    } else {
+      providers.classList.add('pill-instant');
+      setRect(target);
+      void providers.offsetWidth;
+      providers.classList.remove('pill-instant');
+    }
+    setRect(target);
+    lastProvRect = {...target, card: selected};
+  }
   function updateLabel() {
     const current = config?.profiles?.[config.active];
     $('#ai-model-label').textContent = current?.ready ? `${current.name} · ${current.model}` : '未配置';
@@ -14,20 +45,29 @@ window.HomeworkAI = (() => {
     try {
       config = await api('/api/ai/settings');
       selected = null;
+      prevSelected = null;
+      lastProvRect = null;
       settingsNotice = null;
       renderSettings();
-      if (!settingsDialog.open) settingsDialog.showModal();
+      if (typeof openSheet === 'function') openSheet(settingsDialog);
+      else if (!settingsDialog.open) settingsDialog.showModal();
     } catch (e) { toast(e.message, 'error'); }
   }
   function renderSettings() {
-    const body = $('#ai-settings-body'), editingNew = selected === '__new__', saved = !editingNew && selected ? config.profiles[selected] : null;
+    const body = $('#ai-settings-body'), editingNew = selected === '__new__';
+    const openingId = selected !== prevSelected ? selected : null;
+    const closingId = prevSelected && prevSelected !== '__new__' && prevSelected !== selected ? prevSelected : null;
+    const prevEditorClone = closingId
+      ? body.querySelector(`.ai-profile-card[data-profile="${CSS.escape(closingId)}"] .ai-inline-editor`)?.cloneNode(true)
+      : null;
+    prevSelected = selected;
     body.replaceChildren(closeButton(settingsDialog), el('div', 'sheet-eyebrow', 'AI'));
     const title = el('h2', 'sheet-title', 'AI 设置'); title.id = 'ai-settings-title';
     body.append(title, el('p', 'ai-settings-subtitle', '保存常用模型，随时切换。'));
     const library = el('section', 'ai-config-list-page'); library.setAttribute('aria-label', '已保存的 AI 配置');
     const libraryHead = el('div', 'ai-library-head');
     libraryHead.append(el('h3', '', `我的配置 · ${Object.keys(config.profiles).length}`));
-    const add = btn('添加配置', 'btn-sm', () => { selected = '__new__'; newProvider = 'openai'; settingsNotice = null; renderSettings(); }, 'plus');
+    const add = btn('添加配置', 'btn-sm', () => { selected = '__new__'; newProvider = 'openai'; lastProvRect = null; settingsNotice = null; renderSettings(); }, 'plus');
     add.id = 'ai-add-profile'; add.disabled = S.job.busy;
     libraryHead.append(add); library.append(libraryHead);
     const list = el('div', 'ai-config-list');
@@ -35,10 +75,32 @@ window.HomeworkAI = (() => {
     for (const [id, item] of Object.entries(config.profiles)) list.append(profileCard(id, item));
     if (!list.children.length) list.append(el('div', 'ai-library-empty', '还没有配置\n添加一个常用模型开始使用'));
     library.append(list); body.append(library);
+    const providersBar = body.querySelector('.ai-providers');
+    if (providersBar) syncProvPill(providersBar, true);
+    if (openingId) {
+      const openingSlot = body.querySelector(`[data-profile="${CSS.escape(openingId)}"] > .ai-slot`);
+      if (openingSlot) { void openingSlot.offsetHeight; openingSlot.classList.add('open'); }
+    }
+    if (closingId && prevEditorClone) {
+      const hostCard = body.querySelector(`.ai-profile-card[data-profile="${CSS.escape(closingId)}"]`);
+      if (hostCard) {
+        if (typeof scrubGhost === 'function') scrubGhost(prevEditorClone);
+        prevEditorClone.classList.remove('ai-inline-editor', 'ai-config-editor');
+        prevEditorClone.querySelectorAll('.ai-inline-editor, .ai-config-editor').forEach(n => n.classList.remove('ai-inline-editor', 'ai-config-editor'));
+        const slot = el('div', 'ai-slot open ai-closing-slot'), inner = el('div');
+        slot.setAttribute('aria-hidden', 'true');
+        inner.append(prevEditorClone);
+        slot.append(inner);
+        hostCard.append(slot);
+        void slot.offsetHeight;
+        slot.classList.remove('open');
+        setTimeout(() => { if (slot.isConnected) slot.remove(); }, 340);
+      }
+    }
     function profileCard(id, item) {
       const expanded = id === selected, card = el('article', (item ? 'ai-profile-card' : 'ai-config-editor') + (expanded ? ' expanded' : '') + (item && id === config.active ? ' active' : ''));
       card.dataset.profile = id;
-      const head = el('div', 'ai-card-head'), toggle = btn('', 'ai-card-toggle', () => { selected = selected === id ? null : id; settingsNotice = null; renderSettings(); });
+      const head = el('div', 'ai-card-head'), toggle = btn('', 'ai-card-toggle', () => { selected = selected === id ? null : id; lastProvRect = null; settingsNotice = null; renderSettings(); });
       toggle.disabled = S.job.busy;
       toggle.dataset.initial = item ? (config.presets[item.provider]?.name || '自定义').slice(0, 1) : '+';
       const main = el('div', 'ai-card-main');
@@ -76,14 +138,20 @@ window.HomeworkAI = (() => {
         actions.append(btn('取消', 'btn-sm', () => { selected = null; renderSettings(); }));
       }
       head.append(actions); card.append(head);
-      if (expanded) card.append(profileEditor(id, item));
+      if (expanded) {
+        const slot = el('div', 'ai-slot' + (openingId === id ? '' : ' open')), inner = el('div');
+        inner.append(profileEditor(id, item));
+        slot.append(inner);
+        card.append(slot);
+      }
       return card;
     }
     function profileEditor(id, saved) {
       const provider = saved?.provider || newProvider;
       const current = {...(saved || {...config.presets[provider], model: '', has_key: false, name: ''})};
       const editor = el('div', 'ai-inline-editor'); editor.id = 'ai-profile-editor';
-      const providers = el('div', 'ai-providers'); providers.setAttribute('role', 'tablist'); providers.setAttribute('aria-label', 'AI 平台');
+      const providers = el('div', 'ai-providers has-pill'); providers.setAttribute('role', 'tablist'); providers.setAttribute('aria-label', 'AI 平台');
+      providers.append(el('span', 'prov-pill'));
       for (const [providerId, item] of Object.entries(config.presets)) {
         const tab = btn(item.name, 'ai-provider', () => { newProvider = providerId; renderSettings(); });
         tab.setAttribute('role', 'tab'); tab.setAttribute('aria-selected', String(providerId === provider)); tab.disabled = !!saved || S.job.busy; providers.append(tab);
@@ -101,23 +169,37 @@ window.HomeworkAI = (() => {
       const vision = el('input'); vision.type = 'checkbox'; vision.checked = provider !== 'custom' || !!current.vision;
       if (provider === 'custom') { const visionRow = el('label', 'ai-checkbox'); visionRow.append(vision, el('span', '', '模型支持识图')); form.append(visionRow); }
       const note = el('div', 'ai-note'); note.append(icon('info'), el('span', '', '密钥只保存在本机，测试连接会调用你填写的接口。')); form.append(note);
-      const status = el('p', 'ai-config-status' + (settingsNotice?.tone ? ' ' + settingsNotice.tone : '')); status.id = 'ai-config-message'; status.setAttribute('role', 'status'); if (settingsNotice) status.textContent = settingsNotice.text; form.append(status);
-      const actions = el('div', 'ai-form-actions'), test = btn('测试连接', '', async () => { if (!form.reportValidity() || !(await persist())) return; settingsNotice = {text: '正在测试连接…', tone: ''}; renderSettings(); if (await startAction('ai-test')) {} }), save = btn('保存并使用', 'btn-primary'); save.type = 'submit';
+      const status = el('p', 'ai-config-status'); status.id = 'ai-config-message'; status.setAttribute('role', 'status');
+      if (settingsNotice) setConfigStatus(status, settingsNotice.text, settingsNotice.tone);
+      form.append(status);
+      const validateWithShake = () => {
+        if (form.checkValidity()) return true;
+        form.querySelectorAll('.form-field').forEach(f => {
+          const inp = f.querySelector('input, select');
+          if (inp && !inp.validity.valid) { f.classList.remove('shake'); void f.offsetWidth; f.classList.add('shake'); }
+        });
+        return form.reportValidity();
+      };
+      const actions = el('div', 'ai-form-actions'), test = btn('测试连接', '', async () => {
+        if (!validateWithShake() || !(await persist())) return;
+        settingsNotice = {text: '正在测试连接…', tone: 'testing'}; renderSettings();
+        await startAction('ai-test');
+      }), save = btn('保存并使用', 'btn-primary'); save.type = 'submit';
       actions.append(test, save); form.append(actions); editor.append(form);
       async function persist() {
         save.disabled = test.disabled = true; settingsNotice = null;
         const payload = {provider, name: name.value.trim() || model.value.trim(), protocol: protocol.value, base_url: address.value.trim(), model: model.value.trim(), api_key: secret.value.trim(), vision: vision.checked, ...(saved ? {id} : {create: true})};
         secret.value = '';
         try { config = await api('/api/ai/settings', payload); selected = config.active; updateLabel(); settingsNotice = {text: '已保存', tone: 'ok'}; renderSettings(); return true; }
-        catch (e) { settingsNotice = {text: e.message, tone: 'error'}; status.textContent = e.message; status.classList.add('error'); return false; }
+        catch (e) { settingsNotice = {text: e.message, tone: 'error'}; setConfigStatus(status, e.message, 'error'); return false; }
         finally { payload.api_key = ''; save.disabled = test.disabled = false; }
       }
-      form.onsubmit = async e => { e.preventDefault(); if (form.reportValidity()) await persist(); };
+      form.onsubmit = async e => { e.preventDefault(); if (validateWithShake()) await persist(); };
       if (S.job.busy) form.querySelectorAll('button, input, select').forEach(control => control.disabled = true);
       return editor;
     }
   }
-  settingsDialog.addEventListener('close', () => { selected = null; settingsNotice = null; const key = $('#ai-api-key'); if (key) key.value = ''; });
+  settingsDialog.addEventListener('close', () => { selected = null; prevSelected = null; lastProvRect = null; settingsNotice = null; const key = $('#ai-api-key'); if (key) key.value = ''; });
 
   function taskButton(r) {
     if (!r || r.group === 'history') return null;
@@ -137,7 +219,22 @@ window.HomeworkAI = (() => {
 
   function lockInputs(r) {
     const locked = !!r && (settling.has(r.key) || S.job.busy && S.job.action === 'ai' && S.job.key === r.key);
-    $('#detail').classList.toggle('ai-locked', locked);
+    const detail = $('#detail');
+    detail.classList.toggle('ai-locked', locked);
+    const col = detail.querySelector('.column');
+    const existingBox = col?.querySelector('.ai-solving-box');
+    if (locked && col) {
+      if (!existingBox) {
+        const box = el('div', 'ai-solving-box'), head = el('div', 'ai-solving-head');
+        head.append(icon('sparkle'), el('span', '', S.job.message || 'AI 正在思考并填写答案…'));
+        box.append(head, Object.assign(el('div', 'ai-sk-bar'), {style: 'width:92%'}), Object.assign(el('div', 'ai-sk-bar'), {style: 'width:70%'}));
+        const qnav = col.querySelector('.qnav');
+        if (qnav) qnav.after(box);
+        else col.querySelector('.hero')?.after(box);
+      }
+    } else if (existingBox) {
+      existingBox.remove();
+    }
     for (const input of document.querySelectorAll('#detail .question input, #detail .question textarea, #detail .question button, #detail .legacy textarea')) {
       if (locked && !input.hasAttribute('data-ai-disabled')) {
         input.dataset.aiDisabled = String(input.disabled);
@@ -156,7 +253,27 @@ window.HomeworkAI = (() => {
     const summary = el('summary');
     summary.append(icon('sparkle'), el('span', '', 'AI 解答模板'));
     if (template.model) summary.append(el('small', '', template.model));
-    box.append(summary, el('div', 'ai-template-text', template.text));
+    const textNode = el('div', 'ai-template-text', template.text);
+    const hint = S.aiHintKeys?.get(key);
+    if (hint && Date.now() - hint.at < 2400 && hint.templates?.has(String(q.id))) {
+      hint.templates.delete(String(q.id));
+      const fullText = String(template.text || '');
+      if (fullText.length > 1) {
+        let pos = 0;
+        const step = Math.max(2, Math.ceil(fullText.length / 22));
+        textNode.replaceChildren(document.createTextNode(''), el('span', 'ai-caret'));
+        const timer = setInterval(() => {
+          pos = Math.min(fullText.length, pos + step);
+          if (!textNode.isConnected || pos >= fullText.length) {
+            clearInterval(timer);
+            textNode.textContent = fullText;
+          } else {
+            textNode.replaceChildren(document.createTextNode(fullText.slice(0, pos)), el('span', 'ai-caret'));
+          }
+        }, 24);
+      }
+    }
+    box.append(summary, textNode);
     const actions = el('div', 'notice-actions');
     const use = btn('采用模板', 'btn-sm btn-primary', () => apply(true), 'check');
     const changed = q.signature !== template.signature, filled = answered(draft.answers[q.id]);
@@ -182,9 +299,11 @@ window.HomeworkAI = (() => {
     if (job.action === 'ai-test') {
       const message = $('#ai-config-message');
       settingsNotice = {text: job.message, tone: job.result?.error ? 'error' : 'ok'};
-      if (message) message.textContent = job.message;
-      if (settingsDialog.open) { renderSettings(); $('#ai-config-message').textContent = job.message; $('#ai-config-message').classList.add(job.result?.error ? 'error' : 'ok'); }
-      else toast(job.message, job.result?.error ? 'error' : '');
+      if (message) setConfigStatus(message, job.message, settingsNotice.tone);
+      if (settingsDialog.open) {
+        renderSettings();
+        setConfigStatus($('#ai-config-message'), job.message, settingsNotice.tone);
+      } else toast(job.message, job.result?.error ? 'error' : '');
       return;
     }
     const key = canonicalKey(job.result?.key || job.key);
@@ -195,6 +314,10 @@ window.HomeworkAI = (() => {
       latest.answers ??= {};
       drafts.set(key, latest);
       saveState.set(key, {state: 'saved', at: latest.updated_at});
+      const filledIds = job.result?.filled || [], templateIds = job.result?.templates || [];
+      if (filledIds.length || templateIds.length) {
+        S.aiHintKeys.set(key, {filled: new Set(filledIds.map(String)), templates: new Set(templateIds.map(String)), at: Date.now()});
+      }
       if (S.key === key) renderDetail(record(), latest, true);
       await load();
     } catch (e) { toast('答案刷新失败：' + e.message, 'error'); return; }

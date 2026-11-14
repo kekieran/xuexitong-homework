@@ -1036,3 +1036,298 @@ dialog::backdrop{background:rgba(31,30,29,.26);backdrop-filter:blur(3px)}
   .ai-form-grid{gap:14px}
   .ai-form-actions .btn{flex:1;padding-right:10px;padding-left:10px}
 }
+
+/* ==========================================================================
+   Motion System · 登录 A4 + 下拉刷新 R3 + 栏目切换 + 提交归档 + 作答微交互
+   ========================================================================== */
+:root{
+  --spring:cubic-bezier(.34,1.56,.64,1);
+  --spring-soft:cubic-bezier(.22,1.28,.5,1);
+  --ease-in:cubic-bezier(.5,0,.75,0);
+  --ease-io:cubic-bezier(.65,0,.35,1);
+  --out:cubic-bezier(.2,.7,.2,1);
+  --in:cubic-bezier(.5,0,.75,0);
+  --t1:120ms;
+  --t2:200ms;
+  --t3:320ms;
+  --t4:480ms;
+}
+
+/* ---------- 通用微交互：按钮、开关、弹窗 ---------- */
+.btn{transition:background .15s,border-color .15s,color .15s,box-shadow .15s,transform var(--t1) var(--ease)}
+.btn:active:not(:disabled){transform:scale(.96)}
+.switch::after{transition:transform var(--t3) var(--spring),width var(--t1)}
+.switch:active:not(:disabled)::after{width:22px}
+.switch[aria-checked="true"]:active:not(:disabled)::after{transform:translateX(14px)}
+.sheet[open]{animation:sheet-spring-in var(--t4) var(--spring) both}
+@keyframes sheet-spring-in{from{opacity:0;transform:translateY(16px) scale(.94)}to{opacity:1;transform:none}}
+.form-field.shake{animation:field-shake .42s var(--ease)}
+@keyframes field-shake{20%{transform:translateX(-7px)}40%{transform:translateX(6px)}60%{transform:translateX(-4px)}80%{transform:translateX(2px)}}
+
+/* ---------- 三栏（待完成 / 待核实 / 历史）滑块与方向切换 ---------- */
+.tabs{position:relative}
+.tabs.has-pill::before{content:"";position:absolute;left:3px;top:3px;bottom:3px;width:calc((100% - 10px)/3);border-radius:7px;background:var(--surface);box-shadow:var(--shadow-sm);transform:translateX(calc(var(--tab-idx,0)*(100% + 2px)));transition:transform var(--t4) var(--spring-soft);pointer-events:none}
+.tab{position:relative;z-index:1}
+.tabs.has-pill .tab[aria-selected="true"]{background:transparent;box-shadow:none}
+.tab-count.bump{animation:cnt-bump .42s var(--spring)}
+@keyframes cnt-bump{40%{transform:scale(1.42)}}
+.item.list-in,.list-section.list-in{animation:item-in var(--t4) var(--spring-soft) both;animation-delay:calc(var(--i,0)*38ms)}
+@keyframes item-in{from{opacity:0;transform:translateY(14px) scale(.98)}to{opacity:1;transform:none}}
+.item.tab-in,.list-section.tab-in,.list-empty.tab-in{animation:tab-in .38s var(--spring-soft) both;animation-delay:calc(var(--i,0)*30ms)}
+@keyframes tab-in{from{opacity:0;transform:translateX(calc(var(--dx,1)*28px))}to{opacity:1;transform:none}}
+.item.fresh-new{animation:new-in var(--t4) var(--spring) both,fresh 4.2s ease-out both}
+@keyframes new-in{from{opacity:0;transform:translateX(-22px) scale(.96)}to{opacity:1;transform:none}}
+.new-badge{display:inline-block;margin-right:6px;padding:0 6px;border-radius:999px;background:var(--clay);color:#fff;font-size:11px;line-height:17px;vertical-align:1px;font-weight:500;animation:badge-pop var(--t4) var(--spring) .14s both}
+@keyframes badge-pop{from{transform:scale(0) rotate(-20deg)}to{transform:none}}
+.due.due-chg{border-radius:4px;animation:due-chg 1.3s var(--ease)}
+@keyframes due-chg{0%,40%{background:var(--warn-soft);color:var(--warn);box-shadow:0 0 0 4px var(--warn-soft)}100%{background:transparent;box-shadow:0 0 0 4px transparent}}
+
+/* ---------- 刷新：列表波浪（参考 motion_preview 第 2 幕） ---------- */
+.assignment-list .item.wave{animation:list-wave 2.4s ease-in-out infinite;animation-delay:calc(var(--i,0)*90ms)}
+@keyframes list-wave{0%,70%,100%{opacity:1}35%{opacity:.55}}
+.assignment-list.refreshing .item::after{display:none!important;content:none!important}
+.detail.is-refreshing .overview-metric strong,.detail.is-refreshing .big-progress i,.detail.is-refreshing .up-item{animation:none!important}
+#refresh .icon.settle{animation:rfi-settle .52s var(--spring)}
+@keyframes rfi-settle{from{transform:rotate(-70deg)}to{transform:rotate(0)}}
+
+/* ---------- 登录 A4（参考 login_refresh_options.html） ---------- */
+#login-dialog .sheet-body{width:380px;padding:22px 24px 18px;clip-path:circle(420px at 50% 42%);transition:clip-path .24s cubic-bezier(.5,0,.2,1),opacity .24s var(--out)}
+#login-dialog .sheet-eyebrow{padding-right:44px}
+#login-dialog.login-running .sheet-eyebrow{display:none}
+#login-dialog.a4-to-circle .sheet-body{clip-path:circle(31px at 50% 42%);opacity:.12}
+#login-dialog::backdrop{transition:background .24s,backdrop-filter .24s}
+#login-dialog.a4-to-circle::backdrop{background:rgba(31,30,29,0);backdrop-filter:blur(0)}
+.login-pane{transition:opacity .2s var(--out),transform .22s var(--out),filter .22s var(--out)}
+.login-pane.out{opacity:0;transform:scale(.94);filter:blur(3px);pointer-events:none}
+.login-pane .sheet-title{font-size:20px;margin:4px 0 14px}
+.login-pane .form-field>span{font-weight:500;color:var(--muted);font-size:12px}
+.login-pane .form-field .input{height:38px;min-height:38px;padding:0 12px}
+.login-pane .sheet-actions.morphing .btn:not(.login-submit){opacity:0;pointer-events:none}
+.login-submit{width:120px;transition:width var(--t3) var(--spring-soft),min-width var(--t3) var(--spring-soft),height var(--t3) var(--out),border-radius var(--t3) var(--out),padding var(--t3),background var(--t2)}
+.login-submit.morphb{width:36px;min-width:36px;height:36px;padding:0;border-radius:18px}
+.login-orb{position:relative;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:300px;padding:0;text-align:center;animation:login-orb-in .5s var(--spring) both}
+@keyframes login-orb-in{from{opacity:0;transform:translateY(10px) scale(.96)}to{opacity:1;transform:none}}
+.login-halo{position:relative;width:112px;height:112px;margin:0;display:grid;place-items:center;perspective:500px}
+.login-halo .aura{position:absolute;inset:6px;border-radius:50%;background:radial-gradient(circle,rgba(201,100,66,.28),rgba(201,100,66,0) 68%);animation:halo-breath 2.2s ease-in-out infinite;transition:transform .32s,opacity .32s,background .3s}
+@keyframes halo-breath{50%{transform:scale(1.22);opacity:.55}}
+.login-ringspin{position:absolute;inset:8px;animation:spin 2.6s linear infinite}
+.login-ringspin svg{width:100%;height:100%}
+.login-halo.ok .login-ringspin{animation-play-state:paused}
+.login-ring{position:absolute;inset:0;width:100%;height:100%;transform:rotate(-90deg)}
+.login-ring .track{fill:none;stroke:var(--sunken);stroke-width:4}
+.login-ring .arc{fill:none;stroke:var(--clay);stroke-width:4;stroke-linecap:round;stroke-dasharray:283;stroke-dashoffset:200;transition:stroke-dashoffset .7s var(--spring-soft),stroke .3s}
+.login-halo.ok .login-ring .arc{stroke:var(--ok)}
+.login-halo .burst{position:absolute;inset:8px;border-radius:50%;border:2px solid var(--ok);opacity:0;pointer-events:none}
+.login-halo.ok .burst{animation:login-burst .76s var(--out) .1s}
+.login-halo.ok .burst.b2{animation-delay:.26s}
+@keyframes login-burst{from{opacity:.7;transform:scale(1)}to{opacity:0;transform:scale(1.8)}}
+.login-halo.ok .aura{background:radial-gradient(circle,rgba(74,122,76,.3),rgba(74,122,76,0) 68%)}
+.login-emblem{position:relative;width:62px;height:62px;border-radius:50%;background:var(--clay-grad);display:grid;place-items:center;color:#fff;font-family:var(--serif);font-size:26px;font-weight:600;box-shadow:0 6px 18px rgba(201,100,66,.35);animation:emb-in .52s var(--spring) both;transition:background .3s}
+@keyframes emb-in{from{transform:scale(.3);opacity:0}to{transform:none;opacity:1}}
+.emblem-3d{position:relative;width:62px;height:62px;transform-style:preserve-3d;transition:transform .42s var(--spring)}
+.emblem-3d.flip{transform:rotateY(180deg)}
+.emblem-3d .face{position:absolute;inset:0;border-radius:50%;backface-visibility:hidden;display:grid;place-items:center;color:#fff;font-weight:600}
+.emblem-3d .face.front{background:var(--ok);box-shadow:0 6px 18px rgba(74,122,76,.35)}
+.emblem-3d .face.front .icon{width:28px;height:28px;stroke-width:2.4}
+.emblem-3d .face.back{background:var(--clay-grad);font-family:var(--sans);font-size:26px;transform:rotateY(180deg);box-shadow:0 8px 22px rgba(201,100,66,.4)}
+.login-roll{position:relative;width:100%;height:22px;min-height:22px;margin-top:16px;font-size:13.5px;font-weight:500;color:var(--text);text-align:center;overflow:hidden}
+.login-roll span{position:absolute;left:0;right:0;top:0;transition:transform .38s var(--spring-soft),opacity .2s}
+.login-roll span.up{transform:translateY(-100%);opacity:0}
+.login-roll span.down{transform:translateY(100%);opacity:0}
+.login-school{min-height:22px;margin-top:4px;font-size:13px;color:var(--clay-deep);font-weight:600;clip-path:inset(0 100% 0 0);letter-spacing:.26em;opacity:0;transition:clip-path .7s var(--ease-io),letter-spacing .9s var(--ease),opacity .3s}
+.login-school.show{clip-path:inset(0 0 0 0);letter-spacing:.03em;opacity:1}
+.login-bg-actions{position:absolute;right:10px;bottom:6px}
+.fly-orb{position:fixed;z-index:999;border-radius:50%;background:var(--clay-grad);color:#fff;display:grid;place-items:center;font-family:var(--sans);font-weight:600;pointer-events:none;box-shadow:0 10px 28px rgba(201,100,66,.38)}
+.avatar.ava-hide,.account-text.info-hide{opacity:0}
+.avatar.clay-ava{background:var(--clay-grad);color:#fff;font-family:var(--sans);font-weight:600}
+.avatar.land-soft{position:relative;animation:land-soft .46s var(--spring)}
+@keyframes land-soft{0%{transform:scale(.72)}55%{transform:scale(1.18)}100%{transform:scale(1)}}
+.avatar .ring-wave{position:absolute;inset:-2px;border-radius:50%;border:2px solid var(--clay);animation:ava-ring .56s var(--ease) forwards;pointer-events:none}
+@keyframes ava-ring{from{opacity:.78;transform:scale(.9)}to{opacity:0;transform:scale(1.85)}}
+.account-text.pop-ribbon strong{animation:ribbon-reveal .46s var(--spring-soft) both}
+.account-text.pop-ribbon small{animation:ribbon-reveal .52s var(--spring-soft) .09s both}
+@keyframes ribbon-reveal{0%{opacity:0;clip-path:inset(0 100% 0 0);transform:translateX(-8px);letter-spacing:.1em}100%{opacity:1;clip-path:inset(0 0 0 0);transform:none;letter-spacing:0}}
+
+/* ---------- 提交状态自动检测条、已提交印章与抛物线归档卡片 ---------- */
+.sub-watch{display:flex;align-items:center;gap:10px;margin:0 0 16px;padding:10px 14px;border-radius:var(--r);border:1px solid var(--clay-ring);background:var(--clay-tint);color:var(--clay-deep);box-shadow:var(--shadow-sm);font-size:13px;position:relative;overflow:hidden;animation:rise .3s var(--spring-soft) both}
+.sub-watch.busy::after{content:"";position:absolute;left:0;bottom:0;width:36%;height:2px;background:linear-gradient(90deg,transparent,var(--clay),transparent);animation:sweep 1.5s cubic-bezier(.45,.05,.55,.95) infinite}
+.sub-watch.ok{border-color:var(--ok-line);background:var(--ok-soft);color:var(--ok)}
+.sub-watch.ok .pulse-dot{background:var(--ok);animation:none;box-shadow:none}
+.sub-watch.warn{border-color:var(--warn-line);background:var(--warn-soft);color:#6b470b}
+.sub-watch.warn .pulse-dot{background:var(--warn);animation:none;box-shadow:none}
+.sub-watch .pulse-dot{width:8px;height:8px;border-radius:50%;background:var(--clay);flex-shrink:0;box-shadow:0 0 0 0 rgba(201,100,66,.5);animation:sub-pulse 1.6s infinite}
+@keyframes sub-pulse{70%{box-shadow:0 0 0 7px rgba(201,100,66,0)}100%{box-shadow:0 0 0 0 rgba(201,100,66,0)}}
+.sub-watch-text{flex:1;min-width:0}
+.hero{position:relative}
+.hero.thud{animation:hero-thud .32s var(--out) .26s}
+@keyframes hero-thud{30%{transform:translateY(2px) scale(.995)}}
+.submitted-stamp{position:absolute;right:4px;top:2px;padding:4px 12px;border:2.5px solid var(--ok);border-radius:8px;color:var(--ok);background:rgba(233,241,229,.92);font-weight:700;font-size:14px;letter-spacing:.12em;transform:rotate(-8deg);pointer-events:none;z-index:4;animation:stamp-in .52s cubic-bezier(.3,1.6,.5,1) both}
+@keyframes stamp-in{0%{opacity:0;transform:rotate(-8deg) scale(2.2)}60%{opacity:1}100%{opacity:1;transform:rotate(-8deg) scale(1)}}
+.fly-card{position:fixed;z-index:998;pointer-events:none;border-radius:10px;background:var(--surface);border:1px solid var(--ok);box-shadow:0 12px 30px rgba(31,30,29,.18);padding:8px 12px;font-size:12.5px;color:var(--text);display:flex;flex-direction:column;gap:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+/* ---------- 视图方向性切换与选中指示器（motion_preview 第 4 幕） ---------- */
+.assignment-list{position:relative}
+.list-sel{position:absolute;left:8px;right:8px;top:0;height:0;border-radius:10px;background:var(--surface);box-shadow:0 1px 2px rgba(31,30,29,.05),0 4px 12px -4px rgba(31,30,29,.1),inset 0 0 0 1px var(--line),inset 3px 0 0 var(--clay);opacity:0;z-index:0;pointer-events:none;transition:transform .48s var(--spring-soft),height .32s var(--out),opacity .2s}
+.item{position:relative;z-index:1}
+.item[aria-current="true"]{background:transparent!important;box-shadow:none!important}
+.item[aria-current="true"].urgent::before{display:none}
+.item[aria-current="true"] .item-title{color:var(--clay-deep)}
+.item[aria-current="true"]:hover{background:transparent!important}
+.assignment-list.login-ghost .item,.assignment-list.login-ghost .list-section,.assignment-list.login-ghost .list-sel{opacity:0!important;animation:none!important}
+@keyframes ref-page-in-right{from{opacity:0;transform:translateX(48px)}to{opacity:1;transform:none}}
+@keyframes ref-page-in-left{from{opacity:0;transform:translateX(-36px) scale(.985);filter:blur(2px)}to{opacity:1;transform:none;filter:blur(0)}}
+@keyframes ref-page-out-left{to{opacity:0;transform:translateX(-36px) scale(.985);filter:blur(2px)}}
+@keyframes ref-page-out-right{to{opacity:0;transform:translateX(48px);filter:blur(1.5px)}}
+.column.page-in-right,.welcome.page-in-right,.empty.page-in-right{animation:ref-page-in-right .48s var(--spring-soft) both}
+.column.page-in-left,.welcome.page-in-left,.empty.page-in-left{animation:ref-page-in-left .48s var(--spring-soft) both}
+.view-ghost{position:absolute;z-index:35;pointer-events:none;background:transparent;border-radius:12px;overflow:hidden;animation-duration:.34s;animation-timing-function:var(--out);animation-fill-mode:forwards}
+.view-ghost.page-out-left{animation-name:ref-page-out-left}
+.view-ghost.page-out-right{animation-name:ref-page-out-right}
+.stg-item{animation:ref-stg-in .34s var(--spring-soft) both;animation-delay:calc(var(--si,0)*30ms)}
+@keyframes ref-stg-in{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+.column.no-anim,.welcome.no-anim,.column.no-anim .stg-item,.column.no-anim .notice,.column.no-anim .deadline-strip,.column.no-anim .sub-watch,.welcome.no-anim .stg-item,.welcome.no-anim .stg,.welcome.no-anim .up-item,.welcome.no-anim .callout{animation:none}
+@keyframes ref-list-out-left{to{opacity:0;transform:translateX(-26px)}}
+@keyframes ref-list-out-right{to{opacity:0;transform:translateX(26px)}}
+.list-ghost{position:absolute;z-index:36;pointer-events:none;background:transparent;overflow:hidden;animation-duration:.22s;animation-timing-function:var(--in);animation-fill-mode:forwards}
+.list-ghost.tab-out-left{animation-name:ref-list-out-left}
+.list-ghost.tab-out-right{animation-name:ref-list-out-right}
+.item-ghost{position:fixed;z-index:34;pointer-events:none;overflow:hidden;border-radius:10px;background:var(--surface);box-shadow:var(--shadow-sm)}
+dialog.sheet.closing{animation:sheet-out .2s var(--in) both}
+@keyframes sheet-out{to{opacity:0;transform:translateY(8px) scale(.97)}}
+
+/* ---------- 01 首页概览、空状态与重读浮层 ---------- */
+@keyframes rise-sm{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+@keyframes scale-in{from{opacity:0;transform:scale(.94)}to{opacity:1;transform:none}}
+@keyframes pulse-ring-once{0%{box-shadow:0 0 0 0 rgba(201,100,66,.35)}100%{box-shadow:0 0 0 14px rgba(201,100,66,0)}}
+.brand .spark,.greet .spark{transition:transform .6s var(--out)}
+.brand:hover .spark,.greet:hover .spark{transform:rotate(45deg)}
+.welcome .stg{animation:ref-stg-in .46s var(--spring-soft) calc(var(--i,0)*70ms) both}
+.callout.urgent.pulse .callout-icon{animation:pulse-ring-once 1.1s var(--out) .45s 1}
+.up-date{transition:transform .2s var(--spring)}
+.up-item:hover .up-date{transform:scale(1.05)}
+.up-item.enter{animation:rise-sm .42s var(--spring-soft) calc(200ms + var(--i,0)*45ms) both}
+.empty.anim-in{animation:scale-in .36s var(--spring) both}
+.reading-card{animation:sheet-spring-in .46s var(--spring) both}
+
+/* ---------- 02 搜索关键词高亮与子筛选反馈 ---------- */
+.search-meta{display:flex;align-items:center;gap:8px;margin:7px 2px 0;font-size:11.5px;color:var(--muted);animation:rise-sm .2s var(--out)}
+.search-meta[hidden]{display:none}
+.search-meta .qcount{margin-right:auto;display:inline-flex;align-items:center;gap:4px}
+.search-meta .qcount b{font-weight:600;color:var(--clay-deep);font-variant-numeric:tabular-nums;display:inline-block}
+.search-meta .qcount b.bump{animation:cnt-bump .42s var(--spring)}
+.search-meta button{border:0;background:none;padding:0;color:var(--clay-hover);font-size:11.5px;cursor:pointer}
+.search-meta button:hover{color:var(--clay-deep);text-decoration:underline;text-underline-offset:2px}
+.item mark{background:var(--clay-soft);color:var(--clay-deep);border-radius:3px;padding:0 2px;font-weight:600}
+.item.filter-in{animation:filter-in .26s var(--spring-soft) calc(var(--i,0)*22ms) both}
+@keyframes filter-in{from{opacity:0;transform:translateX(10px)}to{opacity:1;transform:none}}
+.list-empty.anim-in{animation:scale-in .32s var(--spring-soft) both}
+.item.warn-blink{animation:warn-blink .9s ease}
+@keyframes warn-blink{25%{background:var(--warn-soft);box-shadow:inset 0 0 0 1px var(--warn-line)}}
+
+/* ---------- 03 作答选项与附件拖放（.qnav / .qdot 保持原样不变） ---------- */
+.option{position:relative;overflow:hidden;transition:border-color .15s,background .15s,box-shadow .18s,transform var(--t1) var(--ease)}
+.option:active{transform:scale(.988)}
+.option:has(input:checked){box-shadow:0 0 0 1px var(--clay) inset,0 3px 10px -4px rgba(201,100,66,.32)}
+.option:has(input:checked) .mark{animation:mark-pop var(--t3) var(--spring)}
+@keyframes mark-pop{0%{transform:scale(.7)}60%{transform:scale(1.18)}100%{transform:scale(1)}}
+.opt-ripple{position:absolute;width:12px;height:12px;margin:-6px 0 0 -6px;border-radius:50%;background:var(--clay-ring);opacity:.45;pointer-events:none;animation:opt-rip .54s var(--ease) forwards}
+@keyframes opt-rip{to{transform:scale(38);opacity:0}}
+.question.q-flash{animation:qflash .95s var(--out);border-radius:10px}
+@keyframes qflash{0%{box-shadow:0 0 0 3px var(--clay-soft)}100%{box-shadow:none}}
+.option.ai-hint-pulse,.input.ai-hint-pulse,.textarea.ai-hint-pulse{animation:ai-hint 1.05s var(--ease) 2}
+@keyframes ai-hint{0%,100%{box-shadow:0 0 0 0 rgba(201,100,66,0)}40%{box-shadow:0 0 0 5px rgba(201,100,66,.26)}}
+.ai-caret{display:inline-block;width:2px;height:14px;margin-left:2px;background:var(--clay);vertical-align:-2px;animation:ai-blink .75s steps(1) infinite}
+@keyframes ai-blink{50%{opacity:0}}
+.dropzone{transition:border-color .18s,background .18s,transform var(--t3) var(--spring),box-shadow .18s}
+.dropzone.over{transform:scale(1.015);box-shadow:0 0 0 4px var(--clay-soft)}
+.file-wrap{display:grid;grid-template-rows:1fr;transition:grid-template-rows .26s var(--in),opacity .18s,margin .26s}
+.file-wrap>div{overflow:hidden}
+.file-wrap.entering{animation:file-in .34s var(--spring) both}
+.file-wrap.removing{grid-template-rows:0fr;opacity:0;margin-bottom:-6px}
+@keyframes file-in{from{opacity:0;transform:translateY(-8px) scale(.97)}to{opacity:1;transform:none}}
+
+/* ---------- 04 底栏升起、进度环扫弧与保存胶囊 ---------- */
+.dock{transition:transform .48s var(--spring-soft)}
+.dock.dock-pre{transform:translateY(115%)}
+.dock-card{background:rgba(255,255,255,.9);backdrop-filter:saturate(1.4) blur(14px)}
+.ring .ring-check{position:absolute;inset:0;display:grid;place-items:center;opacity:0;transform:scale(.5);transition:opacity .2s,transform .32s var(--spring);z-index:1;color:#fff;pointer-events:none}
+.ring .ring-check .icon{width:15px;height:15px;stroke-width:2.6}
+.ring.complete::after{background:var(--ok)}
+.ring.complete .ring-check{opacity:1;transform:none}
+.btn-pulse{animation:submit-pulse 1.05s var(--out) 2}
+@keyframes submit-pulse{0%,100%{box-shadow:0 0 0 0 rgba(201,100,66,.35)}45%{box-shadow:0 0 0 8px rgba(201,100,66,0)}}
+.save-pill{transition:opacity .2s,transform .3s var(--spring),background .2s,color .2s,border-color .2s}
+.save-pill.entering{animation:rise-sm .26s var(--spring) both}
+.save-pill.saving{background:var(--clay-tint);border:1px solid var(--clay-ring)}
+.save-pill.ok{background:var(--ok-soft);border:1px solid var(--ok-line)}
+.save-dot{width:6px;height:6px;border-radius:50%;background:var(--clay);animation:sub-pulse 1.2s infinite;flex-shrink:0}
+
+/* ---------- 05 自动填入弹窗步骤、统计与结果 ---------- */
+.phase-enter{animation:rise-sm .26s var(--out) both}
+.step{transition:color .2s}
+.step-mark{transition:background .2s,border-color .2s,transform .3s var(--spring)}
+.step.done .step-mark{animation:badge-pop .32s var(--spring)}
+.fill-prog{height:6px;border-radius:4px;background:var(--sunken);overflow:hidden;margin-top:12px}
+.fill-prog i{display:block;height:100%;width:0;border-radius:4px;background:linear-gradient(180deg,#d26d4a,#c25d3c);transition:width .48s var(--spring-soft)}
+.reasons .reason{animation:rise-sm .28s var(--spring-soft) calc(var(--i,0)*45ms) both}
+.result-icon{animation:scale-in .42s var(--spring) both}
+
+/* ---------- 07 AI 手风琴、平台滑块与作答提示 ---------- */
+.ai-slot{display:grid;grid-template-rows:0fr;opacity:0;transition:grid-template-rows .34s var(--spring-soft),opacity .2s var(--out)}
+.ai-slot.open{grid-template-rows:1fr;opacity:1}
+.ai-slot>div{overflow:hidden}
+.ai-inline-editor{animation:none}
+.ai-providers{position:relative}
+.prov-pill{position:absolute;left:0;top:0;width:var(--pw,0px);height:var(--ph,0px);border-radius:var(--r-sm);background:var(--surface);box-shadow:var(--shadow-sm),inset 0 0 0 1px var(--clay-ring);transform:translate3d(var(--px,0px),var(--py,0px),0);transition:transform .32s var(--spring-soft),width .26s var(--spring-soft),height .24s var(--out);pointer-events:none;z-index:0}
+.ai-providers.pill-instant .prov-pill{transition:none}
+.ai-provider{position:relative;z-index:1;transition:color .18s}
+.ai-providers.has-pill .ai-provider[aria-selected="true"]{background:transparent;box-shadow:none;color:var(--clay-deep)}
+.ai-delete{transition:all .2s var(--spring-soft)}
+.ai-config-status .st-dot{width:7px;height:7px;border-radius:50%;background:var(--faint);flex-shrink:0}
+.ai-config-status.testing{color:var(--clay-hover)}
+.ai-config-status.testing .st-dot{background:var(--clay);animation:sub-pulse 1.2s infinite}
+.ai-config-status.ok .st-dot{background:var(--ok)}
+.ai-config-status.error .st-dot{background:var(--danger)}
+.ai-solving-box{margin:0 0 14px;padding:12px 14px;border:1px solid var(--clay-ring);border-radius:var(--r);background:linear-gradient(135deg,var(--clay-tint),var(--surface));animation:rise-sm .28s var(--spring-soft)}
+.ai-solving-head{display:flex;align-items:center;gap:8px;font-size:13px;font-weight:600;color:var(--clay-deep)}
+.ai-solving-head .icon{animation:spark-turn 1.5s linear infinite}
+.ai-sk-bar{height:8px;border-radius:5px;margin-top:8px;background:linear-gradient(90deg,var(--sunken) 25%,#e6e1d5 50%,var(--sunken) 75%);background-size:200% 100%;animation:shimmer 1.15s linear infinite}
+
+/* ---------- 08 提醒时间轮盘景深、铃铛与危险操作条 ---------- */
+.rem-bell.ringing .icon{animation:bell-ring .55s var(--out)}
+@keyframes bell-ring{0%,100%{transform:rotate(0)}18%{transform:rotate(14deg)}36%{transform:rotate(-12deg)}54%{transform:rotate(8deg)}72%{transform:rotate(-5deg)}}
+.rem-time-entry.new-entry{animation:rem-entry-in .4s var(--spring) both}
+@keyframes rem-entry-in{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:none}}
+.rem-time .icon{transition:transform .24s var(--spring-soft)}
+.rem-time-entry.editing .rem-time .icon{transform:rotate(90deg)}
+.rem-slot{display:grid;grid-template-rows:0fr;transition:grid-template-rows .36s var(--spring-soft)}
+.rem-slot.open{grid-template-rows:1fr}
+.rem-slot>div{overflow:hidden}
+.rem-slot .tw-editor{opacity:0;transform:translateY(-4px);transition:opacity .2s,transform .32s var(--spring-soft)}
+.rem-slot.open .tw-editor{opacity:1;transform:none}
+.tw-value.bump{animation:cnt-bump .38s var(--spring)}
+.tw-option{opacity:.42;transform:scale(.86);transition:opacity .16s,transform .22s var(--spring),color .16s,font-size .16s}
+.tw-option.near{opacity:.74;transform:scale(.95)}
+.tw-option.selected{opacity:1;transform:scale(1);font-size:26px;font-weight:600;color:var(--clay-deep)}
+.danger-slot{display:grid;grid-template-rows:0fr;opacity:0;transition:grid-template-rows .32s var(--spring-soft),opacity .2s}
+.danger-slot.open{grid-template-rows:1fr;opacity:1}
+.danger-slot>div{overflow:hidden}
+.danger-slot .notice{margin:12px 0 4px}
+
+/* ---------- 09 图片灯箱 FLIP、账号菜单、横幅与 Toast ---------- */
+.account-menu{transform-origin:bottom left;opacity:0;transform:translateY(10px) scale(.94);transition:opacity .2s var(--out),transform .32s var(--spring)}
+.account-menu.open{opacity:1;transform:none}
+.account-menu.open .account-menu-item{animation:rise-sm .3s var(--spring-soft) calc(var(--i,0)*32ms) both}
+.account-menu.account-menu-ghost{position:absolute;z-index:55;pointer-events:none;transform-origin:bottom left;opacity:1;transform:none;animation:menu-close .16s var(--in) forwards}
+@keyframes menu-close{from{opacity:1;transform:none}to{opacity:0;transform:translateY(6px) scale(.96)}}
+#image-dialog{transition:background .28s var(--out)}
+#image-dialog .viewer-bar{transition:opacity .22s,transform .28s var(--spring-soft)}
+#image-dialog:not(.v-open) .viewer-bar{opacity:0;transform:translateY(-6px)}
+#image-dialog.v-closing{background:rgba(24,23,21,0)}
+#image-large{will-change:transform}
+.toast{animation:toast-in .36s var(--spring) both}
+.toast-mark{animation:badge-pop .38s var(--spring) .08s both}
+.toast.leaving{animation:none;max-height:0;padding-top:0;padding-bottom:0;margin-top:-10px;opacity:0;transform:translateY(6px) scale(.98);border-width:0;transition:max-height .24s var(--in),padding .24s var(--in),margin .24s var(--in),opacity .18s,transform .22s var(--in)}
+@media(prefers-reduced-motion:reduce){
+  *,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important;scroll-behavior:auto!important}
+}

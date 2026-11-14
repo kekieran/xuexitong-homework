@@ -1,6 +1,7 @@
 """One local sign-in for Chaoxing and the discovered school host, with user-bound Windows storage."""
 from __future__ import annotations
 
+import base64
 import ctypes
 import json
 import time
@@ -19,6 +20,7 @@ CREDENTIAL_FILE = engine.runtime.DATA_DIR / 'login_credentials.bin'
 _AUTO_FAILED = False
 _DEFAULT_SITES = dict(SITES)
 _DEFAULT_LOGIN_URLS = dict(LOGIN_URLS)
+_PREFLIGHT_PAGES = {}
 
 
 class BrowserUnavailable(RuntimeError):
@@ -43,6 +45,173 @@ def _login_url(platform: str) -> str:
     if _custom_sites() or platform != 'school':
         return LOGIN_URLS[platform]
     return school.school_login_url() or LOGIN_URLS[platform]
+
+
+def _is_playwright_context(context) -> bool:
+    return bool(context) and getattr(type(context), '__module__', '').startswith('playwright')
+
+
+def _can_fast_fanya(context) -> bool:
+    return engine.os.name == 'nt' and not _custom_sites() and _is_playwright_context(context)
+
+
+def _aes_cbc_encrypt(plaintext: str, key: str = 'u2oh6Vu^HWe4_AES') -> str:
+    raw = plaintext.encode('utf-8')
+    pad_len = 16 - (len(raw) % 16)
+    padded = raw + bytes([pad_len] * pad_len)
+    k = key.encode('utf-8')
+    iv = bytearray(k)
+    bcrypt = ctypes.WinDLL('bcrypt')
+    alg = ctypes.c_void_p()
+    hkey = ctypes.c_void_p()
+    if bcrypt.BCryptOpenAlgorithmProvider(ctypes.byref(alg), ctypes.c_wchar_p('AES'), None, 0) != 0:
+        raise RuntimeError('AES provider unavailable')
+    try:
+        mode = 'ChainingModeCBC\x00'.encode('utf-16le')
+        if bcrypt.BCryptSetProperty(alg, ctypes.c_wchar_p('ChainingMode'), mode, len(mode), 0) != 0:
+            raise RuntimeError('AES CBC mode unavailable')
+        if bcrypt.BCryptGenerateSymmetricKey(alg, ctypes.byref(hkey), None, 0, k, len(k), 0) != 0:
+            raise RuntimeError('AES key setup failed')
+        try:
+            out = (ctypes.c_ubyte * len(padded))()
+            cb = ctypes.c_ulong()
+            iv_buf = (ctypes.c_ubyte * 16).from_buffer(iv)
+            if bcrypt.BCryptEncrypt(hkey, padded, len(padded), None, iv_buf, 16, out, len(padded), ctypes.byref(cb), 0) != 0:
+                raise RuntimeError('AES encryption failed')
+            return base64.b64encode(bytes(out[:cb.value])).decode('ascii')
+        finally:
+            bcrypt.BCryptDestroyKey(hkey)
+    finally:
+        bcrypt.BCryptCloseAlgorithmProvider(alg, 0)
+
+
+def _fanya_endpoint(platform: str, login_url: str) -> tuple[str, str, str] | None:
+    if platform == 'chaoxing':
+        return 'https://passport2.chaoxing.com', '-1', SITES['chaoxing']
+    if platform == 'school':
+        parsed = urlsplit(str(login_url or '').strip())
+        host = (parsed.hostname or '').lower()
+        if parsed.scheme in {'http', 'https'} and parsed.netloc and (
+            'passport' in host or '/login' in (parsed.path or '').lower()
+        ):
+            fid = ''
+            for pair in (parsed.query or '').split('&'):
+                if pair.lower().startswith('fid='):
+                    val = pair.split('=', 1)[1].strip()
+                    if val.isdigit() and val != '0':
+                        fid = val
+                        break
+            fid = fid or school.school_fid('') or '-1'
+            return f'{parsed.scheme}://{parsed.netloc}', fid, _site_url('school')
+    return None
+
+
+def _start_fanya_page(context, passport_origin: str, fid: str, refer: str, username: str, password: str):
+    uname_enc = _aes_cbc_encrypt(username)
+    pwd_enc = _aes_cbc_encrypt(password)
+    login_page_url = f'{passport_origin}/login'
+    page = context.new_page()
+    try:
+        page.route(
+            login_page_url,
+            lambda route: route.fulfill(
+                status=200,
+                content_type='text/html',
+                body='<!doctype html><html><body></body></html>',
+            ),
+        )
+        page.goto(login_page_url, wait_until='commit', timeout=5000)
+        page.evaluate(
+            """({fid, uname, password, refer}) => {
+                const bodyStr = new URLSearchParams({
+                    fid, uname, password, refer,
+                    t: 'true', forbidotherlogin: '0', validate: '',
+                    doubleFactorLogin: '0', independentId: '0', independentNameId: '0'
+                }).toString();
+                const sendOne = (ms) => {
+                    const ctrl = new AbortController();
+                    const timer = setTimeout(() => ctrl.abort(), ms);
+                    return fetch('/fanyalogin', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                            'X-Requested-With': 'XMLHttpRequest'
+                        },
+                        body: bodyStr,
+                        credentials: 'include',
+                        signal: ctrl.signal
+                    }).then(async (r) => {
+                        if (!r.ok) throw new Error('HTTP ' + r.status);
+                        return await r.json();
+                    }).finally(() => clearTimeout(timer));
+                };
+                window.__loginPromise = new Promise((resolve) => {
+                    let settled = false;
+                    let lastErr = null;
+                    let pending = 1;
+                    let hedgeTimer = null;
+                    const done = (val) => {
+                        if (settled) return;
+                        settled = true;
+                        if (hedgeTimer) clearTimeout(hedgeTimer);
+                        resolve(val);
+                    };
+                    const attach = (p) => {
+                        p.then((data) => {
+                            if (data && typeof data === 'object') {
+                                done(data);
+                            } else {
+                                lastErr = new Error('invalid json');
+                                if (--pending === 0) done({status: false, error: String(lastErr)});
+                            }
+                        }).catch((e) => {
+                            lastErr = e;
+                            if (--pending === 0) done({status: false, error: String(lastErr)});
+                        });
+                    };
+                    attach(sendOne(12000));
+                    hedgeTimer = setTimeout(() => {
+                        if (settled) return;
+                        pending += 1;
+                        attach(sendOne(7500));
+                    }, 4500);
+                });
+            }""",
+            {'fid': str(fid or '-1'), 'uname': uname_enc, 'password': pwd_enc, 'refer': quote(refer, safe='')},
+        )
+        return page
+    except Exception:
+        try:
+            if not page.is_closed():
+                page.close()
+        except Exception:
+            pass
+        return None
+
+
+def _finish_fanya_page(page, label: str, progress) -> bool:
+    try:
+        res = page.evaluate('() => window.__loginPromise')
+    except Exception:
+        return False
+    finally:
+        try:
+            if not page.is_closed():
+                page.close()
+        except Exception:
+            pass
+    if isinstance(res, dict) and res.get('status') is True:
+        progress(f'{label}登录已确认')
+        return True
+    if isinstance(res, dict) and res.get('status') is False:
+        raw = str(res.get('mes') or res.get('msg') or res.get('message') or '').strip()
+        if any(word in raw for word in ('验证', '滑块')):
+            return False
+        if any(word in raw for word in ('密码', '账号', '用户名', '手机号')):
+            raise RuntimeError(f'{label}：账号或密码未通过验证，请核对后重新登录')
+        if any(word in raw for word in ('频繁', '次数', '锁定')):
+            raise RuntimeError(f'{label}：登录尝试过于频繁，请稍后再试')
+    return False
 
 
 def _protect(data: bytes, decrypt=False) -> bytes:
@@ -108,13 +277,35 @@ def probe(context, platform: str, *, timeout=12000) -> bool:
         return probe(context, 'chaoxing', timeout=timeout)
     site_url = _site_url(platform)
     response = None
+    use_fast = not _custom_sites() and _is_playwright_context(context)
+    req_timeout = min(timeout, 5000) if use_fast else timeout
     try:
-        response = context.request.get(site_url, timeout=timeout)
+        response = context.request.get(site_url, timeout=req_timeout)
         if response.status >= 400:
             raise RuntimeError()
         markup = response.text()
         return bool(markup.strip()) and urlsplit(response.url).hostname == urlsplit(site_url).hostname and not engine.dom.is_login(markup, response.url)
     except Exception:
+        if use_fast:
+            page = context.new_page()
+            try:
+                page.route(
+                    '**/*',
+                    lambda route: route.abort()
+                    if route.request.resource_type in ('image', 'media', 'font', 'stylesheet', 'script')
+                    else route.continue_(),
+                )
+                page.goto(site_url, wait_until='domcontentloaded', timeout=min(timeout, 6000))
+                markup = page.content()
+                return bool(markup.strip()) and urlsplit(page.url).hostname == urlsplit(site_url).hostname and not engine.dom.is_login(markup, page.url)
+            except Exception:
+                pass
+            finally:
+                try:
+                    if not page.is_closed():
+                        page.close()
+                except Exception:
+                    pass
         raise RuntimeError('暂时无法核对登录状态，请检查网络后重试') from None
     finally:
         engine.lab.dispose_response(response)
@@ -209,15 +400,38 @@ def _submit(context, platform, username, password, progress=None):
     label = SITE_LABELS[platform]
     login_url = _login_url(platform)
     progress(f'正在登录{label}…')
+    preflight = _PREFLIGHT_PAGES.pop((id(context), platform), None)
+    if preflight is not None:
+        if _finish_fanya_page(preflight, label, progress):
+            return
+    elif _can_fast_fanya(context):
+        endpoint = _fanya_endpoint(platform, login_url)
+        if endpoint is not None:
+            fast_page = _start_fanya_page(context, *endpoint, username, password)
+            if fast_page is not None and _finish_fanya_page(fast_page, label, progress):
+                return
     page = context.new_page()
+    if not _custom_sites() and hasattr(page, 'route'):
+        try:
+            page.route(
+                '**/*',
+                lambda route: route.abort()
+                if (
+                    route.request.resource_type in ('image', 'media', 'font')
+                    or any(x in route.request.url.lower() for x in ('/createqr', '/getauthstatus', '/api/notice'))
+                )
+                else route.continue_(),
+            )
+        except Exception:
+            pass
     try:
-        page.goto(login_url, wait_until='domcontentloaded', timeout=15000)
+        page.goto(login_url, wait_until='domcontentloaded', timeout=10000)
     except Exception:
         page.close()
         raise RuntimeError('后台登录页面无法打开，请检查网络后重试') from None
     try:
         try:
-            page.locator('#phone').wait_for(state='visible', timeout=15000)
+            page.locator('#phone').wait_for(state='visible', timeout=6000)
             page.locator('#phone').fill(username)
             page.locator('#pwd').fill(password)
             page.locator('#loginBtn').click(timeout=10000)
@@ -238,7 +452,7 @@ def _submit(context, platform, username, password, progress=None):
         while time.monotonic() < deadline:
             if page.is_closed():
                 raise RuntimeError('登录页面已关闭，请重新登录')
-            page.wait_for_timeout(1000)
+            page.wait_for_timeout(250)
             error = _login_error(page)
             if error:
                 raise RuntimeError(f'{label}：{error}')
@@ -266,13 +480,16 @@ def _submit(context, platform, username, password, progress=None):
                 probe_succeeded = True
             except RuntimeError:
                 pass
-            next_probe = time.monotonic() + 3
+            next_probe = time.monotonic() + 0.5
         if not probe_succeeded:
             raise RuntimeError(f'{label}登录状态核对超时，请检查网络后重试')
         raise RuntimeError(f'{label}需要手动完成验证')
     finally:
         if not page.is_closed():
             page.close()
+
+
+_DEFAULT_SUBMIT = _submit
 
 
 def status(username=None, password=None, *, restore=False, force_restore=False,
@@ -332,11 +549,18 @@ def status(username=None, password=None, *, restore=False, force_restore=False,
                 except Exception:
                     pass
             sites = {name: False for name in SITES}
+        elif supplied or force_restore:
+            sites = {name: False for name in SITES}
         else:
             sites = {}
             for name in SITES:
                 if name == 'chaoxing':
-                    cx_ok = probe(active_context, 'chaoxing')
+                    try:
+                        cx_ok = probe(active_context, 'chaoxing')
+                    except RuntimeError:
+                        if not credentials:
+                            raise
+                        cx_ok = False
                     sites['chaoxing'] = cx_ok
                     if not _custom_sites() and cx_ok and school.load_config().get('mode') == 'unknown':
                         known_user = credentials[0] if credentials else (credential_info().get('username') or '').strip()
@@ -349,10 +573,35 @@ def status(username=None, password=None, *, restore=False, force_restore=False,
                     except RuntimeError:
                         sites['school'] = False
                 else:
-                    sites[name] = probe(active_context, name)
+                    try:
+                        sites[name] = probe(active_context, name)
+                    except RuntimeError:
+                        if not credentials:
+                            raise
+                        sites[name] = False
         if on_state:
             on_state({'logged_in': all(sites.values()), 'sites': dict(sites)})
         if credentials:
+            prev_mode = school.load_config().get('mode') if not _custom_sites() else ''
+            prev_school_url = _site_url('school') if 'school' in SITES else ''
+            preflight_keys = []
+            if _submit is _DEFAULT_SUBMIT and _can_fast_fanya(active_context):
+                if not sites.get('chaoxing'):
+                    ep = _fanya_endpoint('chaoxing', _login_url('chaoxing'))
+                    if ep is not None:
+                        pg = _start_fanya_page(active_context, *ep, *credentials)
+                        if pg is not None:
+                            key = (id(active_context), 'chaoxing')
+                            _PREFLIGHT_PAGES[key] = pg
+                            preflight_keys.append(key)
+                if not sites.get('school') and not account_changed and school.load_config().get('mode') == 'school_site':
+                    ep = _fanya_endpoint('school', _login_url('school'))
+                    if ep is not None:
+                        pg = _start_fanya_page(active_context, *ep, *credentials)
+                        if pg is not None:
+                            key = (id(active_context), 'school')
+                            _PREFLIGHT_PAGES[key] = pg
+                            preflight_keys.append(key)
             try:
                 for platform in list(sites):
                     if not sites[platform]:
@@ -364,14 +613,26 @@ def status(username=None, password=None, *, restore=False, force_restore=False,
                         _submit(active_context, platform, *credentials, progress=progress)
                         sites[platform] = True
                         if platform == 'chaoxing' and not _custom_sites():
-                            school.discover_school(active_context, username=credentials[0])
+                            if progress:
+                                progress('正在识别所属学校…')
+                            cfg = school.discover_school(active_context, username=credentials[0])
+                            if progress and cfg.get('school_name'):
+                                progress(f"已识别学校：{cfg['school_name']}")
+                            if _site_url('school') != prev_school_url:
+                                stale_school = _PREFLIGHT_PAGES.pop((id(active_context), 'school'), None)
+                                if stale_school is not None:
+                                    try:
+                                        if not stale_school.is_closed():
+                                            stale_school.close()
+                                    except Exception:
+                                        pass
                             if 'school' in sites:
                                 if school.is_chaoxing_only():
                                     sites['school'] = True
                                 elif school.load_config().get('mode') == 'school_site':
-                                    if account_changed:
+                                    if account_changed or not school._is_chaoxing_domain(urlsplit(_site_url('school')).hostname):
                                         sites['school'] = False
-                                    else:
+                                    elif prev_mode == 'unknown' or _site_url('school') != prev_school_url:
                                         try:
                                             sites['school'] = probe(active_context, 'school')
                                         except RuntimeError:
@@ -381,10 +642,27 @@ def status(username=None, password=None, *, restore=False, force_restore=False,
             except Exception:
                 _AUTO_FAILED = True
                 raise
+            finally:
+                for key in preflight_keys:
+                    stale = _PREFLIGHT_PAGES.pop(key, None)
+                    if stale is not None:
+                        try:
+                            if not stale.is_closed():
+                                stale.close()
+                        except Exception:
+                            pass
             if all(sites.values()):
                 _AUTO_FAILED = False
         return {'logged_in': all(sites.values()), 'sites': sites}
 
+    if context is None and not supplied and not restore and not _custom_sites():
+        session = engine.read_json(engine.DATA_DIR / 'browser_session.json', None)
+        if not isinstance(session, dict) or not session.get('cookies'):
+            sites = {name: False for name in SITES}
+            result = {'logged_in': False, 'sites': sites}
+            if on_state:
+                on_state({'logged_in': False, 'sites': dict(sites)})
+            return result
     if context is not None:
         return authenticate(context)
     with engine.browser_operation(), sync_playwright() as playwright:

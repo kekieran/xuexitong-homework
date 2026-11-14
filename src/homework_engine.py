@@ -95,7 +95,7 @@ def process_transaction(name, wait_ms=0):
         kernel.CloseHandle(handle)
 
 def browser_operation():
-    return process_transaction('Local\\ChaoxingHomeworkBrowserOperation_' + runtime.PROJECT_ID)
+    return process_transaction('Local\\ChaoxingHomeworkBrowserOperation_' + runtime.PROJECT_ID, 30000)
 
 def draft_transaction():
     return process_transaction('Local\\ChaoxingHomeworkDraftTransaction_' + runtime.PROJECT_ID, 10000)
