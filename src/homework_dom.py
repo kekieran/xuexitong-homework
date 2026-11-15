@@ -80,7 +80,7 @@ def platform_url(url):
         return False
 
 PAGE_PATH_HEADS = ('/mooc-ans/', '/work/', '/course/', '/mycourse/', '/exam/', '/notice/',
-                   '/task-list', '/getallwork')
+                   '/task-list', '/getallwork', '/page/renwu')
 
 
 def platform_page_url(url):
@@ -132,7 +132,7 @@ def url_identity(url):
     q = query_params(url)
     host = platform_host(u.hostname)
     course, clazz = course_class_pair(url)
-    return [f'{host}:{course}:{clazz}:{k}:{q[k]}' for k in ('taskrefid', 'workid') if q.get(k) and course and clazz]
+    return [f'{host}:{course}:{clazz}:{k}:{q[k]}' for k in ('taskrefid', 'workid', 'activeid') if q.get(k) and course and clazz]
 
 
 # Keep the candidate URL order and identity inputs identical for navigation and
@@ -230,7 +230,7 @@ def parse_questions(markup, base_url='', asset=None):
     for n in question_nodes(root):
         f = fields(n)
         qid = question_id(n)
-        stem = n.first(cls='workTextWrap') or n.first(cls='timuStyle') or n.first(cls='mark_name') or n.first(cls='Zy_TItle')
+        stem = n.first(cls='qtContent') or n.first(cls='workTextWrap') or n.first(cls='timuStyle') or n.first(cls='mark_name') or n.first(cls='Zy_TItle')
         if not stem or not qid:
             continue
         text = clean_text(stem)
@@ -239,7 +239,7 @@ def parse_questions(markup, base_url='', asset=None):
         code = f.get('type' + qid, f.get('answertype' + qid, f.get('questionType', f.get('questionDataType', ''))))
         kind = TYPE_MAP.get(code, 'unsupported')
         if not code:
-            heading = n.first(cls='mark_name') or n.first(cls='titType') or stem
+            heading = n.first(cls='mark_name') or n.first(cls='titType') or n.first(cls='stemGray') or n.first(cls='stemDiv') or stem
             type_text = n.attrs.get('typename', '') + ' ' + clean_text(heading)[:70]
             for label, value in [('多选', 'multiple'), ('单选', 'single'), ('判断', 'judgment'), ('填空', 'blank'), ('简答', 'essay'), ('论述', 'essay'), ('计算', 'essay')]:
                 if label in type_text:
@@ -247,7 +247,7 @@ def parse_questions(markup, base_url='', asset=None):
                     code = {'single': '0', 'multiple': '1', 'blank': '2', 'judgment': '3', 'essay': '4'}[kind]
                     break
         options = []
-        candidates = n.all(cls='answerBg') or n.all(cls='answerList')
+        candidates = n.all(cls='answerBg') or n.all(cls='answerList') or n.all(cls='optionCon')
         # PC: ul.mark_letter > li; phone: div.answerList.radio / .check.
         if not candidates:
             for container in n.all(cls='mark_letter') + n.all(cls='stem_answer'):
@@ -271,7 +271,7 @@ def parse_questions(markup, base_url='', asset=None):
                 continue
             if any(o['value'] == label for o in options):
                 continue
-            content = opt.first(cls='after') or opt.first(cls='answer_p') or opt.first(cls='optionContent') or opt
+            content = opt.first(cls='after') or opt.first(cls='answer_p') or opt.first(cls='optionContent') or opt.first(cls='qtDetail') or opt
             options.append({'value': label, 'text': clean_text(content), 'html': safe_html(content, base_url, asset), '_fingerprint': _content_fingerprint(content, base_url)})
         if kind == 'judgment' and not options:
             options = [{'value': 'true', 'text': '正确', 'html': '正确'}, {'value': 'false', 'text': '错误', 'html': '错误'}]
@@ -318,6 +318,23 @@ def parse_questions(markup, base_url='', asset=None):
     return result
 
 
+def _has_mobile_pagination_controls(root):
+    """Detect rendered mobile question-paging controls, not unused script helpers."""
+    for node in root.all():
+        if node.tag in {'script', 'style'}:
+            continue
+        for attr_name, attr_val in node.attrs.items():
+            if attr_name != 'style' and attr_val and re.search(
+                r'(?:getTheNextQuestion|gotoWorkAnswerSheet|answerSheet)\s*\(', attr_val
+            ):
+                return True
+        if node.tag in {'a', 'button', 'span', 'div'} and re.fullmatch(
+            r'(?:上一题|下一题|答题卡)', clean_text(node)
+        ):
+            return True
+    return False
+
+
 def question_diagnostics(markup, questions=None):
     """Report partial/ambiguous parses without claiming a phone page is the full work."""
     root = parse(markup)
@@ -346,7 +363,7 @@ def question_diagnostics(markup, questions=None):
         reasons.append('部分题目未能识别，请在原网页核对')
     if expected is not None and len(questions) != expected:
         reasons.append(f'页面标示 {expected} 题，目前只识别到 {len(questions)} 题')
-    phone = bool(root.all(cls='singleQuesId')) and 'getTheNextQuestion' in markup
+    phone = bool(root.all(cls='singleQuesId')) and _has_mobile_pagination_controls(root)
     # Single-question mobile navigation does not expose a trustworthy total on
     # every platform version. Do not mistake that page for the complete work.
     if phone and expected is None:
@@ -379,6 +396,24 @@ def is_login(markup, url):
 def phone_entry(markup, base):
     match = re.search(r"['\"]((?:/mooc-ans)?/work/phone/doHomeWork\?[^'\"]+)", markup)
     return urljoin(base, html.unescape(match.group(1))) if match else None
+
+
+def phone_report_detail(markup, base):
+    """Extract the read-only `isReport=false` detail link from mobile `作业报告` pages."""
+    match = re.search(
+        r"""['"]((?:/mooc-ans)?/work/(?:phone/)?selectWorkQuestionYiPiYue\?[^'"]*isReport=false[^'"]*)['"]""",
+        markup,
+    )
+    if not match:
+        return None
+    # Script string literals contain raw query params such as `&times=`, which
+    # html.unescape would corrupt into the multiplication sign (`×=`).
+    candidate = match.group(1).replace('&amp;', '&')
+    if candidate.endswith('times='):
+        times_val = str(fields(parse(markup)).get('times') or '0')
+        if times_val.isdigit():
+            candidate += times_val
+    return urljoin(base, candidate)
 
 def explicit_status(text):
     """Map a course-list row's own wording onto the canonical status.

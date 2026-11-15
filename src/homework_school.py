@@ -1,6 +1,7 @@
 from datetime import datetime
 from pathlib import Path
 import re
+import threading
 import time
 from urllib.parse import parse_qs, quote, unquote, urljoin, urlsplit
 
@@ -27,6 +28,7 @@ KNOWN_SCHOOL_SITES = {
 
 SCHOOL_FILE = runtime.DATA_DIR / 'school_config.json'
 _DEFAULT_SCHOOL_FILE = SCHOOL_FILE
+_CONFIG_LOCK = threading.RLock()
 
 DEFAULT_CONFIG = {
     'account': '',
@@ -145,24 +147,27 @@ def _normalize_config(raw):
 
 
 def load_config():
-    path = _config_path()
-    raw = read_json_file(path, {}, corrupted='fallback')
-    return _normalize_config(raw)
+    with _CONFIG_LOCK:
+        path = _config_path()
+        raw = read_json_file(path, {}, corrupted='fallback')
+        return _normalize_config(raw)
 
 
 def save_config(config):
-    path = _config_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    normalized = _normalize_config(config)
-    write_json_file(path, normalized)
-    return normalized
+    with _CONFIG_LOCK:
+        path = _config_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        normalized = _normalize_config(config)
+        write_json_file(path, normalized)
+        return normalized
 
 
 def clear_config():
-    try:
-        _config_path().unlink(missing_ok=True)
-    except OSError:
-        pass
+    with _CONFIG_LOCK:
+        try:
+            _config_path().unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def sync_account(username):
@@ -292,13 +297,14 @@ def note_asset_url(url):
     host = parsed.hostname.lower()
     if _is_chaoxing_domain(host) or _is_reserved_host(host):
         return False
-    cfg = load_config()
-    hosts = list(cfg.get('asset_hosts') or [])
-    if host not in hosts:
-        hosts.append(host)
-        cfg['asset_hosts'] = hosts
-        save_config(cfg)
-        return True
+    with _CONFIG_LOCK:
+        cfg = load_config()
+        hosts = list(cfg.get('asset_hosts') or [])
+        if host not in hosts:
+            hosts.append(host)
+            cfg['asset_hosts'] = hosts
+            save_config(cfg)
+            return True
     return False
 
 
@@ -490,34 +496,89 @@ def _parse_notice_url_and_fid(notice):
     return '', ''
 
 
+def _prefer_https_origin(context, origin, fid=''):
+    parsed = urlsplit(str(origin or '').strip())
+    host = (parsed.hostname or '').lower()
+    if parsed.scheme != 'http' or parsed.port is not None or not host or _is_reserved_host(host):
+        return origin, None
+    https_origin = f'https://{parsed.netloc}'
+    known = KNOWN_SCHOOL_SITES.get(str(fid or ''), {})
+    if known.get('school_origin') == https_origin and known.get('auth_origin'):
+        return https_origin, None
+    if context is not None and getattr(context, 'request', None) is not None:
+        https_res = _probe_school_login_entry(context, https_origin, fid=fid)
+        if https_res[0] or https_res[1] != f'{https_origin}/visit/interaction':
+            return https_origin, https_res
+        http_res = _probe_school_login_entry(context, origin, fid=fid)
+        if http_res[0] or http_res[1] != f'{origin}/visit/interaction':
+            return origin, http_res
+        return https_origin, https_res
+    return origin, None
+
+
 def note_notice_url(url, context=None):
     parsed = urlsplit(str(url or '').strip())
     if not _is_chaoxing_candidate_url(parsed):
         return False
-    origin = f'{parsed.scheme}://{parsed.netloc}'
+    raw_origin = f'{parsed.scheme}://{parsed.netloc}'
+    host = (parsed.hostname or '').lower()
     cfg = load_config()
     fid = ''
     for k, v in parse_qs(parsed.query).items():
         if k.lower() == 'fid' and v and str(v[0]).strip().isdigit():
             fid = str(v[0]).strip()
             break
+    existing_origin = cfg.get('school_origin') or ''
+    existing_host = (urlsplit(existing_origin).hostname or '').lower()
+    if cfg.get('mode') == 'school_site' and existing_host == host:
+        if existing_origin.startswith('https://') or parsed.scheme == 'http':
+            if fid and not cfg.get('fid'):
+                with _CONFIG_LOCK:
+                    latest = load_config()
+                    if fid and not latest.get('fid'):
+                        latest['fid'] = fid
+                        save_config(latest)
+            return False
+    origin, cached_probe = _prefer_https_origin(context, raw_origin, fid=fid or cfg.get('fid') or '')
     if cfg.get('mode') == 'school_site' and cfg.get('school_origin') == origin:
         if fid and not cfg.get('fid'):
-            cfg['fid'] = fid
-            save_config(cfg)
+            with _CONFIG_LOCK:
+                latest = load_config()
+                if fid and not latest.get('fid'):
+                    latest['fid'] = fid
+                    save_config(latest)
         return False
-    a_origin, login_url = _probe_school_login_entry(context, origin, fid=fid or cfg.get('fid') or '')
-    cfg['mode'] = 'school_site'
-    cfg['school_origin'] = origin
-    if a_origin:
-        cfg['auth_origin'] = a_origin
-    if login_url:
-        cfg['login_url'] = login_url
-    if fid and not cfg.get('fid'):
-        cfg['fid'] = fid
-    cfg['asset_hosts'] = _derive_asset_hosts(origin, cfg.get('asset_hosts'))
-    cfg['discovered_at'] = datetime.now().isoformat(timespec='seconds')
-    save_config(cfg)
+    eff_fid = fid or cfg.get('fid') or ''
+    known = KNOWN_SCHOOL_SITES.get(eff_fid, {})
+    if known.get('school_origin') == origin and known.get('auth_origin'):
+        a_origin = known['auth_origin']
+        login_url = f'{a_origin}/login?fid={eff_fid}&refer={quote(origin + "/visit/interaction", safe="")}'
+    elif cached_probe is not None:
+        a_origin, login_url = cached_probe
+    else:
+        a_origin, login_url = _probe_school_login_entry(context, origin, fid=eff_fid)
+    with _CONFIG_LOCK:
+        latest = load_config()
+        latest_origin = latest.get('school_origin') or ''
+        latest_host = (urlsplit(latest_origin).hostname or '').lower()
+        if latest.get('mode') == 'school_site' and latest_host == host and (
+            latest_origin == origin or (latest_origin.startswith('https://') and origin.startswith('http://'))
+        ):
+            if fid and not latest.get('fid'):
+                latest['fid'] = fid
+                save_config(latest)
+            return False
+        latest['mode'] = 'school_site'
+        latest['school_origin'] = origin
+        if a_origin:
+            latest['auth_origin'] = a_origin
+        if login_url:
+            latest['login_url'] = login_url
+        if fid and not latest.get('fid'):
+            latest['fid'] = fid
+        latest['asset_hosts'] = _derive_asset_hosts(origin, latest.get('asset_hosts'))
+        latest['discovered_at'] = datetime.now().isoformat(timespec='seconds')
+        save_config(latest)
     return True
 
 
@@ -630,6 +691,7 @@ def discover_school(context, state=None, username=None):
     cfg['discovered_at'] = datetime.now().isoformat(timespec='seconds')
 
     if candidate_origin:
+        candidate_origin, cached_probe = _prefer_https_origin(context, candidate_origin, fid=fid)
         known = KNOWN_SCHOOL_SITES.get(fid, {})
         if (cfg.get('mode') == 'school_site' and cfg.get('school_origin') == candidate_origin
                 and cfg.get('auth_origin') and cfg.get('login_url') and (not fid or prev_fid == fid)):
@@ -640,6 +702,8 @@ def discover_school(context, state=None, username=None):
         elif known.get('school_origin') == candidate_origin and known.get('auth_origin'):
             a_origin = known['auth_origin']
             login_url = f'{a_origin}/login?fid={fid or FALLBACK_FID}&refer={quote(candidate_origin + "/visit/interaction", safe="")}'
+        elif cached_probe is not None:
+            a_origin, login_url = cached_probe
         else:
             a_origin, login_url = _probe_school_login_entry(context, candidate_origin, fid=fid)
         if not a_origin and known.get('school_origin') == candidate_origin:

@@ -1,16 +1,24 @@
 'use strict';
 /* AI UI uses the existing controls; requests and keys stay in the local backend. */
 window.HomeworkAI = (() => {
-  let config = null, selected = null, prevSelected = null, lastProvRect = null, newProvider = 'openai', settingsNotice = null;
+  const BRANDS = {
+    openai: {cls: 'gpt', glyph: 'G', name: 'GPT'},
+    claude: {cls: 'cla', glyph: 'C', name: 'Claude'},
+    gemini: {cls: 'gem', glyph: '✦', name: 'Gemini'},
+    deepseek: {cls: 'ds', glyph: 'D', name: 'DeepSeek'},
+    custom: {cls: 'cus', glyph: '⚙', name: '自定义'},
+  };
+  let config = null, selected = null, newProvider = 'openai', lastProvRect = null, provObserver = null;
+  let advOpen = false, showKey = false, testStartAt = 0;
+  let shellRefs = null, drawerRefs = null, drawerCloseTimer = 0, prevProvidersWidth = 0;
   const deleteTimers = new Map();
+  const lastTestById = new Map();
   const settling = new Set();
   const settingsDialog = $('#ai-settings-dialog');
 
-  function setConfigStatus(node, text, tone = '') {
-    if (!node) return;
-    node.className = 'ai-config-status' + (tone ? ' ' + tone : '');
-    if (!text) { node.replaceChildren(); return; }
-    node.replaceChildren(el('span', 'st-dot'), document.createTextNode(text));
+  function getTestState(id) {
+    if (!id || id === '__new__') return {state: 'idle', text: '未测试', sub: '测试连接会自动先保存配置，再发送探测请求', latencyMs: null};
+    return lastTestById.get(id) || {state: 'idle', text: '未测试', sub: '测试连接会探测模型响应与延迟', latencyMs: null};
   }
   function syncProvPill(providers, animate) {
     const active = providers?.querySelector('.ai-provider[aria-selected="true"]');
@@ -23,183 +31,616 @@ window.HomeworkAI = (() => {
       providers.style.setProperty('--pw', r.width + 'px');
       providers.style.setProperty('--ph', r.height + 'px');
     };
-    if (animate && lastProvRect && lastProvRect.card === selected) {
+    const canAnimate = animate && lastProvRect && providers.dataset.pillReady === '1';
+    if (canAnimate) {
       providers.classList.add('pill-instant');
       setRect(lastProvRect);
       void providers.offsetWidth;
       providers.classList.remove('pill-instant');
+      setRect(target);
     } else {
       providers.classList.add('pill-instant');
       setRect(target);
       void providers.offsetWidth;
       providers.classList.remove('pill-instant');
     }
-    setRect(target);
-    lastProvRect = {...target, card: selected};
+    providers.dataset.pillReady = '1';
+    lastProvRect = {...target};
   }
   function updateLabel() {
     const current = config?.profiles?.[config.active];
     $('#ai-model-label').textContent = current?.ready ? `${current.name} · ${current.model}` : '未配置';
   }
+  function clearDrawerCloseTimer() {
+    if (drawerCloseTimer) { clearTimeout(drawerCloseTimer); drawerCloseTimer = 0; }
+  }
+  function destroyDrawerDom() {
+    clearDrawerCloseTimer();
+    if (provObserver) { provObserver.disconnect(); provObserver = null; }
+    if (drawerRefs) {
+      drawerRefs.scrim?.remove();
+      drawerRefs.sheet?.remove();
+      drawerRefs = null;
+    }
+    lastProvRect = null;
+    prevProvidersWidth = 0;
+  }
+  function closeDrawer() {
+    if (selected === null) return;
+    selected = null;
+    showKey = false;
+    renderSettings();
+  }
+  function openDrawer(id) {
+    if (selected === id && drawerRefs && !drawerRefs.closing) return;
+    selected = id;
+    if (id === '__new__') newProvider = 'openai';
+    showKey = false;
+    const prov = id === '__new__' ? newProvider : config?.profiles?.[id]?.provider;
+    advOpen = prov === 'custom';
+    renderSettings();
+  }
   async function openSettings() {
     try {
       config = await api('/api/ai/settings');
       selected = null;
-      prevSelected = null;
-      lastProvRect = null;
-      settingsNotice = null;
+      showKey = false;
+      destroyDrawerDom();
+      shellRefs = null;
+      $('#ai-settings-body').replaceChildren();
       renderSettings();
       if (typeof openSheet === 'function') openSheet(settingsDialog);
       else if (!settingsDialog.open) settingsDialog.showModal();
     } catch (e) { toast(e.message, 'error'); }
   }
-  function renderSettings() {
-    const body = $('#ai-settings-body'), editingNew = selected === '__new__';
-    const openingId = selected !== prevSelected ? selected : null;
-    const closingId = prevSelected && prevSelected !== '__new__' && prevSelected !== selected ? prevSelected : null;
-    const prevEditorClone = closingId
-      ? body.querySelector(`.ai-profile-card[data-profile="${CSS.escape(closingId)}"] .ai-inline-editor`)?.cloneNode(true)
-      : null;
-    prevSelected = selected;
-    body.replaceChildren(closeButton(settingsDialog), el('div', 'sheet-eyebrow', 'AI'));
-    const title = el('h2', 'sheet-title', 'AI 设置'); title.id = 'ai-settings-title';
-    body.append(title, el('p', 'ai-settings-subtitle', '保存常用模型，随时切换。'));
-    const library = el('section', 'ai-config-list-page'); library.setAttribute('aria-label', '已保存的 AI 配置');
-    const libraryHead = el('div', 'ai-library-head');
-    libraryHead.append(el('h3', '', `我的配置 · ${Object.keys(config.profiles).length}`));
-    const add = btn('添加配置', 'btn-sm', () => { selected = '__new__'; newProvider = 'openai'; lastProvRect = null; settingsNotice = null; renderSettings(); }, 'plus');
-    add.id = 'ai-add-profile'; add.disabled = S.job.busy;
-    libraryHead.append(add); library.append(libraryHead);
-    const list = el('div', 'ai-config-list');
-    if (editingNew) list.append(profileCard('__new__', null));
-    for (const [id, item] of Object.entries(config.profiles)) list.append(profileCard(id, item));
-    if (!list.children.length) list.append(el('div', 'ai-library-empty', '还没有配置\n添加一个常用模型开始使用'));
-    library.append(list); body.append(library);
-    const providersBar = body.querySelector('.ai-providers');
-    if (providersBar) syncProvPill(providersBar, true);
-    if (openingId) {
-      const openingSlot = body.querySelector(`[data-profile="${CSS.escape(openingId)}"] > .ai-slot`);
-      if (openingSlot) { void openingSlot.offsetHeight; openingSlot.classList.add('open'); }
+
+  function ensureShell() {
+    const body = $('#ai-settings-body');
+    if (shellRefs && shellRefs.wrap.isConnected) return shellRefs;
+    body.replaceChildren();
+    const wrap = el('div', 'a1');
+    wrap.append(closeButton(settingsDialog), el('div', 'sheet-eyebrow', 'AI 模型'));
+    const head = el('div', 'a1-head');
+    const headLeft = el('div', 'a1-head-text');
+    const title = el('h2', 'sheet-title', '模型配置'); title.id = 'ai-settings-title';
+    const sub = el('p', 'a1-sub', '');
+    headLeft.append(title, sub);
+    const addBtn = btn('添加配置', 'btn-primary btn-sm', () => openDrawer('__new__'), 'plus');
+    addBtn.id = 'ai-add-profile';
+    head.append(headLeft, addBtn);
+    wrap.append(head);
+
+    const library = el('section', 'a1-sec');
+    library.setAttribute('aria-label', '已保存的 AI 配置');
+    const grid = el('div', 'a1-grid');
+    const addCard = el('button', 'pcard pcard-add');
+    addCard.type = 'button';
+    addCard.append(icon('plus'), el('strong', '', '新建配置'), el('span', '', '添加 GPT / Claude / Gemini / DeepSeek 或本地接口'));
+    addCard.onclick = () => openDrawer('__new__');
+    grid.append(addCard);
+    library.append(grid);
+    wrap.append(library);
+    body.append(wrap);
+    shellRefs = {body, wrap, sub, addBtn, grid, addCard, cards: new Map()};
+    return shellRefs;
+  }
+
+  function buildCard(id, item, active) {
+    const card = el('article', 'pcard');
+    card.dataset.profile = id;
+    card.onclick = e => {
+      if (e.target.closest('button') || S.job.busy) return;
+      openDrawer(id);
+    };
+    const top = el('div', 'pcard-top');
+    const mark = el('span', 'mark');
+    const statusBadge = el('span');
+    top.append(mark, statusBadge);
+
+    const bodyBox = el('div', 'pcard-meta');
+    const h4 = el('h4');
+    const modelLine = el('p', 'pcard-model');
+    bodyBox.append(h4, modelLine);
+
+    const tags = el('div', 'pcard-tags');
+    const tagProto = el('span', 'ptag');
+    const tagVision = el('span', 'ptag');
+    const tagKey = el('span', 'ptag');
+    tags.append(tagProto, tagVision, tagKey);
+
+    const foot = el('div', 'pcard-foot');
+    const useBtn = btn('使用', 'btn-sm', async e => {
+      e.stopPropagation();
+      useBtn.disabled = true;
+      try {
+        config = await api('/api/ai/settings', {id: card.dataset.profile, activate: true});
+        const cur = config?.profiles?.[card.dataset.profile];
+        updateLabel();
+        toast(`已切换为「${cur?.name || '模型'}」`, 'ok');
+        renderSettings();
+      } catch (err) { toast(err.message, 'error'); useBtn.disabled = false; }
+    });
+    const editBtn = btn('编辑', 'btn-sm btn-ghost', e => { e.stopPropagation(); openDrawer(card.dataset.profile); });
+    const removeBtn = btn('', 'btn-quiet btn-sm icon-only pcard-del', async e => {
+      e.stopPropagation();
+      const pid = card.dataset.profile;
+      const curItem = config?.profiles?.[pid];
+      const key = 'card-' + pid;
+      if (removeBtn.dataset.confirm !== 'yes') {
+        removeBtn.dataset.confirm = 'yes';
+        removeBtn.setAttribute('aria-label', '确认删除 ' + (curItem?.name || ''));
+        removeBtn.replaceChildren(el('span', '', '确认删除'));
+        const timer = setTimeout(() => {
+          if (!removeBtn.isConnected) return;
+          removeBtn.dataset.confirm = '';
+          const latest = config?.profiles?.[pid];
+          removeBtn.setAttribute('aria-label', '删除 ' + (latest?.name || ''));
+          removeBtn.replaceChildren(icon('trash'));
+          deleteTimers.delete(key);
+        }, 3000);
+        deleteTimers.set(key, timer);
+        return;
+      }
+      removeBtn.disabled = true; clearTimeout(deleteTimers.get(key)); deleteTimers.delete(key);
+      try {
+        config = await api('/api/ai/settings', {id: pid, remove: true});
+        if (selected === pid) selected = null;
+        lastTestById.delete(pid);
+        updateLabel();
+        toast('配置已删除', 'ok');
+        renderSettings();
+      } catch (err) { toast(err.message, 'error'); removeBtn.disabled = false; }
+    }, 'trash');
+    removeBtn.title = '删除配置';
+    foot.append(useBtn, editBtn, removeBtn);
+    card.append(top, bodyBox, tags, foot);
+    card._refs = {top, mark, statusBadge, h4, modelLine, tagProto, tagVision, tagKey, foot, useBtn, editBtn, removeBtn};
+    patchCard(card, id, item, active);
+    return card;
+  }
+
+  function patchCard(card, id, item, active) {
+    const r = card._refs;
+    const brand = BRANDS[item.provider] || BRANDS.custom;
+    card.className = 'pcard' + (active ? ' active' : '') + (selected === id ? ' editing' : '');
+    r.mark.className = 'mark ' + brand.cls;
+    r.mark.textContent = brand.glyph;
+    r.statusBadge.className = active ? 'tag-use' : 'tag-idle';
+    r.statusBadge.textContent = active ? '使用中' : brand.name;
+    r.h4.textContent = item.name || brand.name;
+    r.modelLine.textContent = item.model || '未填写模型';
+    r.tagProto.textContent = config.protocols?.[item.protocol] || item.protocol;
+    const supportsVision = item.provider !== 'custom' || item.vision;
+    r.tagVision.className = 'ptag' + (supportsVision ? ' ok' : '');
+    r.tagVision.textContent = supportsVision ? '支持识图' : '仅文字';
+    r.tagKey.textContent = item.has_key ? '已设密钥' : '未设密钥';
+
+    if (active) {
+      if (r.useBtn.parentNode === r.foot) {
+        if (document.activeElement === r.useBtn) r.editBtn.focus({preventScroll: true});
+        r.useBtn.remove();
+      }
+    } else {
+      if (r.useBtn.parentNode !== r.foot) r.foot.prepend(r.useBtn);
+      r.useBtn.setAttribute('aria-label', '使用 ' + item.name);
+      r.useBtn.disabled = S.job.busy || !item.ready;
     }
-    if (closingId && prevEditorClone) {
-      const hostCard = body.querySelector(`.ai-profile-card[data-profile="${CSS.escape(closingId)}"]`);
-      if (hostCard) {
-        if (typeof scrubGhost === 'function') scrubGhost(prevEditorClone);
-        prevEditorClone.classList.remove('ai-inline-editor', 'ai-config-editor');
-        prevEditorClone.querySelectorAll('.ai-inline-editor, .ai-config-editor').forEach(n => n.classList.remove('ai-inline-editor', 'ai-config-editor'));
-        const slot = el('div', 'ai-slot open ai-closing-slot'), inner = el('div');
-        slot.setAttribute('aria-hidden', 'true');
-        inner.append(prevEditorClone);
-        slot.append(inner);
-        hostCard.append(slot);
-        void slot.offsetHeight;
-        slot.classList.remove('open');
-        setTimeout(() => { if (slot.isConnected) slot.remove(); }, 340);
+    r.editBtn.setAttribute('aria-label', '编辑 ' + item.name);
+    r.editBtn.disabled = S.job.busy;
+    if (r.removeBtn.dataset.confirm === 'yes') r.removeBtn.setAttribute('aria-label', '确认删除 ' + item.name);
+    else r.removeBtn.setAttribute('aria-label', '删除 ' + item.name);
+    r.removeBtn.disabled = S.job.busy;
+  }
+
+  function ensureDrawerDom(body) {
+    if (drawerRefs && drawerRefs.sheet.isConnected) {
+      if (drawerRefs.closing) {
+        clearDrawerCloseTimer();
+        drawerRefs.closing = false;
+        drawerRefs.scrim.classList.remove('closing');
+        drawerRefs.sheet.classList.remove('closing');
       }
+      return drawerRefs;
     }
-    function profileCard(id, item) {
-      const expanded = id === selected, card = el('article', (item ? 'ai-profile-card' : 'ai-config-editor') + (expanded ? ' expanded' : '') + (item && id === config.active ? ' active' : ''));
-      card.dataset.profile = id;
-      const head = el('div', 'ai-card-head'), toggle = btn('', 'ai-card-toggle', () => { selected = selected === id ? null : id; lastProvRect = null; settingsNotice = null; renderSettings(); });
-      toggle.disabled = S.job.busy;
-      toggle.dataset.initial = item ? (config.presets[item.provider]?.name || '自定义').slice(0, 1) : '+';
-      const main = el('div', 'ai-card-main');
-      if (item) main.append(el('strong', '', item.name), el('span', '', `${config.presets[item.provider]?.name || '自定义'} · ${item.model || '未填写模型'}`));
-      else main.append(el('strong', '', '新建 AI 配置'), el('span', '', '填写后保存并使用'));
-      toggle.setAttribute('aria-label', item ? '编辑 ' + item.name : '编辑新配置');
-      toggle.setAttribute('aria-expanded', String(expanded));
-      if (expanded) toggle.setAttribute('aria-controls', 'ai-profile-editor');
-      toggle.title = expanded ? '收起配置' : '展开编辑配置';
-      toggle.append(main, icon('chevron', 'ai-card-chevron')); head.append(toggle);
-      const actions = el('div', 'ai-card-actions');
-      if (item && id === config.active) actions.append(el('span', 'ai-active-badge', '使用中'));
-      else if (item) {
-        const use = btn('使用', 'btn-sm', async () => {
-          use.disabled = true;
-          try { config = await api('/api/ai/settings', {id, activate: true}); updateLabel(); settingsNotice = {text: '已切换使用配置', tone: 'ok'}; renderSettings(); }
-          catch (e) { toast(e.message, 'error'); use.disabled = false; }
-        });
-        use.setAttribute('aria-label', '使用 ' + item.name);
-        use.disabled = S.job.busy || !item.ready; actions.append(use);
-      }
-      if (item) {
-        const remove = btn('', 'btn-quiet icon-only ai-delete', async () => {
-          if (remove.dataset.confirm !== 'yes') {
-            remove.dataset.confirm = 'yes'; remove.replaceChildren(el('span', '', '确认删除'));
-            const timer = setTimeout(() => { remove.dataset.confirm = ''; remove.replaceChildren(icon('trash')); deleteTimers.delete(id); }, 3000);
-            deleteTimers.set(id, timer); return;
-          }
-          remove.disabled = true; clearTimeout(deleteTimers.get(id)); deleteTimers.delete(id);
-          try { config = await api('/api/ai/settings', {id, remove: true}); selected = null; updateLabel(); settingsNotice = {text: '配置已删除', tone: 'ok'}; renderSettings(); }
-          catch (e) { toast(e.message, 'error'); remove.disabled = false; }
-        }, 'trash');
-        remove.setAttribute('aria-label', '删除 ' + item.name); remove.title = '删除配置'; actions.append(remove);
-      } else {
-        actions.append(btn('取消', 'btn-sm', () => { selected = null; renderSettings(); }));
-      }
-      head.append(actions); card.append(head);
-      if (expanded) {
-        const slot = el('div', 'ai-slot' + (openingId === id ? '' : ' open')), inner = el('div');
-        inner.append(profileEditor(id, item));
-        slot.append(inner);
-        card.append(slot);
-      }
-      return card;
+    clearDrawerCloseTimer();
+    const scrim = el('div', 'scrim on');
+    scrim.onclick = () => { if (!S.job.busy) closeDrawer(); };
+
+    const sheet = el('section', 'side-sheet on');
+    sheet.id = 'ai-profile-editor';
+    sheet.setAttribute('role', 'region');
+
+    const shHead = el('div', 'sh-head');
+    const shTitle = el('div', 'sh-title');
+    const shHeading = el('h3', '', '');
+    const shBrand = el('small', '', '');
+    shTitle.append(shHeading, shBrand);
+    const shClose = btn('', 'btn-quiet btn-sm icon-only sh-close', closeDrawer, 'x');
+    shClose.setAttribute('aria-label', '关闭编辑抽屉');
+    shHead.append(shTitle, shClose);
+
+    const form = el('form', 'sh-form');
+    form.autocomplete = 'off';
+    const shBody = el('div', 'sh-body');
+
+    const providers = el('div', 'ai-providers prov-seg has-pill');
+    providers.setAttribute('role', 'tablist');
+    providers.setAttribute('aria-label', 'AI 平台');
+    providers.append(el('span', 'prov-pill'));
+    const tabButtons = new Map();
+    for (const [providerId, item] of Object.entries(config.presets)) {
+      const tab = btn(item.name, 'ai-provider', () => {
+        if (drawerRefs?.saved || S.job.busy || newProvider === providerId) return;
+        newProvider = providerId;
+        advOpen = providerId === 'custom';
+        patchDrawer(selected, null, true);
+      });
+      tab.dataset.provider = providerId;
+      tab.setAttribute('role', 'tab');
+      tab.setAttribute('aria-selected', 'false');
+      providers.append(tab);
+      tabButtons.set(providerId, tab);
     }
-    function profileEditor(id, saved) {
-      const provider = saved?.provider || newProvider;
-      const current = {...(saved || {...config.presets[provider], model: '', has_key: false, name: ''})};
-      const editor = el('div', 'ai-inline-editor'); editor.id = 'ai-profile-editor';
-      const providers = el('div', 'ai-providers has-pill'); providers.setAttribute('role', 'tablist'); providers.setAttribute('aria-label', 'AI 平台');
-      providers.append(el('span', 'prov-pill'));
-      for (const [providerId, item] of Object.entries(config.presets)) {
-        const tab = btn(item.name, 'ai-provider', () => { newProvider = providerId; renderSettings(); });
-        tab.setAttribute('role', 'tab'); tab.setAttribute('aria-selected', String(providerId === provider)); tab.disabled = !!saved || S.job.busy; providers.append(tab);
+    shBody.append(providers);
+
+    const field = (label, input, idName, extra = '') => {
+      input.id = idName;
+      const row = el('label', 'form-field ' + extra);
+      row.append(el('span', '', label), input);
+      return row;
+    };
+
+    const name = el('input', 'input');
+    name.maxLength = 80; name.placeholder = '例如：日常作答';
+    const model = el('input', 'input');
+    model.required = true; model.placeholder = '服务商提供的模型名称';
+    const row2 = el('div', 'sh-row2');
+    row2.append(field('配置名称', name, 'ai-profile-name'), field('模型名称', model, 'ai-model'));
+    shBody.append(row2);
+
+    const secret = el('input', 'input');
+    secret.id = 'ai-api-key';
+    secret.type = 'password';
+    secret.autocomplete = 'new-password';
+    secret.spellcheck = false;
+    const eyeBtn = btn('', 'inp-eye', () => {
+      showKey = !showKey;
+      secret.type = showKey ? 'text' : 'password';
+      eyeBtn.setAttribute('aria-label', showKey ? '隐藏密钥' : '显示密钥');
+      eyeBtn.setAttribute('aria-pressed', String(showKey));
+    }, 'eye');
+    const inpWrap = el('div', 'inp-wrap');
+    inpWrap.append(secret, eyeBtn);
+    const keyField = el('div', 'form-field');
+    const keyLbl = el('label', '', 'API 密钥'); keyLbl.setAttribute('for', 'ai-api-key');
+    keyField.append(keyLbl, inpWrap);
+    shBody.append(keyField);
+
+    const vision = el('input');
+    vision.id = 'ai-vision';
+    vision.type = 'checkbox';
+    const visionRow = el('label', 'ai-checkbox');
+    visionRow.append(vision, el('span', '', '模型支持识图（可读取题目截图）'));
+
+    const protocol = el('select', 'input');
+    for (const [protocolId, label] of Object.entries(config.protocols)) {
+      const option = el('option', '', label);
+      option.value = protocolId;
+      protocol.append(option);
+    }
+    const address = el('input', 'input');
+    address.type = 'url'; address.required = true;
+    address.placeholder = 'https://example.com/v1';
+
+    const advWrap = el('div', 'adv');
+    const advHead = el('button', 'adv-head');
+    advHead.type = 'button';
+    const advSum = el('span', 'adv-sum', '');
+    advHead.append(el('strong', '', '高级选项'), advSum, icon('chevron', 'adv-chev'));
+    const advBody = el('div', 'collapse');
+    const advInner = el('div', 'adv-inner');
+    advInner.append(field('接口类型', protocol, 'ai-protocol'), field('接口地址', address, 'ai-base-url'));
+    advBody.append(advInner);
+    advHead.onclick = () => {
+      advOpen = !advOpen;
+      advWrap.classList.toggle('open', advOpen);
+      advHead.setAttribute('aria-expanded', String(advOpen));
+    };
+    advWrap.append(advHead, advBody);
+    shBody.append(advWrap);
+
+    const conn = el('div', 'conn');
+    const connIc = el('span', 'conn-ic');
+    const connInfo = el('div', 'conn-info');
+    const connMsg = el('strong', 'conn-msg', '');
+    connMsg.id = 'ai-config-message';
+    connMsg.setAttribute('role', 'status');
+    const connSub = el('p', 'conn-sub', '');
+    connInfo.append(connMsg, connSub);
+    const meters = el('div', 'meters');
+    const latMeter = el('div', 'meter'), latValEl = el('b', '', '--');
+    latMeter.append(el('small', '', '延迟'), latValEl);
+    const visMeter = el('div', 'meter'), visValEl = el('b', '', '支持');
+    visMeter.append(el('small', '', '识图'), visValEl);
+    meters.append(latMeter, visMeter);
+    vision.onchange = () => { visValEl.textContent = vision.checked ? '支持' : '仅文字'; };
+    conn.append(connIc, connInfo, meters);
+    shBody.append(conn);
+
+    const errBox = el('p', 'settings-error');
+    errBox.setAttribute('role', 'alert');
+    shBody.append(errBox);
+
+    const shFoot = el('div', 'sh-foot');
+    const delWrap = el('div', 'sh-foot-l');
+    const shDel = btn('删除', 'btn-sm btn-quiet del', async () => {
+      const targetId = drawerRefs?.sessionKey;
+      if (!targetId || targetId === '__new__') return;
+      const k = 'drawer-' + targetId;
+      if (shDel.dataset.confirm !== 'yes') {
+        shDel.dataset.confirm = 'yes';
+        shDel.textContent = '确认删除';
+        const timer = setTimeout(() => {
+          if (!shDel.isConnected) return;
+          shDel.dataset.confirm = '';
+          shDel.textContent = '删除';
+          deleteTimers.delete(k);
+        }, 3000);
+        deleteTimers.set(k, timer);
+        return;
       }
-      editor.append(providers);
-      const form = el('form', 'ai-inline-form'); form.autocomplete = 'off';
-      const field = (label, input, idName, extra = '') => { input.id = idName; const row = el('label', 'form-field ' + extra); row.append(el('span', '', label), input); return row; };
-      const name = el('input', 'input'); name.maxLength = 80; name.value = current.name || ''; name.placeholder = '例如：日常作答';
-      const model = el('input', 'input'); model.required = true; model.value = current.model || ''; model.placeholder = '服务商提供的模型名称';
-      const secret = el('input', 'input'); secret.type = 'password'; secret.autocomplete = 'new-password'; secret.spellcheck = false; secret.placeholder = current.has_key ? '已保存，留空不修改' : provider === 'custom' ? '本机服务可留空' : '填写 API 密钥'; secret.required = !current.has_key && provider !== 'custom';
-      const protocol = el('select', 'input'); for (const [protocolId, label] of Object.entries(config.protocols)) { const option = el('option', '', label); option.value = protocolId; protocol.append(option); } protocol.value = current.protocol; protocol.disabled = provider !== 'custom';
-      const address = el('input', 'input'); address.type = 'url'; address.required = true; address.value = current.base_url || ''; address.readOnly = provider !== 'custom'; address.placeholder = 'https://example.com/v1';
-      const grid = el('div', 'ai-form-grid'); grid.append(field('模型名称', model, 'ai-model'), field('API 密钥', secret, 'ai-api-key'), field('配置名称', name, 'ai-profile-name'), field('接口类型', protocol, 'ai-protocol'), field('接口地址', address, 'ai-base-url', 'ai-form-wide')); form.append(grid);
-      // 四家固定平台都能识图；只有自定义接口需要自行声明
-      const vision = el('input'); vision.type = 'checkbox'; vision.checked = provider !== 'custom' || !!current.vision;
-      if (provider === 'custom') { const visionRow = el('label', 'ai-checkbox'); visionRow.append(vision, el('span', '', '模型支持识图')); form.append(visionRow); }
-      const note = el('div', 'ai-note'); note.append(icon('info'), el('span', '', '密钥只保存在本机，测试连接会调用你填写的接口。')); form.append(note);
-      const status = el('p', 'ai-config-status'); status.id = 'ai-config-message'; status.setAttribute('role', 'status');
-      if (settingsNotice) setConfigStatus(status, settingsNotice.text, settingsNotice.tone);
-      form.append(status);
-      const validateWithShake = () => {
-        if (form.checkValidity()) return true;
-        form.querySelectorAll('.form-field').forEach(f => {
-          const inp = f.querySelector('input, select');
-          if (inp && !inp.validity.valid) { f.classList.remove('shake'); void f.offsetWidth; f.classList.add('shake'); }
-        });
-        return form.reportValidity();
+      shDel.disabled = true; clearTimeout(deleteTimers.get(k)); deleteTimers.delete(k);
+      try {
+        config = await api('/api/ai/settings', {id: targetId, remove: true});
+        lastTestById.delete(targetId);
+        selected = null;
+        updateLabel();
+        toast('配置已删除', 'ok');
+        renderSettings();
+      } catch (e) { errBox.textContent = e.message; shDel.disabled = false; }
+    });
+    const shActs = el('div', 'sh-foot-r');
+    const testBtn = btn('测试连接', 'btn', async () => {
+      if (!validateWithShake() || !(await persist(false))) return;
+      testStartAt = Date.now();
+      lastTestById.set(selected, {state: 'testing', text: '正在测试连接…', sub: '已保存配置，正在发送探测请求', latencyMs: null});
+      renderSettings();
+      await startAction('ai-test');
+    });
+    const saveBtn = btn('保存并使用', 'btn-primary');
+    saveBtn.type = 'submit';
+    shActs.append(testBtn, saveBtn);
+    shFoot.append(delWrap, shActs);
+
+    form.append(shBody, shFoot);
+    sheet.append(shHead, form);
+
+    const validateWithShake = () => {
+      if (form.checkValidity()) return true;
+      if (!advOpen && ((address.validity && !address.validity.valid) || (protocol.validity && !protocol.validity.valid))) {
+        advOpen = true;
+        advWrap.classList.add('open');
+        advHead.setAttribute('aria-expanded', 'true');
+      }
+      form.querySelectorAll('.form-field').forEach(f => {
+        const inp = f.querySelector('input, select');
+        if (inp && !inp.validity.valid) { f.classList.remove('shake'); void f.offsetWidth; f.classList.add('shake'); }
+      });
+      return form.reportValidity();
+    };
+
+    async function persist(closeOnSave = true) {
+      saveBtn.disabled = testBtn.disabled = true;
+      errBox.textContent = '';
+      const activeSaved = drawerRefs?.saved || null;
+      const activeId = drawerRefs?.sessionKey;
+      const activeProvider = activeSaved?.provider || newProvider;
+      const payload = {
+        provider: activeProvider,
+        name: name.value.trim() || model.value.trim(),
+        protocol: protocol.value,
+        base_url: address.value.trim(),
+        model: model.value.trim(),
+        api_key: secret.value.trim(),
+        vision: vision.checked,
+        ...(activeSaved && activeId && activeId !== '__new__' ? {id: activeId} : {create: true}),
       };
-      const actions = el('div', 'ai-form-actions'), test = btn('测试连接', '', async () => {
-        if (!validateWithShake() || !(await persist())) return;
-        settingsNotice = {text: '正在测试连接…', tone: 'testing'}; renderSettings();
-        await startAction('ai-test');
-      }), save = btn('保存并使用', 'btn-primary'); save.type = 'submit';
-      actions.append(test, save); form.append(actions); editor.append(form);
-      async function persist() {
-        save.disabled = test.disabled = true; settingsNotice = null;
-        const payload = {provider, name: name.value.trim() || model.value.trim(), protocol: protocol.value, base_url: address.value.trim(), model: model.value.trim(), api_key: secret.value.trim(), vision: vision.checked, ...(saved ? {id} : {create: true})};
-        secret.value = '';
-        try { config = await api('/api/ai/settings', payload); selected = config.active; updateLabel(); settingsNotice = {text: '已保存', tone: 'ok'}; renderSettings(); return true; }
-        catch (e) { settingsNotice = {text: e.message, tone: 'error'}; setConfigStatus(status, e.message, 'error'); return false; }
-        finally { payload.api_key = ''; save.disabled = test.disabled = false; }
+      secret.value = '';
+      try {
+        config = await api('/api/ai/settings', payload);
+        if (closeOnSave) {
+          selected = null;
+        } else {
+          selected = config.active;
+          if (drawerRefs) drawerRefs.sessionKey = selected;
+        }
+        updateLabel();
+        if (closeOnSave) toast(`已保存并启用「${config.profiles[config.active]?.name || '模型'}」`, 'ok');
+        renderSettings();
+        return true;
+      } catch (e) {
+        errBox.textContent = e.message;
+        return false;
+      } finally {
+        payload.api_key = '';
+        saveBtn.disabled = testBtn.disabled = false;
       }
-      form.onsubmit = async e => { e.preventDefault(); if (validateWithShake()) await persist(); };
-      if (S.job.busy) form.querySelectorAll('button, input, select').forEach(control => control.disabled = true);
-      return editor;
+    }
+
+    form.onsubmit = async e => { e.preventDefault(); if (validateWithShake()) await persist(true); };
+
+    body.append(scrim, sheet);
+    prevProvidersWidth = providers.clientWidth;
+    if (window.ResizeObserver) {
+      if (provObserver) provObserver.disconnect();
+      provObserver = new ResizeObserver(() => {
+        const w = providers.clientWidth;
+        if (!w || w === prevProvidersWidth) return;
+        prevProvidersWidth = w;
+        syncProvPill(providers, false);
+      });
+      provObserver.observe(providers);
+    }
+
+    drawerRefs = {
+      scrim, sheet, shHeading, shBrand, shClose, providers, tabButtons, shBody,
+      name, model, keyField, secret, eyeBtn, visionRow, vision,
+      protocol, address, advWrap, advHead, advSum,
+      conn, connIc, connIconName: '', connMsg, connSub, latValEl, visValEl,
+      errBox, delWrap, shDel, testBtn, saveBtn,
+      sessionKey: null, provider: null, saved: null, closing: false,
+    };
+    return drawerRefs;
+  }
+
+  function patchDrawer(id, saved, fromTabSwitch = false) {
+    const d = drawerRefs;
+    if (!d) return;
+    const prevKey = d.sessionKey;
+    const prevProv = d.provider;
+    const sameSession = prevKey === id;
+    const provider = saved?.provider || newProvider;
+    const current = {...(saved || {...config.presets[provider], model: '', has_key: false, name: ''})};
+
+    d.saved = saved;
+    d.sheet.setAttribute('aria-label', saved ? `编辑 ${saved.name}` : '新建 AI 配置');
+    d.shHeading.textContent = saved ? saved.name : '新建模型配置';
+    d.shBrand.textContent = BRANDS[provider]?.name || '自定义接口';
+
+    for (const [providerId, tab] of d.tabButtons.entries()) {
+      tab.setAttribute('aria-selected', String(providerId === provider));
+      tab.disabled = !!saved || S.job.busy;
+    }
+
+    if (!sameSession) {
+      d.name.value = current.name || '';
+      d.model.value = current.model || '';
+      d.secret.value = '';
+      d.vision.checked = provider !== 'custom' || !!current.vision;
+      d.protocol.value = current.protocol;
+      d.address.value = current.base_url || '';
+      d.errBox.textContent = '';
+      d.shDel.dataset.confirm = '';
+      d.shDel.textContent = '删除';
+    } else if (fromTabSwitch && prevProv !== provider) {
+      d.vision.checked = provider !== 'custom' || !!current.vision;
+      d.protocol.value = current.protocol;
+      d.address.value = current.base_url || '';
+    }
+
+    d.secret.type = showKey ? 'text' : 'password';
+    d.secret.placeholder = current.has_key ? '已保存，留空不修改' : provider === 'custom' ? '本机服务可留空' : '填写 API 密钥';
+    d.secret.required = !current.has_key && provider !== 'custom';
+    d.eyeBtn.setAttribute('aria-label', showKey ? '隐藏密钥' : '显示密钥');
+    d.eyeBtn.setAttribute('aria-pressed', String(showKey));
+
+    if (provider === 'custom') {
+      if (d.visionRow.parentNode !== d.shBody) d.keyField.after(d.visionRow);
+    } else if (d.visionRow.parentNode === d.shBody) {
+      d.visionRow.remove();
+    }
+
+    d.protocol.disabled = provider !== 'custom';
+    d.address.readOnly = provider !== 'custom';
+    d.advWrap.classList.toggle('open', advOpen);
+    d.advHead.setAttribute('aria-expanded', String(advOpen));
+    const protoVal = d.protocol.value || current.protocol;
+    const hostPreview = (d.address.value || current.base_url || '').replace(/^https?:\/\//, '').split('/')[0] || '自定义地址';
+    d.advSum.textContent = `${config.protocols?.[protoVal] || protoVal} · ${hostPreview}`;
+
+    const tst = getTestState(id);
+    const isTesting = (S.job.busy && S.job.action === 'ai-test') || tst.state === 'testing';
+    d.conn.className = 'conn' + (isTesting ? ' testing' : tst.state === 'ok' ? ' ok' : tst.state === 'error' ? ' err' : '');
+    const iconName = isTesting ? 'loader' : tst.state === 'ok' ? 'check' : tst.state === 'error' ? 'alert' : 'sparkle';
+    if (d.connIconName !== iconName) {
+      d.connIconName = iconName;
+      d.connIc.replaceChildren(icon(iconName));
+    }
+    d.connMsg.textContent = isTesting ? '正在测试连接…' : tst.text;
+    d.connSub.textContent = isTesting ? '已保存配置，正在向模型发送探测请求…' : tst.sub;
+    d.latValEl.textContent = isTesting ? '…' : tst.latencyMs != null ? `${tst.latencyMs}ms` : '--';
+    d.visValEl.textContent = d.vision.checked ? '支持' : '仅文字';
+
+    if (saved) {
+      if (d.shDel.parentNode !== d.delWrap) d.delWrap.append(d.shDel);
+      d.shDel.disabled = S.job.busy;
+    } else if (d.shDel.parentNode === d.delWrap) {
+      d.shDel.remove();
+    }
+
+    d.sheet.querySelectorAll('button, input, select').forEach(control => {
+      if (control.classList.contains('ai-provider')) {
+        control.disabled = !!saved || S.job.busy;
+      } else if (control === d.protocol) {
+        control.disabled = provider !== 'custom' || S.job.busy;
+      } else {
+        control.disabled = S.job.busy;
+      }
+    });
+
+    d.sessionKey = id;
+    d.provider = provider;
+    syncProvPill(d.providers, (fromTabSwitch || sameSession) && prevProv !== provider);
+  }
+
+  function renderSettings() {
+    if (!config) return;
+    const s = ensureShell();
+    const profiles = Object.entries(config?.profiles || {});
+    s.sub.textContent = `集中管理多个模型与接口（${profiles.length} 项）· 密钥仅存本机。`;
+    s.addBtn.disabled = S.job.busy;
+    s.addCard.disabled = S.job.busy;
+
+    const prevScroll = s.wrap.scrollTop;
+    const seenIds = new Set();
+    let idx = 0;
+    for (const [id, item] of profiles) {
+      seenIds.add(id);
+      const active = id === config.active;
+      let card = s.cards.get(id);
+      if (card) patchCard(card, id, item, active);
+      else { card = buildCard(id, item, active); s.cards.set(id, card); }
+      const cursor = s.grid.children[idx];
+      if (card !== cursor) s.grid.insertBefore(card, cursor || s.addCard);
+      idx++;
+    }
+    for (const [id, card] of s.cards.entries()) {
+      if (!seenIds.has(id)) { card.remove(); s.cards.delete(id); }
+    }
+    if (s.wrap.scrollTop !== prevScroll) s.wrap.scrollTop = prevScroll;
+
+    if (selected !== null) {
+      const saved = selected === '__new__' ? null : config?.profiles?.[selected] || null;
+      if (selected !== '__new__' && !saved) {
+        selected = null;
+      } else {
+        ensureDrawerDom(s.body);
+        patchDrawer(selected, saved, false);
+        return;
+      }
+    }
+    if (drawerRefs && !drawerRefs.closing) {
+      if (!settingsDialog.open || (typeof REDUCED_MOTION === 'function' && REDUCED_MOTION())) {
+        destroyDrawerDom();
+      } else {
+        drawerRefs.closing = true;
+        drawerRefs.sessionKey = null;
+        drawerRefs.saved = null;
+        if (provObserver) { provObserver.disconnect(); provObserver = null; }
+        drawerRefs.scrim.classList.add('closing');
+        drawerRefs.sheet.classList.add('closing');
+        drawerCloseTimer = setTimeout(destroyDrawerDom, 155);
+      }
     }
   }
-  settingsDialog.addEventListener('close', () => { selected = null; prevSelected = null; lastProvRect = null; settingsNotice = null; const key = $('#ai-api-key'); if (key) key.value = ''; });
+  settingsDialog.addEventListener('cancel', e => {
+    if (selected !== null) { e.preventDefault(); closeDrawer(); }
+  });
+  settingsDialog.addEventListener('close', () => {
+    selected = null; lastProvRect = null; showKey = false;
+    if (provObserver) { provObserver.disconnect(); provObserver = null; }
+    const key = $('#ai-api-key'); if (key) key.value = '';
+  });
 
   function taskButton(r) {
     if (!r || r.group === 'history') return null;
@@ -297,13 +738,19 @@ window.HomeworkAI = (() => {
 
   async function jobDone(job) {
     if (job.action === 'ai-test') {
-      const message = $('#ai-config-message');
-      settingsNotice = {text: job.message, tone: job.result?.error ? 'error' : 'ok'};
-      if (message) setConfigStatus(message, job.message, settingsNotice.tone);
-      if (settingsDialog.open) {
-        renderSettings();
-        setConfigStatus($('#ai-config-message'), job.message, settingsNotice.tone);
-      } else toast(job.message, job.result?.error ? 'error' : '');
+      const targetId = selected && selected !== '__new__' ? selected : config?.active;
+      const failed = !!job.result?.error;
+      const latency = job.result?.latency_ms ?? (testStartAt ? Math.max(1, Date.now() - testStartAt) : null);
+      if (targetId) {
+        lastTestById.set(targetId, {
+          state: failed ? 'error' : 'ok',
+          text: job.message || (failed ? '连接失败' : '连接成功'),
+          sub: failed ? '请检查 API 密钥、模型名称或接口地址' : '模型返回格式正确 · 已就绪可用于作答',
+          latencyMs: latency,
+        });
+      }
+      if (settingsDialog.open) renderSettings();
+      else toast(job.message, failed ? 'error' : 'ok');
       return;
     }
     const key = canonicalKey(job.result?.key || job.key);
@@ -347,10 +794,16 @@ window.HomeworkAI = (() => {
     if (!dialog.open) dialog.showModal();
   }
 
+  settingsDialog.addEventListener('close', () => {
+    selected = null;
+    showKey = false;
+    destroyDrawerDom();
+  });
   $('#ai-settings-button').onclick = () => { closeAccountMenu(); openSettings(); };
   api('/api/ai/settings').then(value => { config = value; updateLabel(); if (record()) renderDock(record()); }).catch(() => {});
   function jobChanged(previous, next) {
     if (previous.busy && previous.action === 'ai' && !next.busy && next.action === 'ai') settling.add(canonicalKey(next.key));
+    if (previous.busy !== next.busy && settingsDialog.open && config) renderSettings();
   }
   return {openSettings, taskButton, templateCard, lockInputs, jobDone, jobChanged};
 })();

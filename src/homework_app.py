@@ -15,6 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import homework_engine as backend
 import homework_auth
+import homework_accounts
 import homework_workspace as workspace
 import homework_retention as retention
 import homework_ai
@@ -88,14 +89,72 @@ def reminder_slot(now, value):
         return f'{now:%Y-%m-%d}-{value}'
     return None
 
-def next_reminder_at(now, times):
+def normalize_reminder_rule(value):
+    if value is None:
+        return {'days': [1, 2, 3, 4, 5, 6, 7], 'skip_complete': True, 'quiet': '', 'lead_hours': [24], 'auto_refresh': False, 'notify_style': 'center'}
+    if not isinstance(value, dict):
+        raise ValueError('提醒规则格式不正确')
+    raw_days = value.get('days', [1, 2, 3, 4, 5, 6, 7])
+    if not isinstance(raw_days, (list, tuple)) or not raw_days:
+        raise ValueError('重复日期格式不正确')
+    days = sorted({int(d) for d in raw_days})
+    if any(d < 1 or d > 7 for d in days):
+        raise ValueError('重复日期范围应为 1-7')
+    quiet = (value.get('quiet') or '').strip()
+    if quiet:
+        parts = quiet.split('-', 1)
+        if len(parts) != 2:
+            raise ValueError('免打扰时段格式不正确')
+        for part in parts:
+            if len(part) != 5 or part[2] != ':' or not part[:2].isdigit() or not part[3:].isdigit():
+                raise ValueError('免打扰时段格式不正确')
+            h, m = int(part[:2]), int(part[3:])
+            if not (0 <= h <= 23 and 0 <= m <= 59):
+                raise ValueError('免打扰时段格式不正确')
+    raw_leads = value.get('lead_hours', [24])
+    if not isinstance(raw_leads, (list, tuple)):
+        raise ValueError('加急提醒时间格式不正确')
+    lead_hours = sorted({int(h) for h in raw_leads if int(h) in (24, 6, 2)}, reverse=True)
+    notify_style = 'banner' if value.get('notify_style') == 'banner' else 'center'
+    return {
+        'days': days,
+        'skip_complete': bool(value.get('skip_complete', True)),
+        'quiet': quiet,
+        'lead_hours': lead_hours,
+        'auto_refresh': bool(value.get('auto_refresh', False)),
+        'notify_style': notify_style,
+    }
+
+def normalize_reminder_rules(value, allowed_times):
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError('提醒规则格式不正确')
+    allowed = set(allowed_times)
+    return {t: normalize_reminder_rule(raw) for t, raw in value.items() if t in allowed}
+
+def in_quiet_window(now, quiet):
+    if not quiet or '-' not in quiet:
+        return False
+    a, b = quiet.split('-', 1)
+    sh, sm = reminder_clock(a)
+    eh, em = reminder_clock(b)
+    cur = now.hour * 60 + now.minute
+    start, end = sh * 60 + sm, eh * 60 + em
+    if start == end:
+        return False
+    return (start <= cur < end) if start < end else (cur >= start or cur < end)
+
+def next_reminder_at(now, times, rules=None):
     candidates = []
     for value in times:
         hour, minute = reminder_clock(value)
-        candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        if candidate <= now:
-            candidate += timedelta(days=1)
-        candidates.append(candidate)
+        days = set((rules or {}).get(value, {}).get('days') or [1, 2, 3, 4, 5, 6, 7])
+        for offset in range(8):
+            candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0) + timedelta(days=offset)
+            if candidate > now and candidate.isoweekday() in days:
+                candidates.append(candidate)
+                break
     return min(candidates) if candidates else None
 
 def reminder_snapshot():
@@ -103,20 +162,25 @@ def reminder_snapshot():
         current = settings()
         enabled = current.get('reminder_enabled', True) is not False
         times = normalize_reminder_times(current.get('reminder_times'))
+        rules = normalize_reminder_rules(current.get('reminder_rules'), times)
     now = datetime.now()
-    upcoming = next_reminder_at(now, times) if enabled else None
-    return {'enabled': enabled, 'times': times, 'max_times': MAX_REMINDER_TIMES,
+    upcoming = next_reminder_at(now, times, rules) if enabled else None
+    return {'enabled': enabled, 'times': times, 'rules': rules, 'max_times': MAX_REMINDER_TIMES,
             'next_check': shared.iso_timestamp(upcoming, timespec='minutes') if upcoming else None}
 
-def set_reminder(enabled, times=None):
+def set_reminder(enabled, times=None, rules=None):
     validated_times = normalize_reminder_times(times) if times is not None else None
     with SETTINGS_LOCK:
         current = settings()
+        current_times = validated_times if validated_times is not None else normalize_reminder_times(current.get('reminder_times'))
+        validated_rules = normalize_reminder_rules(rules, current_times) if rules is not None else normalize_reminder_rules(current.get('reminder_rules'), current_times)
         current['reminder_enabled'] = bool(enabled)
         if validated_times is not None:
             current['reminder_times'] = validated_times
         elif 'reminder_times' not in current:
             current['reminder_times'] = list(DEFAULT_REMINDER_TIMES)
+        if rules is not None or validated_times is not None:
+            current['reminder_rules'] = validated_rules
         # SETTINGS_LOCK serializes this independent file; using the assignment
         # writer lock here can hold up reminders during refresh or autosave.
         shared.write_json_file(SETTINGS_FILE, current)
@@ -204,10 +268,10 @@ def reminder_message(records, now=None):
         body.append(f'还有 {total - len(shown)} 项，打开助手查看')
     return '作业提醒', body
 
-def show_reminder(records):
+def show_reminder(records, persistent=True):
     title, body = reminder_message(records)
-    # Keep the reminder in Notification Center without a sticky screen banner.
-    return backend.notify(title, body, persistent=True)
+    # Keep the reminder in Notification Center without a sticky screen banner unless configured.
+    return backend.notify(title, body, persistent=bool(persistent))
 
 def reminder_preview():
     records = reminder_records()
@@ -236,7 +300,25 @@ def auth_snapshot():
                 snapshot['school_name'] = school_name
         except Exception:
             pass
+    accounts = homework_accounts.public_accounts()
+    snapshot['active_account_id'] = accounts['active_id']
+    snapshot['accounts'] = accounts['accounts']
+    active_acct = next((item for item in accounts['accounts'] if item.get('id') == accounts['active_id']), None)
+    if active_acct is not None:
+        snapshot['account_label'] = active_acct.get('label') or ''
+        snapshot['account_alias'] = active_acct.get('alias') or ''
     return snapshot
+
+
+def _probe_auth_async():
+    try:
+        with JOB_LOCK:
+            if JOB['busy']:
+                return
+        res = homework_auth.status(restore=False)
+        set_auth(res)
+    except Exception:
+        set_auth({'logged_in': False, 'sites': {k: False for k in homework_auth.SITES}})
 
 def set_auth(value):
     with AUTH_LOCK:
@@ -260,6 +342,7 @@ def start_job(action, key=None, credentials=None):
             return False
         JOB.update(busy=True, action=action, key=key, message="正在处理…", result=None)
     def run():
+        preserve_prev_auth = False
         try:
             if action == "refresh":
                 code = backend.check_once(headless=True, force_key=key, on_auth=set_auth)
@@ -267,10 +350,33 @@ def start_job(action, key=None, credentials=None):
                 result = {"message": ("部分信息未更新" if warnings else "作业已更新") if code == 0 else
                           (warnings[0] if warnings else "刷新失败，请重试"), "error": code != 0}
             elif action == "login":
-                set_auth(homework_auth.status(**credentials, progress=progress, on_state=set_auth))
-                if auth_snapshot()['state'] != 'logged_in':
-                    raise ValueError('登录尚未完成，请重试')
-                result = {"message": "作业通已登录，两个站点的登录状态均已确认"}
+                prep = None
+                auth_creds = dict(credentials or {})
+                auth_creds.pop('add_account', None)
+                has_alias = 'alias' in auth_creds
+                login_alias = auth_creds.pop('alias', None)
+                uname = (auth_creds.get('username') or '').strip()
+                if auth_creds.get('restore') is True and 'password' not in auth_creds:
+                    auth_creds.pop('username', None)
+                if homework_accounts.is_isolated() and uname:
+                    prep = homework_accounts.prepare_login(uname, alias=login_alias if has_alias else None)
+                    if auth_creds.get('restore') is not True:
+                        with AUTH_LOCK:
+                            AUTH.update(state='checking', sites={k: False for k in homework_auth.SITES})
+                try:
+                    set_auth(homework_auth.status(**auth_creds, progress=progress, on_state=set_auth))
+                    if auth_snapshot()['state'] != 'logged_in':
+                        raise ValueError('登录尚未完成，请重试')
+                    result = {"message": "作业通已登录，两个站点的登录状态均已确认"}
+                except Exception:
+                    if prep is not None and homework_accounts.is_isolated():
+                        reg = homework_accounts.finalize_login(prep, username=uname, ok=False)
+                        if prep.get('created_id') and reg.get('active_id') != prep.get('created_id'):
+                            preserve_prev_auth = True
+                    raise
+                else:
+                    if prep is not None and homework_accounts.is_isolated():
+                        homework_accounts.finalize_login(prep, username=uname, alias=login_alias if has_alias else None, ok=True)
             elif action in ("fill", "open"):
                 import homework_fill
                 result = (homework_fill.fill_assignment if action == "fill" else homework_fill.open_assignment)(key)
@@ -284,8 +390,12 @@ def start_job(action, key=None, credentials=None):
                 JOB.update(message=result.get("message", "操作完成"), result=result)
         except Exception as exc:
             if action == 'login':
-                with AUTH_LOCK:
-                    AUTH['state'] = 'login_required'
+                if preserve_prev_auth:
+                    with AUTH_LOCK:
+                        AUTH.update(state='checking', sites={k: False for k in homework_auth.SITES})
+                else:
+                    with AUTH_LOCK:
+                        AUTH['state'] = 'login_required'
             with JOB_LOCK:
                 JOB.update(message=backend.safe_error(exc), result={"error": True})
         finally:
@@ -293,6 +403,8 @@ def start_job(action, key=None, credentials=None):
             with JOB_LOCK:
                 JOB["busy"] = False
                 JOB["revision"] += 1
+            if preserve_prev_auth:
+                threading.Thread(target=_probe_auth_async, daemon=True).start()
     threading.Thread(target=run, daemon=True).start()
     return True
 
@@ -514,25 +626,128 @@ class Handler(BaseHTTPRequestHandler):
                 credentials = None
                 if action == 'login':
                     username, password = payload.get('username'), payload.get('password')
+                    raw_alias = payload.get('alias')
+                    has_alias = 'alias' in payload and raw_alias is not None
+                    if has_alias and not isinstance(raw_alias, str):
+                        raise ValueError('备注名格式不正确')
                     if payload.get('saved') is True:
-                        if not homework_auth.credential_info()['saved']:
+                        uname = username.strip() if isinstance(username, str) else ''
+                        saved_ok = (
+                            homework_accounts.has_saved_credentials(username=uname)
+                            if (homework_accounts.is_isolated() and uname)
+                            else homework_auth.credential_info()['saved']
+                        )
+                        if not saved_ok:
                             raise ValueError('保存的登录信息不可用，请重新输入')
                         credentials = {'restore': True, 'force_restore': True}
+                        if uname:
+                            credentials['username'] = uname
                     else:
                         if not isinstance(username, str) or not username.strip() or not isinstance(password, str) or not password:
                             raise ValueError('请输入账号和密码')
                         credentials = {'username': username.strip(), 'password': password}
+                    if has_alias:
+                        credentials['alias'] = raw_alias
                 if key:
                     assignment(key)
                 if action in ("open", "fill", "ai") and not key:
                     raise ValueError("请先选择作业")
                 self.send(202, job_snapshot()) if start_job(action, key, credentials) else self.send(409, {"error": "当前操作尚未完成，请稍候"})
+            elif url.path == "/api/submission-check":
+                key = canonical_key(payload.get("key"))
+                if not key:
+                    raise ValueError("请先选择作业")
+                assignment(key)
+                auto = bool(payload.get("auto"))
+                if auto:
+                    with JOB_LOCK:
+                        if JOB["busy"]:
+                            self.send(200, {"key": key, "skipped": True})
+                            return
+                try:
+                    res = backend.check_submission(key, on_auth=set_auth, wait=not auto)
+                except Exception:
+                    if auto:
+                        self.send(200, {"key": key, "skipped": True})
+                        return
+                    raise
+                self.send(200, res)
+            elif url.path == "/api/account/switch":
+                target_id = payload.get("id")
+                if not isinstance(target_id, str) or not target_id.strip():
+                    raise ValueError("请选择要切换的账号")
+                with JOB_LOCK:
+                    if JOB["busy"]:
+                        self.send(409, {"error": "当前操作尚未完成，请稍候"})
+                        return
+                    JOB.update(busy=True, action="account", key=None, message="正在切换账号…", result=None)
+                try:
+                    with backend.browser_operation():
+                        acct = homework_accounts.switch_account(target_id.strip())
+                    with AUTH_LOCK:
+                        AUTH.update(state="checking", sites={k: False for k in homework_auth.SITES})
+                    REMINDER_WAKE.set()
+                finally:
+                    with JOB_LOCK:
+                        JOB.update(busy=False, message="", revision=JOB["revision"] + 1)
+                threading.Thread(target=_probe_auth_async, daemon=True).start()
+                self.send(200, {"account": acct, "auth": auth_snapshot()})
+            elif url.path == "/api/account/remove":
+                target_id = payload.get("id")
+                if not isinstance(target_id, str) or not target_id.strip():
+                    raise ValueError("请选择要移除的账号")
+                with JOB_LOCK:
+                    if JOB["busy"]:
+                        self.send(409, {"error": "当前操作尚未完成，请稍候"})
+                        return
+                    JOB.update(busy=True, action="account", key=None, message="正在移除账号…", result=None)
+                switched = False
+                try:
+                    with backend.browser_operation():
+                        res = homework_accounts.remove_account(target_id.strip())
+                    switched = bool(res.get("switched"))
+                    if switched:
+                        with AUTH_LOCK:
+                            AUTH.update(state="checking", sites={k: False for k in homework_auth.SITES})
+                        REMINDER_WAKE.set()
+                finally:
+                    with JOB_LOCK:
+                        JOB.update(busy=False, message="", revision=JOB["revision"] + 1)
+                if switched:
+                    threading.Thread(target=_probe_auth_async, daemon=True).start()
+                self.send(200, {**res, "auth": auth_snapshot()})
+            elif url.path == "/api/account/rename":
+                target_id = payload.get("id")
+                if not isinstance(target_id, str) or not target_id.strip():
+                    raise ValueError("请选择要备注的账号")
+                raw_label = payload.get("label")
+                if raw_label is not None and not isinstance(raw_label, str):
+                    raise ValueError("备注名格式不正确")
+                with JOB_LOCK:
+                    if JOB["busy"]:
+                        self.send(409, {"error": "当前操作尚未完成，请稍候"})
+                        return
+                acct = homework_accounts.rename_account(target_id.strip(), raw_label or "")
+                self.send(200, {"account": acct, "auth": auth_snapshot()})
+            elif url.path == "/api/history/cleanup":
+                with JOB_LOCK:
+                    if JOB["busy"]:
+                        self.send(409, {"error": "当前操作尚未完成，请稍候"})
+                        return
+                    JOB.update(busy=True, action="cleanup", key=None, message="正在清理更早历史…", result=None)
+                try:
+                    days = payload.get("days", getattr(backend, "HISTORY_FOLD_DAYS", 45))
+                    res = retention.cleanup_old_history(days)
+                finally:
+                    with JOB_LOCK:
+                        JOB.update(busy=False, message="", revision=JOB["revision"] + 1)
+                self.send(200, res)
             elif url.path == "/api/reminder/test":
                 self.send(200, send_test_reminder())
             elif url.path == "/api/reminder":
                 if not isinstance(payload.get("enabled"), bool):
                     raise ValueError("提醒开关格式不正确")
-                self.send(200, set_reminder(payload['enabled'], payload.get('times')))
+                self.send(200, set_reminder(payload['enabled'], payload.get('times'), payload.get('rules')))
             elif url.path == "/api/exit":
                 self.send(200, {"message": "助手已退出，提醒已停止"})
                 STOP.set()
@@ -547,23 +762,78 @@ def reminder_loop():
     while not STOP.is_set():
         REMINDER_WAKE.clear()
         try:
+            rules_map = {}
+            enabled = True
             with SETTINGS_LOCK:
                 now = datetime.now()
                 current = settings()
-                times = normalize_reminder_times(current.get('reminder_times')) if current.get('reminder_enabled', True) is not False else []
+                enabled = current.get('reminder_enabled', True) is not False
+                times = normalize_reminder_times(current.get('reminder_times')) if enabled else []
+                rules_map = normalize_reminder_rules(current.get('reminder_rules'), times) if enabled else {}
                 shown = current.setdefault("shown_slots", [])
                 # An already sent time must not mask the next time within the
                 # three-minute recovery window, e.g. 08:30 followed by 08:31.
-                due_slots = [slot for value in times if (slot := reminder_slot(now, value)) and slot not in shown]
+                due_pairs = [(value, slot) for value in times if (slot := reminder_slot(now, value)) and slot not in shown]
+                due_slots = [slot for _, slot in due_pairs]
                 if due_slots:
                     current["shown_slots"] = (shown + due_slots)[-120:]
                     shared.write_json_file(SETTINGS_FILE, current)
-                upcoming = next_reminder_at(now, times)
-            if due_slots:
+                upcoming = next_reminder_at(now, times, rules_map)
+            fired_rules = []
+            for value, _slot in due_pairs:
+                rule = rules_map.get(value)
+                if rule:
+                    if now.isoweekday() not in rule['days'] or in_quiet_window(now, rule['quiet']):
+                        continue
+                fired_rules.append(rule)
+            if fired_rules:
+                if any(r and r.get('auto_refresh') for r in fired_rules) and not job_snapshot()['busy']:
+                    try:
+                        backend.check_once(headless=True)
+                    except Exception:
+                        pass
                 active = reminder_records()
+                if fired_rules and all(r is not None and r.get('skip_complete', True) for r in fired_rules):
+                    active = [r for r in active if (r.get('progress') or {}).get('state') != 'complete']
                 if active:
-                    show_reminder(active)
+                    style = next((r.get('notify_style') for r in fired_rules if r and r.get('notify_style') == 'banner'), 'center')
+                    if style == 'banner':
+                        show_reminder(active, persistent=False)
+                    else:
+                        show_reminder(active)
                 continue
+            # Also evaluate optional per-rule deadline lead reminders (24h / 6h / 2h)
+            lead_candidates = [(t, r) for t, r in rules_map.items() if r.get('lead_hours') and now.isoweekday() in r.get('days', [1,2,3,4,5,6,7]) and not in_quiet_window(now, r.get('quiet'))] if enabled else []
+            if lead_candidates:
+                hours = sorted({h for _, r in lead_candidates for h in r['lead_hours']}, reverse=True)
+                all_active = reminder_records()
+                lead_records = []
+                lead_slots = []
+                with SETTINGS_LOCK:
+                    current = settings()
+                    shown = current.setdefault("shown_slots", [])
+                    for rec in all_active:
+                        dl = backend.parse_datetime(rec.get('deadline'))
+                        if not dl:
+                            continue
+                        left_s = (dl - now).total_seconds()
+                        if left_s <= 0:
+                            continue
+                        if all(r.get('skip_complete', True) for _, r in lead_candidates) and (rec.get('progress') or {}).get('state') == 'complete':
+                            continue
+                        for h in hours:
+                            if left_s <= h * 3600:
+                                marker = f"lead-{rec.get('key', '')}-{dl:%Y%m%d%H%M}-{h}h"
+                                if marker not in shown:
+                                    lead_slots.append(marker)
+                                    lead_records.append(rec)
+                                break
+                    if lead_slots:
+                        current["shown_slots"] = (shown + lead_slots)[-120:]
+                        shared.write_json_file(SETTINGS_FILE, current)
+                if lead_records:
+                    show_reminder(lead_records)
+                    continue
             # Wait only until the precise next deadline. The short upper bound also
             # rechecks the wall clock after sleep/resume or a system time change.
             delay = min(REMINDER_RECHECK_SECONDS, max(0, (upcoming - now).total_seconds())) if upcoming else REMINDER_RECHECK_SECONDS
@@ -648,6 +918,7 @@ def main():
             if reachable and not args.background:
                 backend.ensure_chrome(url, app=True)
         return
+    homework_accounts.init_accounts()
     retention.cleanup_history()
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     server.daemon_threads = True

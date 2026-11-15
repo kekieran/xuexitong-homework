@@ -11,15 +11,20 @@ import threading
 import time
 import unicodedata
 import ctypes
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import copy
 from datetime import datetime, timedelta
 from urllib.parse import urljoin, urlsplit
 from playwright.sync_api import sync_playwright
 import homework_dom as dom
+import homework_http as http_pool
 import homework_runtime as runtime
 import homework_shared as shared
 import homework_lab as lab
 import homework_school as school
+
+_DEFAULT_SYNC_PLAYWRIGHT = sync_playwright
 
 DATA_DIR = runtime.DATA_DIR
 PROFILE_DIR = runtime.PROFILE_DIR
@@ -41,6 +46,8 @@ PROGRESS = lambda message: None
 CONTENT_VERSION = 2
 ERROR_BACKOFF = timedelta(minutes=30)   # a failed read is not retried before this
 METADATA_MAX_AGE = timedelta(hours=6)   # cached deadline/status is refreshed after this
+ACTIVE_LOOKBACK_DAYS = 75
+HISTORY_FOLD_DAYS = 45
 TOAST_APP_ID = r'{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe'
 
 def now_iso():
@@ -94,8 +101,8 @@ def process_transaction(name, wait_ms=0):
             kernel.ReleaseMutex(handle)
         kernel.CloseHandle(handle)
 
-def browser_operation():
-    return process_transaction('Local\\ChaoxingHomeworkBrowserOperation_' + runtime.PROJECT_ID, 30000)
+def browser_operation(wait_ms=30000):
+    return process_transaction('Local\\ChaoxingHomeworkBrowserOperation_' + runtime.PROJECT_ID, wait_ms)
 
 def draft_transaction():
     return process_transaction('Local\\ChaoxingHomeworkDraftTransaction_' + runtime.PROJECT_ID, 10000)
@@ -463,6 +470,9 @@ def open_context(playwright, headless=True):
 
 def close_context(context):
     global CONNECTED_BROWSER
+    if getattr(context, 'is_fast_http_context', False) is True:
+        context.close()
+        return
     owner = BACKGROUND_CONTEXTS.pop(id(context), None)
     if owner is not None:
         try:
@@ -473,6 +483,9 @@ def close_context(context):
     if CONNECTED_BROWSER is None:
         context.close()
     CONNECTED_BROWSER = None
+
+_DEFAULT_OPEN_CONTEXT = open_context
+_DEFAULT_CLOSE_CONTEXT = close_context
 
 def request(context, url, **kwargs):
     for attempt in range(2):
@@ -517,16 +530,133 @@ def parse_notice_attachment(raw):
             url = web.get('url') or url
     return url
 
-def collect_notices(context, state, stats):
+def _nonempty_draft_keys():
+    """Return canonical assignment keys that currently have saved answers or attachments."""
+    drafts = read_json(DRAFTS_FILE, {})
+    if not isinstance(drafts, dict):
+        return set()
+    keys = set()
+    for k, v in drafts.items():
+        if isinstance(v, str) and v.strip():
+            keys.add(k)
+        elif isinstance(v, dict) and (v.get('answers') or v.get('legacy_text') or v.get('attachments')):
+            keys.add(k)
+    return keys
+
+
+def is_stale_old_row(item, *, now=None, days=HISTORY_FOLD_DAYS, lookback_days=ACTIVE_LOOKBACK_DAYS):
+    """True when an unmatched incoming item is an old completed/expired row outside active windows."""
+    if not isinstance(item, dict):
+        return False
+    now = now or datetime.now()
+    dl = parse_datetime(item.get('deadline'))
+    if dl and dl > now:
+        return False
+    if (item.get('status') or 'unknown') == 'submitted':
+        ref = dl or parse_datetime(item.get('start')) or parse_datetime(item.get('notice_sent'))
+        return bool(ref and (now - ref) > timedelta(days=days))
+    if dl and dl <= now:
+        return (now - dl) > timedelta(days=days)
+    ref = parse_datetime(item.get('start')) or parse_datetime(item.get('notice_sent'))
+    return bool(ref and (now - ref) > timedelta(days=lookback_days))
+
+
+def _is_record_active_or_protected(record, key=None, *, now=None, draft_keys=None, overrides=None):
+    """True when an existing assignment must not be skipped or pruned as stale history."""
+    now = now or datetime.now()
+    eff = effective_record(record, overrides)
+    if record_group(eff) != 'history':
+        return True
+    dl = parse_datetime(eff.get('deadline')) or parse_datetime(record.get('deadline'))
+    if dl and dl > now:
+        return True
+    if draft_keys and key and key in draft_keys:
+        return True
+    return False
+
+
+def _apply_renwu_fallback(record, fallback):
+    record['source_kind'] = 'renwu_task'
+    record['renwu_task'] = fallback.get('renwu_task') or {}
+    answer_url = fallback.get('answer_url') or record.get('work_url') or record.get('entry_url') or ''
+    if answer_url:
+        record['answer_url'] = answer_url
+        record['work_url'] = answer_url
+    if fallback.get('title'):
+        record['title'] = fallback['title']
+    if fallback.get('start'):
+        record['start'] = fallback['start']
+    if fallback.get('deadline'):
+        record['deadline'] = fallback['deadline']
+        record['deadline_kind'] = 'known'
+        record['deadline_reason'] = None
+        record['deadline_source'] = 'page'
+    card_status = fallback.get('card_status')
+    if card_status == 'submitted':
+        record['status'] = 'submitted'
+    elif card_status == 'pending' and record.get('status') in {None, '', 'unknown'}:
+        record['status'] = 'pending'
+    elif record.get('status') in {None, '', 'unknown'}:
+        record['status'] = 'pending'
+    if fallback.get('identity'):
+        record['identities'] = sorted(set(record.get('identities') or []) | {fallback['identity']})
+    q = fallback.get('question')
+    if q:
+        record['questions'] = [q]
+        record['requirements'] = q.get('text') or ''
+        record['question_count'] = 1
+    record['attachments'] = list(fallback.get('attachments') or [])
+    record['content_version'] = CONTENT_VERSION
+    record['content_status'] = 'ready'
+    record['content_complete'] = True
+    record['content_warnings'] = []
+    now_stamp = now_iso()
+    record['content_last_read'] = now_stamp
+    record['metadata_checked_at'] = now_stamp
+    record.pop('metadata_needs_check', None)
+
+
+def _handle_read_error(state, record, key, exc, verified_sites, stats):
+    from homework_navigation import NotInClassError
+    if isinstance(exc, NotInClassError):
+        try:
+            import homework_accounts as accounts
+            import homework_retention as retention
+            if accounts.is_isolated() and verified_sites.get(retention.platform(record)):
+                draft = None
+                with STATE_LOCK, draft_transaction():
+                    drafts = read_json(DRAFTS_FILE, {})
+                    draft = drafts.pop(key, None)
+                    if draft is not None:
+                        write_json(DRAFTS_FILE, drafts)
+                accounts.archive_quarantined_record(key, copy.deepcopy(record), draft)
+                state['assignments'].pop(key, None)
+                aliases = state.get('record_aliases') or {}
+                for alias_key, target in list(aliases.items()):
+                    if target == key:
+                        aliases.pop(alias_key, None)
+                stats['warnings'].append(f'已清理非当前账号课程作业：{record.get("course")} / {record.get("title")}')
+                return
+        except Exception:
+            pass
+    reason = safe_error(exc)
+    record['content_error'] = '该课程的平台需要重新登录' if 'LOGIN_REQUIRED' in reason else reason
+    stats['warnings'].append(f'{record.get("course")}：{record["content_error"]}')
+
+
+def collect_notices(context, state, stats, *, _sink=None):
     seen = set(state.get('notice_seen') or [])
     cursor, used, fresh_ids = '', set(), []
-    page_limit = 30 if not state.get('notice_backfilled') else 10
+    page_limit = 15 if not state.get('notice_backfilled') else 5
     ended = False
     lab_replay = not state.get('lab_notices_scanned')
     lab_cutoff = datetime.now() - timedelta(days=30)
+    lookback_cutoff = datetime.now() - timedelta(days=ACTIVE_LOOKBACK_DAYS)
+    course_meta = state.setdefault('course_meta', {})
     pending_cursors = list(state.get('notice_pending_cursors') or [])
     if state.get('notice_backfill_cursor') and state['notice_backfill_cursor'] not in pending_cursors:
         pending_cursors.append(state['notice_backfill_cursor'])
+    school_discovered = False
     for page_index in range(page_limit):
         try:
             response = context.request.post(NOTICE_API_URL, form={
@@ -558,9 +688,12 @@ def collect_notices(context, state, stats):
         for n in notices:
             candidate = lab.parse_notice(n)
             if candidate:
-                existing = match_record(state['assignments'], candidate)
-                if lab.should_import(candidate, existing=bool(existing)):
-                    merge_record(state['assignments'], candidate)
+                if _sink is not None:
+                    _sink.append(('lab', candidate))
+                else:
+                    existing = match_record(state['assignments'], candidate)
+                    if lab.should_import(candidate, existing=bool(existing)):
+                        merge_record(state['assignments'], candidate)
                 continue
             content = str(n.get('content') or '')
             def field(label):
@@ -572,28 +705,36 @@ def collect_notices(context, state, stats):
             url = parse_notice_attachment(n.get('attachment'))
             if url:
                 if school.note_notice_url(url, context):
-                    try:
-                        import homework_auth
-                        homework_auth.status(restore=True, context=context, progress=PROGRESS)
-                    except Exception:
-                        pass
+                    school_discovered = True
             start, deadline = time_fields(content)
             item = {'course': course, 'title': title, 'start': start, 'deadline': deadline,
                     'deadline_source': 'notice' if deadline else None,
                     'notice_sent': standard_time(n.get('sendTime')), 'entry_url': url,
                     'identities': dom.url_identity(url),
                     'source_notice_ids': [str(n['idCode'])] if n.get('idCode') else [], 'status': 'unknown'}
-            merge_record(state['assignments'], item)
+            existing = match_record(state['assignments'], item)
+            if not existing and is_stale_old_row(item):
+                continue
+            c_id, cl_id = course_ids(item)
+            if c_id and cl_id and _sink is None:
+                cm = course_meta.get(f'{c_id}:{cl_id}')
+                if isinstance(cm, dict):
+                    cm['dormant'] = False
+                    cm['empty_streak'] = 0
+            if _sink is not None:
+                _sink.append(('work', item))
+            else:
+                merge_record(state['assignments'], item)
         fresh_ids.extend(ids)
-        # Existing installations have already marked these notices seen, but
-        # have never inspected their rich text. Replay just the recent window.
         sent = [parse_datetime(standard_time(n.get('sendTime'))) for n in notices]
+        valid_sent = [t for t in sent if t]
+        old_cutoff_reached = bool(valid_sent) and all(t < lookback_cutoff for t in valid_sent)
         if lab_replay and (not notices or (sent and all(t and t < lab_cutoff for t in sent))
-                           or str(container.get('lastPage')) == '1'):
+                           or str(container.get('lastPage')) == '1' or old_cutoff_reached):
             lab_replay = False
             state['lab_notices_scanned'] = True
         page_known = bool(ids) and all(i in seen for i in ids)
-        at_end = not notices or str(container.get('lastPage')) == '1'
+        at_end = not notices or str(container.get('lastPage')) == '1' or (old_cutoff_reached and not lab_replay)
         next_cursor = str(container.get('lastGetId') or '')
         if (page_known or at_end) and pending_cursors:
             next_cursor = pending_cursors.pop(0)
@@ -605,7 +746,6 @@ def collect_notices(context, state, stats):
             break
         used.add(next_cursor)
         cursor = next_cursor
-        time.sleep(0.25)
     state['notice_seen'] = list(dict.fromkeys(fresh_ids + list(seen)))[:1200]
     if ended:
         state['notice_backfilled'] = True
@@ -615,6 +755,12 @@ def collect_notices(context, state, stats):
         state['notice_backfill_cursor'] = cursor
         state['notice_pending_cursors'] = list(dict.fromkeys([cursor] + pending_cursors))
         stats['warnings'].append('通知较多，本次达到分页上限，已有作业仍保留。')
+    if school_discovered:
+        try:
+            import homework_auth
+            homework_auth.status(restore=True, context=context, progress=PROGRESS)
+        except Exception:
+            pass
 
 def course_ids(record):
     """(courseId, classId) of the course that owns this record, or None."""
@@ -625,15 +771,88 @@ def course_ids(record):
     return None
 
 
-def collect_lab_reports(context, state, stats, only=None):
+def _collect_lab_targets_flat(context, state, records_view, work_items, *, _sink=None):
+    """Run lab status queries in one flat HTTP-pooled executor and skip redundant cold-course submitted scans."""
+    now = datetime.now()
+    active_courses = set()
+    for record in records_view.values():
+        if record.get('source_kind') == lab.SOURCE_KIND and record_group(record) != 'history':
+            info = record.get('lab_report') or {}
+            active_courses.add((str(info.get('fid') or ''), str(info.get('course_id') or '0')))
+    lab_meta = state.get('lab_meta') if isinstance(state.get('lab_meta'), dict) else {}
+
+    flat_jobs = []
+    submitted_requested = set()
+    for idx, (target, origin) in enumerate(work_items):
+        trusted = lab.trusted_origin(origin)
+        fid = lab._identifier(target.get('fid'))
+        course_id = lab._identifier(target.get('course_id'))
+        if not trusted or not fid:
+            continue
+        meta_key = f'{fid}:{course_id}'
+        meta_entry = lab_meta.get(meta_key) if isinstance(lab_meta.get(meta_key), dict) else {}
+        prev_submitted = parse_datetime(meta_entry.get('submitted_checked_at'))
+        filters = ['2']
+        if course_id == '0' or (fid, course_id) in active_courses or not prev_submitted or (now - prev_submitted) > METADATA_MAX_AGE:
+            filters.append('1')
+            submitted_requested.add(idx)
+        for sf in filters:
+            flat_jobs.append((idx, trusted, fid, course_id, sf))
+
+    def _run_job(job):
+        idx, trusted, fid, course_id, sf = job
+        try:
+            rows_out, job_warnings = lab._collect_status_pages(context, trusted, fid, course_id, sf, None)
+            return idx, sf, rows_out, job_warnings, None
+        except Exception as exc:
+            return idx, sf, [], [], safe_error(exc)
+
+    grouped = {idx: {'rows': [], 'warnings': [], 'err': ''} for idx in range(len(work_items))}
+    if flat_jobs:
+        with ThreadPoolExecutor(max_workers=min(6, len(flat_jobs))) as pool:
+            for idx, sf, rows_out, job_warnings, exc_msg in pool.map(_run_job, flat_jobs):
+                bucket = grouped[idx]
+                bucket['rows'].extend(rows_out)
+                bucket['warnings'].extend(job_warnings)
+                if exc_msg and not bucket['err']:
+                    bucket['err'] = exc_msg
+
+    checked_iso = now_iso()
+    results = []
+    for idx, (target, _origin) in enumerate(work_items):
+        bucket = grouped[idx]
+        candidates = {}
+        for cand in bucket['rows']:
+            canonical = cand['identities'][0]
+            prev = candidates.get(canonical)
+            if not prev or cand['status'] == 'submitted' or prev['status'] != 'submitted':
+                candidates[canonical] = cand
+        warnings = list(dict.fromkeys(bucket['warnings']))
+        err_msg = bucket['err'] or (warnings[0] if warnings else '')
+        if idx in submitted_requested and not err_msg:
+            fid = lab._identifier(target.get('fid'))
+            course_id = lab._identifier(target.get('course_id'))
+            meta_key = f'{fid}:{course_id}'
+            if _sink is not None:
+                _sink.append(('lab_meta', (meta_key, checked_iso)))
+            else:
+                state.setdefault('lab_meta', {})[meta_key] = {'submitted_checked_at': checked_iso}
+        results.append((target, list(candidates.values()), warnings, err_msg))
+    return results
+
+
+def collect_lab_reports(context, state, stats, only=None, *, _snapshot=None, _sink=None):
     """Use the ordinary assignment store; only eligible reports get details."""
     from homework_lab_auth import ensure_session
     from homework_lab_courses import discover_courses
     targets = {}
+    records_view = _snapshot if _snapshot is not None else state['assignments']
+
     def add(target):
         origin, fid = lab.trusted_origin(target.get('origin')), str(target.get('fid') or '')
         if origin and fid:
             targets[(origin, fid, str(target.get('course_id') or '0'))] = dict(target, origin=origin, fid=fid)
+
     if not only:
         discovered, warnings = discover_courses(context)
         stats['warnings'].extend(warnings)
@@ -643,7 +862,7 @@ def collect_lab_reports(context, state, stats, only=None):
         active_fid = school.school_fid(lab.DEFAULT_FID)
         if active_origin and active_fid:
             add({'origin': active_origin, 'fid': active_fid, 'course_id': '0'})
-    for key, record in state['assignments'].items():
+    for key, record in records_view.items():
         if only and key != only:
             continue
         if record.get('source_kind') == lab.SOURCE_KIND:
@@ -656,39 +875,92 @@ def collect_lab_reports(context, state, stats, only=None):
                 if (host == 'mooc.istudy.szpu.edu.cn' or school.is_school_host(host)) and course_id:
                     add({'origin': f'https://{host}', 'fid': school.school_fid(lab.DEFAULT_FID),
                          'course_id': course_id, 'course': record.get('course', '')})
-    checked, sessions = set(), {}
+
+    session_keys = list(dict.fromkeys((t['origin'], t['fid']) for t in targets.values()))
+    sessions = {}
+    if http_pool.supports_concurrency(context) and len(session_keys) > 1:
+        def _resolve_session(sk):
+            try:
+                return ensure_session(context, *sk)
+            except Exception as exc:
+                return RuntimeError(safe_error(exc))
+        with ThreadPoolExecutor(max_workers=min(4, len(session_keys))) as pool:
+            for sk, res in zip(session_keys, pool.map(_resolve_session, session_keys)):
+                sessions[sk] = res
+    else:
+        for sk in session_keys:
+            try:
+                sessions[sk] = ensure_session(context, *sk)
+            except Exception as exc:
+                sessions[sk] = RuntimeError(safe_error(exc))
+
+    checked, work_items, pre_errors = set(), [], []
     for target in targets.values():
+        res = sessions[(target['origin'], target['fid'])]
+        if isinstance(res, Exception):
+            pre_errors.append((target, safe_error(res)))
+            continue
+        origin = res
+        course_key = (origin, target['fid'], str(target.get('course_id') or '0'))
+        if course_key in checked:
+            continue
+        checked.add(course_key)
+        work_items.append((target, origin))
+
+    def _collect_one(target, origin):
         try:
-            session_key = (target['origin'], target['fid'])
-            if session_key not in sessions:
-                try:
-                    sessions[session_key] = ensure_session(context, *session_key)
-                except Exception as exc:
-                    sessions[session_key] = RuntimeError(safe_error(exc))
-            origin = sessions[session_key]
-            if isinstance(origin, Exception):
-                raise origin
-            course_key = (origin, target['fid'], str(target.get('course_id') or '0'))
-            if course_key in checked:
-                continue
-            checked.add(course_key)
             candidates, warnings = lab.collect_reports(context, [dict(target, origin=origin)])
-            stats['course_lists'] += 1
-            stats['warnings'].extend(warnings)
-            for candidate in candidates:
+            return target, candidates, warnings, (warnings[0] if warnings else '')
+        except Exception as exc:
+            return target, [], [], safe_error(exc)
+
+    if (
+        not only
+        and http_pool.supports_concurrency(context)
+        and len(work_items) > 1
+        and lab.collect_reports is getattr(lab, '_DEFAULT_COLLECT_REPORTS', lab.collect_reports)
+    ):
+        results = _collect_lab_targets_flat(context, state, records_view, work_items, _sink=_sink)
+    elif http_pool.supports_concurrency(context) and len(work_items) > 1:
+        with ThreadPoolExecutor(max_workers=min(4, len(work_items))) as pool:
+            results = list(pool.map(lambda pair: _collect_one(*pair), work_items))
+    else:
+        results = [_collect_one(target, origin) for target, origin in work_items]
+
+    for target, candidates, warnings, err_msg in results:
+        stats['course_lists'] += 1
+        stats['warnings'].extend(warnings)
+        for candidate in candidates:
+            if not candidate.get('course'):
+                candidate['course'] = target.get('course') or target.get('title') or '未命名课程'
+            if _sink is not None:
+                _sink.append(('lab_row', candidate))
+            else:
                 existing = match_record(state['assignments'], candidate)
                 if only and existing != only:
                     continue
                 if lab.should_import(candidate, existing=bool(existing)):
-                    if not candidate.get('course'):
-                        candidate['course'] = target.get('course') or target.get('title') or '未命名课程'
                     merge_record(state['assignments'], candidate)
-            if warnings:
-                raise RuntimeError(warnings[0])
-        except Exception as exc:
-            reason = safe_error(exc)
-            reason = '该课程的平台需要重新登录' if 'LOGIN_REQUIRED' in reason else reason
-            stats['warnings'].append(reason)
+        if err_msg:
+            reason = '该课程的平台需要重新登录' if 'LOGIN_REQUIRED' in err_msg else err_msg
+            if not warnings or reason != warnings[0]:
+                stats['warnings'].append(reason)
+            if _sink is not None:
+                _sink.append(('lab_err', (target, reason)))
+            else:
+                for record in state['assignments'].values():
+                    info = record.get('lab_report') or {}
+                    if (record.get('source_kind') == lab.SOURCE_KIND and record_group(record) != 'history'
+                            and info.get('fid') == target['fid']
+                            and str(info.get('course_id') or '0') == str(target.get('course_id') or '0')):
+                        record['content_error'] = reason
+
+    for target, reason in pre_errors:
+        reason = '该课程的平台需要重新登录' if 'LOGIN_REQUIRED' in reason else reason
+        stats['warnings'].append(reason)
+        if _sink is not None:
+            _sink.append(('lab_err', (target, reason)))
+        else:
             for record in state['assignments'].values():
                 info = record.get('lab_report') or {}
                 if (record.get('source_kind') == lab.SOURCE_KIND and record_group(record) != 'history'
@@ -697,8 +969,9 @@ def collect_lab_reports(context, state, stats, only=None):
                     record['content_error'] = reason
 
 
-def collect_course_rows(context, state, stats, only=None):
+def collect_course_rows(context, state, stats, only=None, *, _snapshot=None, _sink=None, _meta_out=None):
     """Read course task lists; `only` restricts it to one (courseId, classId)."""
+    records_view = _snapshot if _snapshot is not None else state['assignments']
     try:
         markup, _ = fetch_html(context, COURSES_URL)
         courses = dom.parse(markup).all('li', attr='courseid')
@@ -718,7 +991,7 @@ def collect_course_rows(context, state, stats, only=None):
     # School-hosted courses have a separate login and are absent from the main list.
     # Every stored link is inspected: a record's entry may be a notice URL while
     # its work page is the school host, and only the latter carries the ids.
-    for r in state['assignments'].values():
+    for r in records_view.values():
         if record_group(r) == 'history':
             continue
         for name in ('entry_url', 'work_url', 'list_url', 'answer_url'):
@@ -727,12 +1000,43 @@ def collect_course_rows(context, state, stats, only=None):
             course, clazz = dom.course_class_pair(raw)
             if (u.hostname == 'mooc.istudy.szpu.edu.cn' or school.is_school_host(u.hostname)) and course and clazz:
                 targets[(u.hostname, course, clazz)] = r.get('course', '')
+
+    now = datetime.now()
+    draft_keys = _nonempty_draft_keys()
+    overrides = local_overrides()
+    protected_course_keys = set()
+    existing_latest_by_course = {}
+    for k, r in records_view.items():
+        c_id, cl_id = course_ids(r)
+        if not c_id or not cl_id:
+            continue
+        ck = f'{c_id}:{cl_id}'
+        if _is_record_active_or_protected(r, k, now=now, draft_keys=draft_keys, overrides=overrides):
+            protected_course_keys.add(ck)
+        for d_str in (r.get('deadline'), r.get('start'), r.get('notice_sent')):
+            dt = parse_datetime(d_str)
+            if dt and (ck not in existing_latest_by_course or dt > existing_latest_by_course[ck]):
+                existing_latest_by_course[ck] = dt
+
+    course_meta = state.setdefault('course_meta', {})
+    course_items = []
     for (host, cid, clazz), name in targets.items():
         if only and (cid, clazz) != only:
             continue
+        ck = f'{cid}:{clazz}'
+        meta = course_meta.get(ck) if isinstance(course_meta.get(ck), dict) else {}
+        if only is None and meta.get('dormant') and ck not in protected_course_keys:
+            if _meta_out is not None:
+                _meta_out.setdefault('skipped_dormant', set()).add((cid, clazz))
+            continue
+        course_items.append(((host, cid, clazz), name))
+    total = len(course_items)
+
+    def _fetch_course(item):
+        (host, cid, clazz), name = item
         try:
             markup, base = fetch_html(context, f'https://{host}/work/task-list?courseId={cid}&classId={clazz}&vx=1')
-            stats['course_lists'] += 1
+            rows = []
             for n in dom.parse(markup).all('li', attr='data'):
                 url = html.unescape(urljoin(base, n.attrs['data']))
                 if 'type=work' not in url:
@@ -740,13 +1044,76 @@ def collect_course_rows(context, state, stats, only=None):
                 title = dom.clean_text(n.first('p') or n)
                 status = dom.explicit_status('\n'.join(dom.clean_text(s) for s in n.all('span')))
                 candidate = {'course': name, 'title': title, 'status': status, 'list_url': url,
-                    'identities': dom.url_identity(url), 'status_checked_at': now_iso()}
+                             'identities': dom.url_identity(url), 'status_checked_at': now_iso()}
                 start, deadline = time_fields(dom.clean_text(n))
                 candidate.update(start=start, deadline=deadline)
-                merge_record(state['assignments'], candidate)
-            time.sleep(0.15)
+                rows.append(candidate)
+            return (host, cid, clazz), name, rows, None
         except Exception as exc:
-            stats['warnings'].append(f'{name}：{safe_error(exc)}')
+            return (host, cid, clazz), name, None, f'{name}：{safe_error(exc)}'
+
+    ordered_results = [None] * total
+    if http_pool.supports_concurrency(context) and total > 1:
+        progress_lock = threading.Lock()
+        done_count = 0
+        with ThreadPoolExecutor(max_workers=min(8, total)) as pool:
+            future_map = {pool.submit(_fetch_course, item): idx for idx, item in enumerate(course_items)}
+            for fut in as_completed(future_map):
+                idx = future_map[fut]
+                res = fut.result()
+                ordered_results[idx] = res
+                item_name = course_items[idx][1]
+                with progress_lock:
+                    done_count += 1
+                    if only is None and total > 1 and item_name:
+                        PROGRESS(f'正在核对课程（{done_count}/{total}）：{item_name}')
+    else:
+        for idx, item in enumerate(course_items):
+            name = item[1]
+            if only is None and total > 1 and name:
+                PROGRESS(f'正在核对课程（{idx + 1}/{total}）：{name}')
+            ordered_results[idx] = _fetch_course(item)
+
+    lookback_cutoff = now - timedelta(days=ACTIVE_LOOKBACK_DAYS)
+    meta_target = _meta_out.setdefault('course_meta', {}) if _meta_out is not None else course_meta
+    for (_host, cid, clazz), _name, rows, warn in ordered_results:
+        if warn:
+            stats['warnings'].append(warn)
+            continue
+        stats['course_lists'] += 1
+        ck = f'{cid}:{clazz}'
+        row_dates = [dt for row in rows for dt in (parse_datetime(row.get('deadline')), parse_datetime(row.get('start'))) if dt]
+        latest_dt = max(row_dates) if row_dates else existing_latest_by_course.get(ck)
+        prev_meta = course_meta.get(ck) if isinstance(course_meta.get(ck), dict) else {}
+        has_active_row = any(
+            (row.get('status') or 'unknown') != 'submitted' and not is_stale_old_row(row, now=now)
+            for row in rows
+        )
+        is_protected = ck in protected_course_keys or has_active_row
+        if rows:
+            empty_streak = 0
+            dormant = bool(not is_protected and latest_dt and latest_dt < lookback_cutoff)
+        else:
+            empty_streak = 0 if is_protected else int(prev_meta.get('empty_streak') or 0) + 1
+            dormant = bool(not is_protected and ((latest_dt and latest_dt < lookback_cutoff) or empty_streak >= 2))
+        if only is not None:
+            dormant = False
+            empty_streak = 0
+        meta_target[ck] = {
+            'name': _name or prev_meta.get('name') or '',
+            'latest_activity_at': shared.iso_timestamp(latest_dt) if latest_dt else prev_meta.get('latest_activity_at', ''),
+            'last_checked_at': now_iso(),
+            'empty_streak': empty_streak,
+            'dormant': dormant,
+        }
+        for candidate in rows:
+            existing = match_record(records_view, candidate)
+            if only is None and not existing and is_stale_old_row(candidate, now=now):
+                continue
+            if _sink is not None:
+                _sink.append(candidate)
+            else:
+                merge_record(state['assignments'], candidate)
 
 IMAGE_MIME_SUFFIX = {'image/png': '.png', 'image/jpeg': '.jpg', 'image/gif': '.gif', 'image/webp': '.webp'}
 
@@ -790,7 +1157,14 @@ def asset_downloader(context):
             # header-derived suffix (or none) exactly as before.
             suffix = IMAGE_MIME_SUFFIX.get(image_mime(data)) or suffix
             if suffix and len(data) <= 12_000_000:
-                (folder / (name + suffix)).write_bytes(data)
+                dest = folder / (name + suffix)
+                if not dest.exists():
+                    tmp = folder / f'.{name}.{os.getpid()}.{threading.get_ident()}.tmp'
+                    try:
+                        tmp.write_bytes(data)
+                        tmp.replace(dest)
+                    finally:
+                        tmp.unlink(missing_ok=True)
                 return '/assets/' + name + suffix
         except Exception:
             pass
@@ -813,6 +1187,8 @@ def update_metadata(record, markup, url):
     elif re.search(r'(?:截止|结束)(?:时间|日期)?\s*[：:]?\s*(?:不限|无限制|永久|无截止|未设置)|不限时|无截止时间', text):
         record.update(deadline=None, deadline_kind='none', deadline_source='detail')
     if re.search(r'作业已截止|作业已结束|超过截止时间|不在作答时间|本课程已结课|作业不支持作答', text):
+        record['availability'] = 'closed'
+    elif re.search(r'/selectworkquestionyipiyue(?:/|$)', urlsplit(url).path, re.I):
         record['availability'] = 'closed'
     elif re.search(r'/do(?:home)?work', urlsplit(url).path, re.I) and ((parse_datetime(record.get('deadline')) or datetime.min) > datetime.now() or record.get('deadline_kind') == 'none'):
         record.pop('availability', None)
@@ -842,21 +1218,48 @@ def read_content(context, record, stats):
         record['content_status'] = '缺少作答入口，等待通知或课程列表补全'
         return
     stats['details'] += 1
-    from homework_navigation import resolve_work_page
+    from homework_navigation import resolve_empty_work_fallback, resolve_work_page
     markup, final = resolve_work_page(context, record, fetch_html)
-    update_metadata(record, markup, final)
+    if not (record.get('status') == 'submitted' and re.search(r'/getallwork', urlsplit(final).path, re.I)):
+        update_metadata(record, markup, final)
     record['content_entry_checked'] = url
     record['work_url'] = final
     if record_group(record) == 'history':
         return
-    if school.is_school_host(urlsplit(final).hostname):
-        for img in dom.parse(markup).all('img'):
-            img_src = urljoin(final, img.attrs.get('data-original') or img.attrs.get('data-src') or img.attrs.get('src') or '')
-            if img_src.startswith(('https://', 'http://')):
+    download = asset_downloader(context)
+    img_urls = []
+    parsed_markup = dom.parse(markup)
+    is_school = school.is_school_host(urlsplit(final).hostname)
+    for img in parsed_markup.all('img'):
+        img_src = urljoin(final, img.attrs.get('data-original') or img.attrs.get('data-src') or img.attrs.get('src') or '')
+        if img_src.startswith(('https://', 'http://')):
+            if is_school:
                 school.note_asset_url(img_src)
-    questions = dom.parse_questions(markup, final, asset_downloader(context))
+            if img_src not in img_urls:
+                img_urls.append(img_src)
+    if http_pool.supports_concurrency(context) and len(img_urls) > 1:
+        with ThreadPoolExecutor(max_workers=min(4, len(img_urls))) as pool:
+            list(pool.map(download, img_urls))
+    questions = dom.parse_questions(markup, final, download)
     if not questions:
-        record['content_status'] = '页面没有可识别的原题，未把摘要或题号列表存为题目'
+        fallback = resolve_empty_work_fallback(context, record, final, markup, fetch_html, asset=download)
+        if isinstance(fallback, dict) and fallback.get('mode') == 'renwu_task':
+            _apply_renwu_fallback(record, fallback)
+            return
+        if isinstance(fallback, dict) and fallback.get('mode') == 'html':
+            fb_markup = fallback.get('markup') or ''
+            fb_final = fallback.get('final') or final
+            update_metadata(record, fb_markup, fb_final)
+            record['work_url'] = fb_final
+            if fallback.get('card_status') in {'pending', 'submitted'} and record.get('status') in {None, '', 'unknown'}:
+                record['status'] = fallback['card_status']
+            if record_group(record) == 'history':
+                return
+            markup, final = fb_markup, fb_final
+            questions = dom.parse_questions(markup, final, download)
+    if not questions:
+        if not record.get('questions'):
+            record['content_status'] = '页面没有可识别的原题，未把摘要或题号列表存为题目'
         return
     record['questions'] = questions
     # Old versions collected links from the entire page, including plugin updates.
@@ -932,75 +1335,408 @@ def check_once(headless=True, force_key=None, on_auth=None):
     with browser_operation():
         return _check_once(headless, force_key, on_auth)
 
+
+def check_submission(key, on_auth=None, wait=True):
+    """Lightweight single-assignment check for submission status without locking UI actions."""
+    canonical = canonical_key(key)
+    with browser_operation(30000 if wait else 0):
+        state = load_state()
+        selected = state['assignments'].get(canonical)
+        if not selected:
+            raise ValueError('找不到这份作业，请刷新后重试')
+        stats = {'notice_pages': 0, 'course_lists': 0, 'details': 0, 'cache_hits': 0, 'warnings': []}
+        with ExitStack() as stack:
+            context = _open_fast_or_browser_context(True)
+            if context is None:
+                playwright = stack.enter_context(sync_playwright())
+                context = open_context(playwright, True)
+            stack.callback(close_context, context)
+
+            def _fetch_target_status():
+                if selected.get('source_kind') == lab.SOURCE_KIND:
+                    collect_lab_reports(context, state, stats, only=canonical)
+                else:
+                    ids = course_ids(selected)
+                    if ids:
+                        collect_course_rows(context, state, stats, only=ids)
+
+            need_auth = not getattr(context, 'is_fast_http_context', False)
+            if not need_auth:
+                try:
+                    _fetch_target_status()
+                except Exception as exc:
+                    if 'LOGIN_REQUIRED' in str(exc) or '登录' in str(exc):
+                        need_auth = True
+                    else:
+                        raise
+                else:
+                    if any('LOGIN_REQUIRED' in w or '登录' in w for w in stats['warnings']):
+                        stats['warnings'].clear()
+                        need_auth = True
+            if need_auth:
+                import homework_auth
+                auth = homework_auth.status(restore=True, context=context, progress=PROGRESS, on_state=on_auth)
+                if not any(auth['sites'].values()):
+                    raise RuntimeError('请先登录作业通')
+                _fetch_target_status()
+
+        reconcile_aliases(state)
+        resolved_key = resolve_alias(state.get('record_aliases') or {}, canonical)
+        record = state['assignments'].get(resolved_key) or state['assignments'].get(canonical) or {}
+        state['last_check'] = now_iso()
+        state['last_success'] = now_iso()
+        save_state(state)
+        try:
+            import homework_accounts as accounts
+            if accounts.is_isolated():
+                accounts.sync_active_metadata()
+        except Exception:
+            pass
+        latest = LATEST_FILE.with_name(LATEST_FILE.name + f'.{os.getpid()}.{threading.get_ident()}.tmp')
+        latest.write_text(render_summary(active_pending(state)) + '\n', encoding='utf-8')
+        latest.replace(LATEST_FILE)
+        group = record_group(record) if record else ''
+        submitted = bool(record and (record.get('status') == 'submitted' or group == 'history'))
+        return {
+            'key': resolved_key or canonical,
+            'status': record.get('status', ''),
+            'group': group,
+            'submitted': submitted,
+            'warnings': stats['warnings'],
+        }
+
+_DEFAULT_COLLECT_NOTICES = collect_notices
+_DEFAULT_COLLECT_COURSE_ROWS = collect_course_rows
+_DEFAULT_COLLECT_LAB_REPORTS = collect_lab_reports
+
+
+def _replay_collectors(state, notice_items, course_items, lab_sink):
+    for kind, payload in notice_items:
+        if kind == 'lab':
+            existing = match_record(state['assignments'], payload)
+            if lab.should_import(payload, existing=bool(existing)):
+                merge_record(state['assignments'], payload)
+        else:
+            merge_record(state['assignments'], payload)
+    for candidate in course_items:
+        merge_record(state['assignments'], candidate)
+    for kind, payload in lab_sink:
+        if kind == 'lab_row':
+            existing = match_record(state['assignments'], payload)
+            if lab.should_import(payload, existing=bool(existing)):
+                merge_record(state['assignments'], payload)
+        elif kind == 'lab_meta':
+            meta_key, stamp = payload
+            state.setdefault('lab_meta', {})[meta_key] = {'submitted_checked_at': stamp}
+        elif kind == 'lab_err':
+            target, reason = payload
+            for record in state['assignments'].values():
+                info = record.get('lab_report') or {}
+                if (record.get('source_kind') == lab.SOURCE_KIND and record_group(record) != 'history'
+                        and info.get('fid') == target['fid']
+                        and str(info.get('course_id') or '0') == str(target.get('course_id') or '0')):
+                    record['content_error'] = reason
+
+
+def _collect_top_level_parallel(context, state, stats):
+    state_snapshot = copy.deepcopy(state['assignments'])
+    before_school_origin = school.school_origin('')
+    known_school_pairs = set()
+    for r in state_snapshot.values():
+        if record_group(r) == 'history':
+            continue
+        for name in ('entry_url', 'work_url', 'list_url', 'answer_url'):
+            raw = r.get(name) or ''
+            u = urlsplit(raw)
+            course, clazz = dom.course_class_pair(raw)
+            if (u.hostname == 'mooc.istudy.szpu.edu.cn' or school.is_school_host(u.hostname)) and course and clazz:
+                known_school_pairs.add((course, clazz))
+
+    notice_state = {
+        'notice_seen': list(state.get('notice_seen') or []),
+        'notice_backfilled': state.get('notice_backfilled'),
+        'lab_notices_scanned': state.get('lab_notices_scanned'),
+        'notice_pending_cursors': list(state.get('notice_pending_cursors') or []),
+        'notice_backfill_cursor': state.get('notice_backfill_cursor'),
+        'assignments': state_snapshot,
+    }
+    notice_stats = {'notice_pages': 0, 'course_lists': 0, 'details': 0, 'cache_hits': 0, 'warnings': []}
+    course_stats = {'notice_pages': 0, 'course_lists': 0, 'details': 0, 'cache_hits': 0, 'warnings': []}
+    lab_stats = {'notice_pages': 0, 'course_lists': 0, 'details': 0, 'cache_hits': 0, 'warnings': []}
+    notice_items, course_items, lab_sink = [], [], []
+    course_meta_out = {}
+    notice_err = course_err = lab_err = None
+
+    def _run_notices():
+        collect_notices(context, notice_state, notice_stats, _sink=notice_items)
+
+    def _run_courses():
+        collect_course_rows(context, state, course_stats, _snapshot=state_snapshot, _sink=course_items, _meta_out=course_meta_out)
+
+    def _run_labs():
+        collect_lab_reports(context, state, lab_stats, _snapshot=state_snapshot, _sink=lab_sink)
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        f_notice = pool.submit(_run_notices)
+        f_course = pool.submit(_run_courses)
+        f_lab = pool.submit(_run_labs)
+        for name, fut in (('notice', f_notice), ('course', f_course), ('lab', f_lab)):
+            try:
+                fut.result()
+            except Exception as exc:
+                if name == 'notice':
+                    notice_err = exc
+                elif name == 'course':
+                    course_err = exc
+                else:
+                    lab_err = exc
+
+    connected = False
+    if notice_err is None:
+        connected = True
+        for key in ('notice_seen', 'notice_backfilled', 'lab_notices_scanned'):
+            if key in notice_state:
+                state[key] = notice_state[key]
+        if 'notice_backfill_cursor' in notice_state:
+            state['notice_backfill_cursor'] = notice_state['notice_backfill_cursor']
+        else:
+            state.pop('notice_backfill_cursor', None)
+        if 'notice_pending_cursors' in notice_state:
+            state['notice_pending_cursors'] = notice_state['notice_pending_cursors']
+        else:
+            state.pop('notice_pending_cursors', None)
+    else:
+        stats['warnings'].append(safe_error(notice_err))
+
+    if course_err is None:
+        connected = True
+    else:
+        stats['warnings'].append(safe_error(course_err))
+
+    if lab_err is None:
+        connected = True
+    else:
+        stats['warnings'].append(safe_error(lab_err))
+
+    for sub in (notice_stats, course_stats, lab_stats):
+        stats['notice_pages'] += sub['notice_pages']
+        stats['course_lists'] += sub['course_lists']
+        stats['details'] += sub['details']
+        stats['cache_hits'] += sub['cache_hits']
+        stats['warnings'].extend(sub['warnings'])
+
+    _replay_collectors(state, notice_items, course_items, lab_sink)
+    if course_meta_out.get('course_meta'):
+        state.setdefault('course_meta', {}).update(course_meta_out['course_meta'])
+    skipped_dormant = set(course_meta_out.get('skipped_dormant') or ())
+    woken_dormant_pairs = set()
+    for _kind, payload in notice_items:
+        c_id, cl_id = course_ids(payload)
+        if c_id and cl_id:
+            cm = state.setdefault('course_meta', {}).get(f'{c_id}:{cl_id}')
+            if isinstance(cm, dict):
+                cm['dormant'] = False
+                cm['empty_streak'] = 0
+            if (c_id, cl_id) in skipped_dormant:
+                woken_dormant_pairs.add((c_id, cl_id))
+    for pair in sorted(woken_dormant_pairs):
+        try:
+            collect_course_rows(context, state, stats, only=pair)
+        except Exception as exc:
+            stats['warnings'].append(safe_error(exc))
+
+    if notice_err is None:
+        extra_pairs = set()
+        for kind, payload in notice_items:
+            if kind != 'work':
+                continue
+            url = payload.get('entry_url') or ''
+            u = urlsplit(url)
+            course, clazz = dom.course_class_pair(url)
+            if (u.hostname == 'mooc.istudy.szpu.edu.cn' or school.is_school_host(u.hostname)) and course and clazz:
+                if (course, clazz) not in known_school_pairs:
+                    extra_pairs.add((course, clazz))
+        for pair in sorted(extra_pairs):
+            try:
+                collect_course_rows(context, state, stats, only=pair)
+            except Exception as exc:
+                stats['warnings'].append(safe_error(exc))
+        if school.school_origin('') != before_school_origin:
+            try:
+                collect_lab_reports(context, state, stats)
+            except Exception as exc:
+                stats['warnings'].append(safe_error(exc))
+
+    return connected
+
+
+def _open_fast_or_browser_context(headless):
+    fast_mode = (
+        headless
+        and sync_playwright is _DEFAULT_SYNC_PLAYWRIGHT
+        and open_context is _DEFAULT_OPEN_CONTEXT
+        and close_context is _DEFAULT_CLOSE_CONTEXT
+        and http_pool.has_session_cookies(DATA_DIR / 'browser_session.json')
+    )
+    if not fast_mode:
+        return None
+    def _run_in_browser(fn):
+        with sync_playwright() as playwright:
+            pw_ctx = open_context(playwright, headless)
+            try:
+                return fn(pw_ctx)
+            finally:
+                close_context(pw_ctx)
+    return http_pool.FastCookieContext(DATA_DIR / 'browser_session.json', run_in_browser=_run_in_browser)
+
+
 def _check_once(headless=True, force_key=None, on_auth=None):
     state = load_state()
     stats = {'notice_pages': 0, 'course_lists': 0, 'details': 0, 'cache_hits': 0, 'warnings': []}
     connected = False
     try:
-        with sync_playwright() as p:
-            context = open_context(p, headless)
-            try:
-                if headless:
-                    import homework_auth
-                    auth = homework_auth.status(restore=True, context=context, progress=PROGRESS, on_state=on_auth)
-                    if not any(auth['sites'].values()):
-                        raise RuntimeError('请先登录作业通')
-                    if not auth['logged_in']:
-                        stats['warnings'].append('部分站点尚未登录')
-                if not force_key:
-                    log('正在同步通知与课程作业状态…')
+        with ExitStack() as stack:
+            context = _open_fast_or_browser_context(headless)
+            if context is None:
+                playwright = stack.enter_context(sync_playwright())
+                context = open_context(playwright, headless)
+            stack.callback(close_context, context)
+            verified_sites = {'chaoxing': True, 'school': True}
+            if headless:
+                import homework_auth
+                auth = homework_auth.status(restore=True, context=context, progress=PROGRESS, on_state=on_auth)
+                verified_sites = dict(auth.get('sites') or {})
+                if not any(auth['sites'].values()):
+                    raise RuntimeError('请先登录作业通')
+                if not auth['logged_in']:
+                    stats['warnings'].append('部分站点尚未登录')
+            if not force_key:
+                log('正在同步通知与课程作业状态…')
+                unpatched_collectors = (
+                    collect_notices is _DEFAULT_COLLECT_NOTICES
+                    and collect_course_rows is _DEFAULT_COLLECT_COURSE_ROWS
+                    and collect_lab_reports is _DEFAULT_COLLECT_LAB_REPORTS
+                )
+                if unpatched_collectors and http_pool.supports_concurrency(context):
+                    connected = _collect_top_level_parallel(context, state, stats)
+                else:
                     for collector in (collect_notices, collect_course_rows, collect_lab_reports):
                         try:
                             collector(context, state, stats)
                             connected = True
                         except Exception as exc:
                             stats['warnings'].append(safe_error(exc))
-                else:
-                    connected = True
-                    # A single-assignment refresh must still read this course's
-                    # task-list row: after submitting, that row is the page that
-                    # says 已提交/待批阅, while the detail page may keep showing
-                    # the pending form and never archive the assignment.
-                    selected = state['assignments'].get(force_key) or {}
-                    if selected.get('source_kind') == lab.SOURCE_KIND:
-                        collect_lab_reports(context, state, stats, only=force_key)
-                    ids = None if selected.get('source_kind') == lab.SOURCE_KIND else course_ids(selected)
-                    if ids:
-                        try:
-                            collect_course_rows(context, state, stats, only=ids)
-                        except Exception as exc:
-                            stats['warnings'].append(safe_error(exc))
+            else:
+                connected = True
+                # A single-assignment refresh must still read this course's
+                # task-list row: after submitting, that row is the page that
+                # says 已提交/待批阅, while the detail page may keep showing
+                # the pending form and never archive the assignment.
+                selected = state['assignments'].get(force_key) or {}
+                if selected.get('source_kind') == lab.SOURCE_KIND:
+                    collect_lab_reports(context, state, stats, only=force_key)
+                ids = None if selected.get('source_kind') == lab.SOURCE_KIND else course_ids(selected)
+                if ids:
+                    try:
+                        collect_course_rows(context, state, stats, only=ids)
+                    except Exception as exc:
+                        stats['warnings'].append(safe_error(exc))
+            reconcile_aliases(state)
+            eligible = []
+            for key, record in list(state['assignments'].items()):
+                if key not in state['assignments']:
+                    continue
+                if force_key and key != force_key:
+                    continue
+                if force_key and record.get('status') == 'submitted':
+                    # The course row just proved it is submitted; its detail
+                    # page is read-only now and would only add a warning.
+                    stats['cache_hits'] += 1
+                    continue
+                if record.get('source_kind') == lab.SOURCE_KIND and record_group(record) == 'history':
+                    # List metadata can reopen an extended/redo assignment;
+                    # an expired or submitted one never needs its old body.
+                    stats['cache_hits'] += 1
+                    continue
+                identity_probe = record.get('source_kind') != lab.SOURCE_KIND and needs_identity_probe(record, state['assignments'])
+                entry_upgrade = record.get('source_kind') != lab.SOURCE_KIND and needs_entry_upgrade(record)
+                if record_group(record) == 'history' and key != force_key and not record.get('metadata_needs_check') and not identity_probe:
+                    continue
+                attempted = parse_datetime(record.get('content_attempted_at'))
+                valid = record.get('content_version') == CONTENT_VERSION and bool(record.get('questions'))
+                checked = parse_datetime(record.get('content_last_read') if record.get('source_kind') == lab.SOURCE_KIND
+                                         else record.get('metadata_checked_at'))
+                due = record.get('metadata_needs_check') or not checked or datetime.now() - checked > METADATA_MAX_AGE
+                if (record.get('content_error') == '网页作业标识与目标不一致，已停止读取'
+                        and not record.get('alias_retry_done')):
+                    record['alias_retry_done'] = True
+                    attempted = None
+                if (record.get('content_complete') is False
+                        and '当前为手机分页题目，尚未核实作业全部题数' in (record.get('content_warnings') or [])
+                        and not record.get('phone_paging_verified')):
+                    record['phone_paging_verified'] = True
+                    due = True
+                if skipped_by_cache(record, force_key=bool(force_key), valid=valid, due=due,
+                                    attempted=attempted, identity_probe=identity_probe,
+                                    entry_upgrade=entry_upgrade):
+                    stats['cache_hits'] += 1
+                    continue
+                if not record.get('entry_url') and not record.get('list_url') and not record.get('work_url'):
+                    continue
+                eligible.append((key, record, identity_probe))
+
+            if http_pool.supports_concurrency(context) and len(eligible) > 1:
+                PROGRESS(f'正在并发读取 {len(eligible)} 份作业详情…')
+                work_copies = []
+                for key, record, identity_probe in eligible:
+                    log(f'正在核对：{record.get("course")} / {record.get("title")}')
+                    record['content_attempted_at'] = now_iso()
+                    work_copies.append((key, copy.deepcopy(record), identity_probe))
+
+                def _read_one(item):
+                    key, rec_copy, id_probe = item
+                    local_stats = {'details': 0, 'warnings': []}
+                    try:
+                        read_content(context, rec_copy, local_stats)
+                        return key, rec_copy, id_probe, local_stats, None
+                    except Exception as exc:
+                        return key, rec_copy, id_probe, local_stats, exc
+
+                with ThreadPoolExecutor(max_workers=min(6, len(work_copies))) as pool:
+                    read_results = list(pool.map(_read_one, work_copies))
+
+                for key, updated, identity_probe, local_stats, err in read_results:
+                    stats['details'] += local_stats['details']
+                    stats['warnings'].extend(local_stats['warnings'])
+                    record = state['assignments'].get(key)
+                    if not record:
+                        continue
+                    if err is None:
+                        record.clear()
+                        record.update(updated)
+                        if identity_probe:
+                            record['identity_probe_done'] = True
+                        record.pop('content_error', None)
+                    else:
+                        _handle_read_error(state, record, key, err, verified_sites, stats)
                 reconcile_aliases(state)
-                for key, record in list(state['assignments'].items()):
+                upgraded = set()
+                for key, _, _ in eligible:
+                    merged_key = resolve_alias(state.get('record_aliases') or {}, key)
+                    if merged_key in upgraded:
+                        continue
+                    upgraded.add(merged_key)
+                    merged = state['assignments'].get(merged_key)
+                    if merged and needs_entry_upgrade(merged):
+                        try:
+                            read_content(context, merged, stats)
+                            merged.pop('content_error', None)
+                            reconcile_aliases(state)
+                        except Exception as exc:
+                            _handle_read_error(state, merged, merged_key, exc, verified_sites, stats)
+            else:
+                for key, record, identity_probe in eligible:
                     if key not in state['assignments']:
-                        continue
-                    if force_key and key != force_key:
-                        continue
-                    if force_key and record.get('status') == 'submitted':
-                        # The course row just proved it is submitted; its detail
-                        # page is read-only now and would only add a warning.
-                        stats['cache_hits'] += 1
-                        continue
-                    if record.get('source_kind') == lab.SOURCE_KIND and record_group(record) == 'history':
-                        # List metadata can reopen an extended/redo assignment;
-                        # an expired or submitted one never needs its old body.
-                        stats['cache_hits'] += 1
-                        continue
-                    identity_probe = record.get('source_kind') != lab.SOURCE_KIND and needs_identity_probe(record, state['assignments'])
-                    entry_upgrade = record.get('source_kind') != lab.SOURCE_KIND and needs_entry_upgrade(record)
-                    if record_group(record) == 'history' and key != force_key and not record.get('metadata_needs_check') and not identity_probe:
-                        continue
-                    attempted = parse_datetime(record.get('content_attempted_at'))
-                    valid = record.get('content_version') == CONTENT_VERSION and bool(record.get('questions'))
-                    checked = parse_datetime(record.get('content_last_read') if record.get('source_kind') == lab.SOURCE_KIND
-                                             else record.get('metadata_checked_at'))
-                    due = record.get('metadata_needs_check') or not checked or datetime.now() - checked > METADATA_MAX_AGE
-                    if skipped_by_cache(record, force_key=bool(force_key), valid=valid, due=due,
-                                        attempted=attempted, identity_probe=identity_probe,
-                                        entry_upgrade=entry_upgrade):
-                        stats['cache_hits'] += 1
-                        continue
-                    if not record.get('entry_url') and not record.get('list_url') and not record.get('work_url'):
                         continue
                     log(f'正在核对：{record.get("course")} / {record.get("title")}')
                     record['content_attempted_at'] = now_iso()
@@ -1020,11 +1756,7 @@ def _check_once(headless=True, force_key=None, on_auth=None):
                             merged.pop('content_error', None)
                             reconcile_aliases(state)
                     except Exception as exc:
-                        reason = safe_error(exc)
-                        record['content_error'] = '该课程的平台需要重新登录' if 'LOGIN_REQUIRED' in reason else reason
-                        stats['warnings'].append(f'{record.get("course")}：{record["content_error"]}')
-            finally:
-                close_context(context)
+                        _handle_read_error(state, record, key, exc, verified_sites, stats)
     except Exception as exc:
         stats['warnings'].append(safe_error(exc))
     state['last_check'] = now_iso()
@@ -1032,6 +1764,12 @@ def _check_once(headless=True, force_key=None, on_auth=None):
         state['last_success'] = now_iso()
     state['last_stats'] = stats
     save_state(state)
+    try:
+        import homework_accounts as accounts
+        if accounts.is_isolated():
+            accounts.sync_active_metadata()
+    except Exception:
+        pass
     latest = LATEST_FILE.with_name(LATEST_FILE.name + f'.{os.getpid()}.{threading.get_ident()}.tmp')
     latest.write_text(render_summary(active_pending(state)) + '\n', encoding='utf-8')
     latest.replace(LATEST_FILE)
@@ -1115,7 +1853,17 @@ def notify(title, message, persistent=False):
 
 def ensure_chrome(url=None, app=False):
     port = urlsplit(CHAOXING_CDP_URL).port or 9222
-    args = runtime.browser_args(url, app=app, port=port)
+    if not app and runtime.cdp_endpoint_alive(CHAOXING_CDP_URL):
+        if url is None:
+            return
+        with sync_playwright() as playwright:
+            browser = runtime.connect_browser_direct(playwright, CHAOXING_CDP_URL, timeout=1000)
+            runtime.open_visible_url(browser, url, app=False)
+        return
+    if hasattr(runtime, '_allow_foreground_window'):
+        runtime._allow_foreground_window()
+    launch_url = runtime.fill_loading_url() if (url is None and not app and hasattr(runtime, 'fill_loading_url')) else url
+    args = runtime.browser_args(launch_url, app=app, port=port)
     subprocess.Popen(args, creationflags=getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0))
 
 LOGIN_TARGET_ID = None
@@ -1203,10 +1951,7 @@ def login_mode(platform='chaoxing'):
                 target_id = target['targetId']
             LOGIN_TARGET_ID = target_id
             LOGIN_TARGET_PLATFORM = platform
-            window = session.send('Browser.getWindowForTarget', {'targetId': target_id})
-            if window.get('bounds', {}).get('windowState') == 'minimized':
-                session.send('Browser.setWindowBounds', {'windowId': window['windowId'], 'bounds': {'windowState': 'normal'}})
-            session.send('Target.activateTarget', {'targetId': target_id})
+            runtime.activate_target(browser, target_id, session=session)
         finally:
             session.detach()
     return 0

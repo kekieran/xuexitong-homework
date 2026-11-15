@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import ctypes
 import json
 import time
@@ -10,7 +11,10 @@ from urllib.parse import quote, urlsplit
 from playwright.sync_api import sync_playwright
 
 import homework_engine as engine
+import homework_http as http_pool
 import homework_school as school
+
+_DEFAULT_SYNC_PLAYWRIGHT = sync_playwright
 
 SCHOOL_URL = 'https://mooc.istudy.szpu.edu.cn/visit/interaction'
 SITES = {'chaoxing': engine.NOTICE_URL, 'school': SCHOOL_URL}
@@ -284,7 +288,13 @@ def probe(context, platform: str, *, timeout=12000) -> bool:
         if response.status >= 400:
             raise RuntimeError()
         markup = response.text()
-        return bool(markup.strip()) and urlsplit(response.url).hostname == urlsplit(site_url).hostname and not engine.dom.is_login(markup, response.url)
+        ok = bool(markup.strip()) and urlsplit(response.url).hostname == urlsplit(site_url).hostname and not engine.dom.is_login(markup, response.url)
+        if ok and response.status == 200 and response.url == site_url and hasattr(context, 'remember_response'):
+            try:
+                context.remember_response(site_url, response.status, response.url, markup.encode('utf-8'))
+            except Exception:
+                pass
+        return ok
     except Exception:
         if use_fast:
             page = context.new_page()
@@ -505,12 +515,14 @@ def status(username=None, password=None, *, restore=False, force_restore=False,
         prev_saved = (credential_info().get('username') or '').strip()
         cfg_before = school.load_config() if not _custom_sites() else {}
         prev_cfg_account = (cfg_before.get('account') or '').strip()
+        import homework_accounts
+        session_dirs = {engine.DATA_DIR} if homework_accounts.is_isolated() else {engine.DATA_DIR, engine.runtime.DATA_DIR}
         has_unattributed_state = (
             not prev_saved
             and not prev_cfg_account
             and not _custom_sites()
             and (
-                any((d / 'browser_session.json').exists() for d in {engine.DATA_DIR, engine.runtime.DATA_DIR})
+                any((d / 'browser_session.json').exists() for d in session_dirs)
                 or cfg_before.get('mode', 'unknown') != 'unknown'
                 or bool(cfg_before.get('fid'))
                 or bool(cfg_before.get('uid'))
@@ -523,7 +535,7 @@ def status(username=None, password=None, *, restore=False, force_restore=False,
             or has_unattributed_state
         ):
             account_changed = True
-            for session_dir in {engine.DATA_DIR, engine.runtime.DATA_DIR}:
+            for session_dir in session_dirs:
                 try:
                     (session_dir / 'browser_session.json').unlink(missing_ok=True)
                 except OSError:
@@ -553,35 +565,147 @@ def status(username=None, password=None, *, restore=False, force_restore=False,
             sites = {name: False for name in SITES}
         else:
             sites = {}
-            for name in SITES:
-                if name == 'chaoxing':
+            can_parallel = (
+                http_pool.supports_concurrency(active_context)
+                and (_custom_sites() or school.load_config().get('mode') == 'school_site')
+                and set(SITES) == {'chaoxing', 'school'}
+            )
+            if can_parallel:
+                def _probe_one(platform_name):
                     try:
-                        cx_ok = probe(active_context, 'chaoxing')
-                    except RuntimeError:
-                        if not credentials:
-                            raise
-                        cx_ok = False
-                    sites['chaoxing'] = cx_ok
-                    if not _custom_sites() and cx_ok and school.load_config().get('mode') == 'unknown':
-                        known_user = credentials[0] if credentials else (credential_info().get('username') or '').strip()
-                        school.discover_school(active_context, username=known_user or None)
-                elif name == 'school' and not _custom_sites() and school.is_chaoxing_only():
-                    sites['school'] = bool(sites.get('chaoxing', False))
-                elif name == 'school' and not _custom_sites() and school.load_config().get('mode') == 'unknown' and not sites.get('chaoxing'):
-                    try:
-                        sites['school'] = probe(active_context, 'school')
-                    except RuntimeError:
-                        sites['school'] = False
-                else:
-                    try:
-                        sites[name] = probe(active_context, name)
-                    except RuntimeError:
-                        if not credentials:
-                            raise
-                        sites[name] = False
+                        return probe(active_context, platform_name), None
+                    except RuntimeError as exc:
+                        return False, exc
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    fut_cx = pool.submit(_probe_one, 'chaoxing')
+                    fut_sc = pool.submit(_probe_one, 'school')
+                    cx_ok, cx_err = fut_cx.result()
+                    sc_ok, sc_err = fut_sc.result()
+                if cx_err is not None and not credentials:
+                    raise cx_err
+                if sc_err is not None and not credentials:
+                    raise sc_err
+                sites['chaoxing'] = cx_ok
+                sites['school'] = sc_ok
+            else:
+                for name in SITES:
+                    if name == 'chaoxing':
+                        try:
+                            cx_ok = probe(active_context, 'chaoxing')
+                        except RuntimeError:
+                            if not credentials:
+                                raise
+                            cx_ok = False
+                        sites['chaoxing'] = cx_ok
+                        if not _custom_sites() and cx_ok and school.load_config().get('mode') == 'unknown':
+                            known_user = credentials[0] if credentials else (credential_info().get('username') or '').strip()
+                            school.discover_school(active_context, username=known_user or None)
+                    elif name == 'school' and not _custom_sites() and school.is_chaoxing_only():
+                        sites['school'] = bool(sites.get('chaoxing', False))
+                    elif name == 'school' and not _custom_sites() and school.load_config().get('mode') == 'unknown' and not sites.get('chaoxing'):
+                        try:
+                            sites['school'] = probe(active_context, 'school')
+                        except RuntimeError:
+                            sites['school'] = False
+                    else:
+                        try:
+                            sites[name] = probe(active_context, name)
+                        except RuntimeError:
+                            if not credentials:
+                                raise
+                            sites[name] = False
         if on_state:
             on_state({'logged_in': all(sites.values()), 'sites': dict(sites)})
-        if credentials:
+        if credentials and any(not ok for ok in sites.values()):
+            if getattr(active_context, 'is_fast_http_context', False) is True:
+                def _restore_in_browser(pw_ctx):
+                    pw_sites = dict(sites)
+                    prev_mode = school.load_config().get('mode') if not _custom_sites() else ''
+                    prev_school_url = _site_url('school') if 'school' in SITES else ''
+                    preflight_keys = []
+                    if _submit is _DEFAULT_SUBMIT and _can_fast_fanya(pw_ctx):
+                        if not pw_sites.get('chaoxing'):
+                            ep = _fanya_endpoint('chaoxing', _login_url('chaoxing'))
+                            if ep is not None:
+                                pg = _start_fanya_page(pw_ctx, *ep, *credentials)
+                                if pg is not None:
+                                    key = (id(pw_ctx), 'chaoxing')
+                                    _PREFLIGHT_PAGES[key] = pg
+                                    preflight_keys.append(key)
+                        if not pw_sites.get('school') and not account_changed and school.load_config().get('mode') == 'school_site':
+                            ep = _fanya_endpoint('school', _login_url('school'))
+                            if ep is not None:
+                                pg = _start_fanya_page(pw_ctx, *ep, *credentials)
+                                if pg is not None:
+                                    key = (id(pw_ctx), 'school')
+                                    _PREFLIGHT_PAGES[key] = pg
+                                    preflight_keys.append(key)
+                    try:
+                        for platform in list(pw_sites):
+                            if not pw_sites[platform]:
+                                if platform == 'school' and not _custom_sites() and school.is_chaoxing_only():
+                                    pw_sites['school'] = bool(pw_sites.get('chaoxing', False))
+                                    if on_state:
+                                        on_state({'logged_in': all(pw_sites.values()), 'sites': dict(pw_sites)})
+                                    continue
+                                _submit(pw_ctx, platform, *credentials, progress=progress)
+                                pw_sites[platform] = True
+                                if platform == 'chaoxing' and not _custom_sites():
+                                    if progress:
+                                        progress('正在识别所属学校…')
+                                    cfg = school.discover_school(pw_ctx, username=credentials[0])
+                                    if progress and cfg.get('school_name'):
+                                        progress(f"已识别学校：{cfg['school_name']}")
+                                    if _site_url('school') != prev_school_url:
+                                        stale_school = _PREFLIGHT_PAGES.pop((id(pw_ctx), 'school'), None)
+                                        if stale_school is not None:
+                                            try:
+                                                if not stale_school.is_closed():
+                                                    stale_school.close()
+                                            except Exception:
+                                                pass
+                                    if 'school' in pw_sites:
+                                        if school.is_chaoxing_only():
+                                            pw_sites['school'] = True
+                                        elif school.load_config().get('mode') == 'school_site':
+                                            if account_changed or not school._is_chaoxing_domain(urlsplit(_site_url('school')).hostname):
+                                                pw_sites['school'] = False
+                                            elif prev_mode == 'unknown' or _site_url('school') != prev_school_url:
+                                                try:
+                                                    pw_sites['school'] = probe(pw_ctx, 'school')
+                                                except RuntimeError:
+                                                    pw_sites['school'] = False
+                                if on_state:
+                                    on_state({'logged_in': all(pw_sites.values()), 'sites': dict(pw_sites)})
+                    finally:
+                        for key in preflight_keys:
+                            stale = _PREFLIGHT_PAGES.pop(key, None)
+                            if stale is not None:
+                                try:
+                                    if not stale.is_closed():
+                                        stale.close()
+                                except Exception:
+                                    pass
+                    return pw_sites
+
+                try:
+                    runner = getattr(active_context, 'run_in_browser', None)
+                    if callable(runner):
+                        sites = runner(_restore_in_browser)
+                    else:
+                        with engine.browser_operation(), sync_playwright() as playwright:
+                            pw_ctx = engine.open_context(playwright, headless=True)
+                            try:
+                                sites = _restore_in_browser(pw_ctx)
+                            finally:
+                                engine.close_context(pw_ctx)
+                    active_context.reload_storage_state()
+                except Exception:
+                    _AUTO_FAILED = True
+                    raise
+                if all(sites.values()):
+                    _AUTO_FAILED = False
+                return {'logged_in': all(sites.values()), 'sites': sites}
             prev_mode = school.load_config().get('mode') if not _custom_sites() else ''
             prev_school_url = _site_url('school') if 'school' in SITES else ''
             preflight_keys = []
@@ -653,6 +777,15 @@ def status(username=None, password=None, *, restore=False, force_restore=False,
                             pass
             if all(sites.values()):
                 _AUTO_FAILED = False
+        elif credentials:
+            _AUTO_FAILED = False
+        if not _custom_sites():
+            try:
+                import homework_accounts
+                if homework_accounts.is_isolated():
+                    homework_accounts.sync_active_metadata(context=active_context, username=credentials[0] if credentials else '')
+            except Exception:
+                pass
         return {'logged_in': all(sites.values()), 'sites': sites}
 
     if context is None and not supplied and not restore and not _custom_sites():
@@ -665,6 +798,20 @@ def status(username=None, password=None, *, restore=False, force_restore=False,
             return result
     if context is not None:
         return authenticate(context)
+    session_file = engine.DATA_DIR / 'browser_session.json'
+    if (
+        not supplied
+        and not force_restore
+        and not _custom_sites()
+        and sync_playwright is _DEFAULT_SYNC_PLAYWRIGHT
+        and engine.open_context is getattr(engine, '_DEFAULT_OPEN_CONTEXT', engine.open_context)
+        and http_pool.has_session_cookies(session_file)
+    ):
+        fast_ctx = http_pool.FastCookieContext(session_file)
+        try:
+            return authenticate(fast_ctx)
+        finally:
+            fast_ctx.close()
     with engine.browser_operation(), sync_playwright() as playwright:
         active_context = engine.open_context(playwright, headless=True)
         try:

@@ -7,6 +7,7 @@ questions survive an expired session or an unsupported response format.
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import html
 import json
@@ -15,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 import homework_dom as dom
+import homework_http as http_pool
 import homework_school as school
 
 
@@ -294,9 +296,52 @@ def _get(context, origin, endpoint, params):
         dispose_response(response)
 
 
+def _collect_status_pages(context, origin, fid, course_id, status_filter, now):
+    rows_out, warnings = [], []
+    signatures = set()
+    try:
+        for page in range(1, 21):
+            # Public table filters are an array of objects. Axios's
+            # serializer uses bracketed nested keys, not dotted keys.
+            params = {'cpage': page, 'pageSize': 50, 'deptId': fid,
+                      'search[0][field]': 'type', 'search[0][val]': status_filter,
+                      'search[0][operator]': 'eq'}
+            # Native global lists explicitly filter by course 0; their
+            # filter helper deliberately retains zero-valued filters.
+            params.update({'search[1][field]': 'moocCourseId',
+                           'search[1][val]': course_id or '0', 'search[1][operator]': 'eq'})
+            data = _get(context, origin, 'list', params)
+            if not isinstance(data, dict) or not isinstance(data.get('list'), list):
+                raise RuntimeError('作业列表结构无法识别，已有内容已保留')
+            rows = data['list']
+            signature = tuple(str(row.get('reportId')) for row in rows if isinstance(row, dict))
+            if rows and signature in signatures:
+                warnings.append('作业列表分页重复，本次已停止，已有内容已保留')
+                break
+            signatures.add(signature)
+            for row in rows:
+                candidate = candidate_from_row(row, origin, fid, now)
+                if candidate:
+                    rows_out.append(candidate)
+            total = data.get('total')
+            try:
+                exhausted = int(total) <= page * 50 if total is not None else False
+            except (TypeError, ValueError):
+                exhausted = False
+            if len(rows) < 50 or exhausted:
+                break
+            if page == 20:
+                warnings.append('作业列表达到分页上限，本次未读取全部记录，下次可继续刷新')
+    except Exception as exc:
+        message = str(exc) if isinstance(exc, RuntimeError) else '作业列表暂时无法读取'
+        warnings.append(message)
+    return rows_out, warnings
+
+
 def collect_reports(context, targets, *, now=None):
     """Read both pending/submitted lists without fetching any report details."""
     candidates, warnings, known_targets = {}, [], set()
+    jobs = []
     for target in targets:
         origin, fid = trusted_origin(target.get('origin')), _identifier(target.get('fid'))
         course_id = _identifier(target.get('course_id'))
@@ -304,48 +349,26 @@ def collect_reports(context, targets, *, now=None):
             continue
         known_targets.add((origin, fid, course_id))
         for status_filter in ('2', '1'):
-            signatures = set()
-            try:
-                for page in range(1, 21):
-                    # Public table filters are an array of objects. Axios's
-                    # serializer uses bracketed nested keys, not dotted keys.
-                    params = {'cpage': page, 'pageSize': 50, 'deptId': fid,
-                              'search[0][field]': 'type', 'search[0][val]': status_filter,
-                              'search[0][operator]': 'eq'}
-                    # Native global lists explicitly filter by course 0; their
-                    # filter helper deliberately retains zero-valued filters.
-                    params.update({'search[1][field]': 'moocCourseId',
-                                   'search[1][val]': course_id or '0', 'search[1][operator]': 'eq'})
-                    data = _get(context, origin, 'list', params)
-                    if not isinstance(data, dict) or not isinstance(data.get('list'), list):
-                        raise RuntimeError('作业列表结构无法识别，已有内容已保留')
-                    rows = data['list']
-                    signature = tuple(str(row.get('reportId')) for row in rows if isinstance(row, dict))
-                    if rows and signature in signatures:
-                        warnings.append('作业列表分页重复，本次已停止，已有内容已保留')
-                        break
-                    signatures.add(signature)
-                    for row in rows:
-                        candidate = candidate_from_row(row, origin, fid, now)
-                        if candidate:
-                            canonical = candidate['identities'][0]
-                            # A just-submitted report can be in both filters during sync.
-                            previous = candidates.get(canonical)
-                            if not previous or candidate['status'] == 'submitted' or previous['status'] != 'submitted':
-                                candidates[canonical] = candidate
-                    total = data.get('total')
-                    try:
-                        exhausted = int(total) <= page * 50 if total is not None else False
-                    except (TypeError, ValueError):
-                        exhausted = False
-                    if len(rows) < 50 or exhausted:
-                        break
-                    if page == 20:
-                        warnings.append('作业列表达到分页上限，本次未读取全部记录，下次可继续刷新')
-            except Exception as exc:
-                message = str(exc) if isinstance(exc, RuntimeError) else '作业列表暂时无法读取'
-                warnings.append(message)
+            jobs.append((origin, fid, course_id, status_filter))
+    if not jobs:
+        return [], []
+    if http_pool.supports_concurrency(context) and len(jobs) > 1:
+        with ThreadPoolExecutor(max_workers=min(6, len(jobs))) as pool:
+            results = list(pool.map(lambda job: _collect_status_pages(context, *job, now), jobs))
+    else:
+        results = [_collect_status_pages(context, *job, now) for job in jobs]
+    for rows_out, job_warnings in results:
+        warnings.extend(job_warnings)
+        for candidate in rows_out:
+            canonical = candidate['identities'][0]
+            # A just-submitted report can be in both filters during sync.
+            previous = candidates.get(canonical)
+            if not previous or candidate['status'] == 'submitted' or previous['status'] != 'submitted':
+                candidates[canonical] = candidate
     return list(candidates.values()), list(dict.fromkeys(warnings))
+
+
+_DEFAULT_COLLECT_REPORTS = collect_reports
 
 
 def _record_target(record):
@@ -498,16 +521,43 @@ def read_report(context, record):
     converted to fictional essays; type 2's native upload control is known.
     """
     target = _record_target(record)
-    data = _get(context, target['origin'], 'report', {'id': target['report_id'], 'deptId': target['fid']})
-    if not isinstance(data, dict):
-        raise RuntimeError('作业详情结构无法识别，已有内容已保留')
-    reported_id = _first(data, 'reportId', 'id')
-    if reported_id is not None and str(reported_id) != target['report_id']:
-        raise RuntimeError('作业详情身份不一致，已有内容已保留')
-    reported_fid = _first(data, 'fid', 'deptId')
-    if reported_fid is not None and str(reported_fid) != target['fid']:
-        raise RuntimeError('作业所属学校不一致，已有内容已保留')
-    fill = _get(context, target['origin'], 'fill', {'reportId': target['report_id'], 'deptId': target['fid']})
+    concurrent = http_pool.supports_concurrency(context)
+    hint_type = str((record.get('lab_report') or {}).get('type') or '')
+    if concurrent:
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            f_report = pool.submit(_get, context, target['origin'], 'report', {'id': target['report_id'], 'deptId': target['fid']})
+            f_fill = pool.submit(_get, context, target['origin'], 'fill', {'reportId': target['report_id'], 'deptId': target['fid']})
+            f_instr = (
+                pool.submit(_get, context, target['origin'], 'instructions', {
+                    'reportId': target['report_id'], 'deptId': target['fid'], 'isTemplateAnswer': 'false'})
+                if hint_type in {'1', '2'} else None
+            )
+            f_child = (
+                pool.submit(_get, context, target['origin'], 'children', {'reportId': target['report_id'], 'deptId': target['fid']})
+                if hint_type == '3' else None
+            )
+            data = f_report.result()
+            if not isinstance(data, dict):
+                raise RuntimeError('作业详情结构无法识别，已有内容已保留')
+            reported_id = _first(data, 'reportId', 'id')
+            if reported_id is not None and str(reported_id) != target['report_id']:
+                raise RuntimeError('作业详情身份不一致，已有内容已保留')
+            reported_fid = _first(data, 'fid', 'deptId')
+            if reported_fid is not None and str(reported_fid) != target['fid']:
+                raise RuntimeError('作业所属学校不一致，已有内容已保留')
+            fill = f_fill.result()
+    else:
+        f_instr = f_child = None
+        data = _get(context, target['origin'], 'report', {'id': target['report_id'], 'deptId': target['fid']})
+        if not isinstance(data, dict):
+            raise RuntimeError('作业详情结构无法识别，已有内容已保留')
+        reported_id = _first(data, 'reportId', 'id')
+        if reported_id is not None and str(reported_id) != target['report_id']:
+            raise RuntimeError('作业详情身份不一致，已有内容已保留')
+        reported_fid = _first(data, 'fid', 'deptId')
+        if reported_fid is not None and str(reported_fid) != target['fid']:
+            raise RuntimeError('作业所属学校不一致，已有内容已保留')
+        fill = _get(context, target['origin'], 'fill', {'reportId': target['report_id'], 'deptId': target['fid']})
     if not isinstance(fill, dict):
         raise RuntimeError('当前作答信息无法识别，已有内容已保留')
     if fill.get('reportId') is not None and str(fill['reportId']) != target['report_id']:
@@ -551,7 +601,7 @@ def read_report(context, record):
     warnings = []
     if str(details.get('type')) in {'1', '2'}:
         try:
-            defaults = _get(context, target['origin'], 'instructions', {
+            defaults = f_instr.result() if f_instr is not None else _get(context, target['origin'], 'instructions', {
                 'reportId': target['report_id'], 'deptId': target['fid'], 'isTemplateAnswer': 'false'})
             instructions = _form_prefill_instructions(defaults)
             if instructions is not None:
@@ -591,7 +641,7 @@ def read_report(context, record):
             if name == 'student_attachments':
                 details['attachments_verified'] = False
     if str(details.get('type')) == '3':
-        sub = _get(context, target['origin'], 'children', {'reportId': target['report_id'], 'deptId': target['fid']})
+        sub = f_child.result() if f_child is not None else _get(context, target['origin'], 'children', {'reportId': target['report_id'], 'deptId': target['fid']})
         details['child_reports'] = _children(sub, target, details.get('course_id', ''))
     question = _upload_question(target['report_id'], details.get('upload_type')) if str(details.get('type')) == '2' else None
     if question:

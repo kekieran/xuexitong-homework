@@ -25,7 +25,7 @@
     <nav class="side-nav" aria-label="主导航">
       <button id="home" class="nav-item" type="button"><span data-icon="home"></span><span>首页</span></button>
       <div class="nav-row">
-        <button id="refresh" class="nav-item" type="button" title="刷新全部作业" aria-label="刷新全部作业"></button>
+        <button id="refresh" class="nav-item rf-btn" type="button" title="刷新全部作业" aria-label="刷新全部作业"></button>
         <span id="sync-badge" class="sync-badge" role="status" aria-live="polite"></span>
       </div>
     </nav>
@@ -42,13 +42,14 @@
         <button class="tab" role="tab" data-group="review" type="button">待核实<span class="tab-count" id="count-review">0</span></button>
         <button class="tab" role="tab" data-group="history" type="button">历史<span class="tab-count" id="count-history">0</span></button>
       </div>
-      <div id="subfilters" class="subfilters" hidden></div>
-      <div id="workspace-filters" class="workspace-filters" hidden>
+      <div id="subfilters-fold" class="filter-fold"><div class="filter-fold-inner"><div id="subfilters" class="subfilters"></div></div></div>
+      <div id="workspace-filters-fold" class="filter-fold"><div class="filter-fold-inner"><div id="workspace-filters" class="workspace-filters">
         <label class="mini-select"><span class="sr-only">作答进度</span><select id="progress-filter"><option value="all">全部进度</option><option value="unstarted">未作答</option><option value="partial">部分作答</option><option value="complete">已写完</option><option value="unread">题目待读取</option></select></label>
         <label class="mini-select"><span class="sr-only">截止范围</span><select id="due-filter"><option value="all">全部时间</option><option value="today">今天截止</option><option value="within_3_days">3 天内截止</option><option value="within_7_days">7 天内截止</option></select></label>
-      </div>
+      </div></div></div>
     </div>
 
+    <div id="diff-ribbon-slot" class="rib-slot" aria-live="polite"></div>
     <nav id="assignment-list" class="assignment-list" aria-label="作业"></nav>
 
     <div class="side-foot">
@@ -59,8 +60,8 @@
             <span id="account-menu-state">正在检查登录</span>
           </div>
           <div class="account-menu-items">
-            <button id="account-login-button" class="account-menu-item" style="--i:0" type="button">
-              <span data-icon="user"></span><span class="menu-label">账号与登录</span><small id="account-login-state">检查中…</small>
+            <button id="account-manage-button" class="account-menu-item" style="--i:0" type="button">
+              <span data-icon="user"></span><span class="menu-label">账号管理</span><small id="account-manage-meta">检查中…</small>
             </button>
             <button id="ai-settings-button" class="account-menu-item" style="--i:1" type="button">
               <span data-icon="sparkle"></span><span class="menu-label">AI 设置</span><small id="ai-model-label">未配置</small>

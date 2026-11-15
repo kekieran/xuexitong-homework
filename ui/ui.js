@@ -22,15 +22,33 @@ const S = {
   // Refresh feedback: when the running job began, how the last refresh ended,
   // and which records the last refresh added or changed (key -> timestamp).
   jobStart: 0, outcome: null, fresh: null, diff: null,
-  firstListAnimated: false, tabDir: 0, prevCounts: null,
+  refreshUi: {pct: 0, course: '', countText: '', phase: '', finTimer: null, finLabel: ''},
+  diffRibbon: null,
+  firstListAnimated: false, tabDir: 0, tabSeq: 0, tabTimer: 0, tabSwapEnter: false, prevCounts: null,
   addedKeys: null, deadlineChangedKeys: null,
   waveState: '', acctRevealState: '',
-  watchingSub: new Map(), subCheckKey: null,
+  watchingSub: new Map(), subCheckBusyKey: null, subCheckSeq: 0,
   navDir: '', prevDoneDots: new Map(), aiHintKeys: new Map(),
   welcomeAnimated: false, bellRingUntil: 0, remOpenedKey: null,
   dockPct: null, filterEnter: false, prevFilterCount: -1,
   lastImage: null, prevDockKey: null, listSelBox: null,
+  historyExpanded: false, historyCleanConfirm: false,
+  accountRemoveConfirmId: null, accountRenameId: null, accountRenameValue: '', accountRenameBusy: false,
+  loginListSig: '',
 };
+const HISTORY_FOLD_MS = 45 * 86400 * 1000;
+function recordTimeMs(raw) {
+  if (!raw || typeof raw !== 'string') return null;
+  const ms = Date.parse(raw.trim().replace(' ', 'T'));
+  return Number.isFinite(ms) ? ms : null;
+}
+function isOlderHistoryRecord(r, nowMs = Date.now()) {
+  if (!r || r.group !== 'history') return false;
+  const dl = recordTimeMs(r.deadline);
+  if (dl && dl > nowMs) return false;
+  const ref = recordTimeMs(r.deadline || r.start || r.notice_sent || r.status_checked_at || r.metadata_checked_at || r.history_cleaned_at);
+  return !!(ref && (nowMs - ref) > HISTORY_FOLD_MS);
+}
 const GROUP_IDX = {active: 0, review: 1, history: 2};
 function switchGroup(nextGroup) {
   if (nextGroup && nextGroup !== S.group) {
@@ -42,7 +60,8 @@ const OUTCOME_MS = 4500, FRESH_MS = 4200;
 const REDUCED_MOTION = () => window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
 const drafts = new Map(), dirty = new Map(), timers = new Map(), saving = new Map(), saveState = new Map();
 const draftChanges = new Map();
-let loginPhase = 'form', loginError = '';
+let loginPhase = 'form', loginError = '', loginAddMode = false;
+let loginView = 'form', loginTarget = null, loginFromList = false, loginAliasDraft = '';
 let fillPhase = 'check', fillResult = null;
 let accountMenuOpen = false;
 let warningDismissal;
@@ -582,6 +601,8 @@ function overview() {
   return HomeworkWorkspace.dashboard(S.records.map(r => ({...r, progress: progressFor(r)})));
 }
 function showWorkspaceList(group, progress = 'all', dueRange = 'all') {
+  clearTimeout(S.tabTimer); S.tabTimer = 0; ++S.tabSeq; S.tabSwapEnter = false;
+  $('#assignment-list')?.classList.remove('tab-leaving');
   switchGroup(group); S.sub = 'all'; S.progressFilter = progress; S.dueFilter = dueRange;
   $('#search').value = '';
   renderList(); setView('list');
@@ -597,7 +618,77 @@ async function goHome() {
   try { await load(); }
   catch (e) { toast('首页显示本机数据，更新失败：' + e.message, 'warn'); }
 }
+function syncTabsAndFilters() {
+  const tabsBar = $('.tabs');
+  if (tabsBar) {
+    tabsBar.classList.add('has-pill');
+    tabsBar.style.setProperty('--tab-idx', String(GROUP_IDX[S.group] ?? 0));
+  }
+  document.querySelectorAll('.tab').forEach(t => t.setAttribute('aria-selected', String(t.dataset.group === S.group)));
+  $('#home').setAttribute('aria-current', S.key ? 'false' : 'page');
+  const wsOpen = S.loaded && S.group === 'active';
+  const wsFold = $('#workspace-filters-fold');
+  if (wsFold) {
+    wsFold.classList.toggle('open', wsOpen);
+    wsFold.setAttribute('aria-hidden', String(!wsOpen));
+  }
+  const wsBox = $('#workspace-filters');
+  if (wsBox) wsBox.hidden = false;
+  $('#progress-filter').value = S.progressFilter;
+  $('#due-filter').value = S.dueFilter;
+  $('#progress-filter').classList.toggle('on', S.progressFilter !== 'all');
+  $('#due-filter').classList.toggle('on', S.dueFilter !== 'all');
+  const subs = SUBS[S.group], box = $('#subfilters'), subFold = $('#subfilters-fold');
+  const subOpen = !!(subs && S.loaded);
+  if (subFold) {
+    subFold.classList.toggle('open', subOpen);
+    subFold.setAttribute('aria-hidden', String(!subOpen));
+  }
+  if (box) {
+    box.hidden = false;
+    if (subs) {
+      box.replaceChildren();
+      const inGroup = S.records.filter(r => r.group === S.group);
+      for (const [id, label] of subs) {
+        const chip = el('button', 'chip', label);
+        chip.type = 'button';
+        chip.append(el('span', 'n', String(inGroup.filter(r => matchesSub(r, id)).length)));
+        chip.setAttribute('aria-pressed', String(S.sub === id));
+        chip.onclick = () => { S.sub = id; S.filterEnter = true; renderList(); };
+        box.append(chip);
+      }
+    }
+  }
+}
+function transitionToGroup(next) {
+  if (!next || next === S.group) return;
+  const seq = ++S.tabSeq;
+  clearTimeout(S.tabTimer);
+  switchGroup(next); S.sub = 'all'; S.progressFilter = S.dueFilter = 'all';
+  syncTabsAndFilters();
+  const list = $('#assignment-list');
+  if (!S.loaded || REDUCED_MOTION() || !list || !list.children.length) {
+    S.tabSwapEnter = false;
+    renderList();
+    return;
+  }
+  list.classList.remove('tab-entering');
+  void list.offsetWidth;
+  list.classList.add('tab-leaving');
+  S.tabTimer = setTimeout(() => {
+    if (seq !== S.tabSeq) return;
+    S.tabTimer = 0;
+    S.tabSwapEnter = true;
+    renderList();
+  }, 105);
+}
 function renderList() {
+  if (S.tabTimer && !S.tabSwapEnter) {
+    clearTimeout(S.tabTimer);
+    S.tabTimer = 0;
+  }
+  const entering = S.tabSwapEnter;
+  S.tabSwapEnter = false;
   const prevCounts = S.prevCounts;
   const nextCounts = {};
   for (const g of Object.keys(GROUPS)) {
@@ -612,34 +703,11 @@ function renderList() {
     }
   }
   if (S.loaded) S.prevCounts = nextCounts;
-  const tabsBar = $('.tabs');
-  if (tabsBar) {
-    tabsBar.classList.add('has-pill');
-    tabsBar.style.setProperty('--tab-idx', String(GROUP_IDX[S.group] ?? 0));
-  }
-  document.querySelectorAll('.tab').forEach(t => t.setAttribute('aria-selected', String(t.dataset.group === S.group)));
-  $('#home').setAttribute('aria-current', S.key ? 'false' : 'page');
-  $('#workspace-filters').hidden = !S.loaded || S.group !== 'active';
-  $('#progress-filter').value = S.progressFilter;
-  $('#due-filter').value = S.dueFilter;
-  $('#progress-filter').classList.toggle('on', S.progressFilter !== 'all');
-  $('#due-filter').classList.toggle('on', S.dueFilter !== 'all');
-  const subs = SUBS[S.group], box = $('#subfilters');
-  box.replaceChildren();
-  box.hidden = !subs || !S.loaded;
-  if (subs) {
-    const inGroup = S.records.filter(r => r.group === S.group);
-    for (const [id, label] of subs) {
-      const chip = el('button', 'chip', label);
-      chip.type = 'button';
-      chip.append(el('span', 'n', String(inGroup.filter(r => matchesSub(r, id)).length)));
-      chip.setAttribute('aria-pressed', String(S.sub === id));
-      chip.onclick = () => { S.sub = id; S.filterEnter = true; renderList(); };
-      box.append(chip);
-    }
-  }
+  syncTabsAndFilters();
   const list = $('#assignment-list');
+  const prevScroll = entering ? 0 : list.scrollTop;
   const previousSel = list.querySelector('.list-sel');
+  list.classList.remove('tab-leaving');
   list.replaceChildren();
   const sel = previousSel || el('div', 'list-sel');
   list.append(sel);
@@ -658,7 +726,6 @@ function renderList() {
   }
   const firstIn = !S.firstListAnimated;
   S.firstListAnimated = true;
-  const tabDir = S.tabDir;
   S.tabDir = 0;
   const filterEnter = S.filterEnter;
   S.filterEnter = false;
@@ -700,27 +767,82 @@ function renderList() {
   if (!items.length) {
     sel.style.opacity = '0';
     const emptyNode = listEmpty(qLower, match);
-    emptyNode.classList.add('anim-in');
-    if (tabDir) { emptyNode.classList.add('tab-in'); emptyNode.style.setProperty('--dx', String(tabDir)); emptyNode.style.setProperty('--i', '0'); }
+    if (!entering) emptyNode.classList.add('anim-in');
     list.append(emptyNode);
+    list.scrollTop = prevScroll;
+    if (entering) restartAnim(list, 'tab-entering');
     return;
   }
   let section = null, idx = 0;
-  for (const r of items) {
-    if (S.group === 'active') {
-      const s = sectionOf(r);
-      if (s !== section) {
-        section = s;
-        const heading = el('div', 'list-section ' + due(r).tone);
-        heading.append(icon('clock'), document.createTextNode(s));
-        list.append(heading);
+  if (S.group === 'history' && !hasFilter) {
+    const recentItems = [], olderItems = [];
+    const nowMs = Date.now();
+    for (const r of items) {
+      if (isOlderHistoryRecord(r, nowMs)) olderItems.push(r);
+      else recentItems.push(r);
+    }
+    for (const r of recentItems) list.append(listItem(r, idx++, firstIn, 0, !entering && filterEnter, query));
+    if (olderItems.length) {
+      const fold = el('div', 'history-fold');
+      const head = el('div', 'history-fold-row');
+      const toggle = el('button', 'history-fold-toggle');
+      toggle.type = 'button';
+      toggle.setAttribute('aria-expanded', String(S.historyExpanded));
+      toggle.append(
+        el('span', '', S.historyExpanded ? `收起更早历史（超过 45 天，${olderItems.length} 项）` : `显示更早历史（超过 45 天，${olderItems.length} 项）`),
+        icon('chevron', S.historyExpanded ? 'rotated' : '')
+      );
+      toggle.onclick = () => {
+        S.historyExpanded = !S.historyExpanded;
+        S.historyCleanConfirm = false;
+        renderList();
+      };
+      head.append(toggle);
+      if (S.historyCleanConfirm) {
+        const confirmBtn = btn('确认清理', 'btn-quiet btn-xs danger', async () => {
+          S.historyCleanConfirm = false;
+          await cleanupOldHistory();
+        });
+        const cancelBtn = btn('取消', 'btn-quiet btn-xs', () => {
+          S.historyCleanConfirm = false;
+          renderList();
+        });
+        confirmBtn.disabled = S.job.busy;
+        head.append(confirmBtn, cancelBtn);
+      } else {
+        const cleanBtn = btn('清理更早历史', 'btn-quiet btn-xs', () => {
+          S.historyCleanConfirm = true;
+          renderList();
+        });
+        cleanBtn.disabled = S.job.busy;
+        head.append(cleanBtn);
+      }
+      fold.append(head);
+      list.append(fold);
+      if (S.historyExpanded) {
+        for (const r of olderItems) list.append(listItem(r, idx++, false, 0, false, query));
       }
     }
-    list.append(listItem(r, idx++, firstIn, tabDir, filterEnter, query));
+  } else {
+    for (const r of items) {
+      if (S.group === 'active') {
+        const s = sectionOf(r);
+        if (s !== section) {
+          section = s;
+          const heading = el('div', 'list-section ' + due(r).tone);
+          heading.append(icon('clock'), document.createTextNode(s));
+          list.append(heading);
+        }
+      }
+      list.append(listItem(r, idx++, firstIn, 0, !entering && filterEnter, query));
+    }
   }
-  placeListSel(sel, true);
+  list.scrollTop = prevScroll;
+  placeListSel(sel, !entering);
+  if (entering) restartAnim(list, 'tab-entering');
   if (S.job.busy && S.job.action === 'refresh' && !S.jobKey) {
     list.querySelectorAll('.item').forEach((n, i) => { n.style.setProperty('--i', String(Math.min(i, 8))); n.classList.add('wave'); });
+    syncScanningRows(S.refreshUi.course);
   }
 }
 function placeListSel(sel, animate = true) {
@@ -762,6 +884,7 @@ function listItem(r, idx = 0, firstIn = false, tabDir = 0, filterEnter = false, 
   const d = due(r), b = el('button', 'item' + (r.group === 'active' && d.tone === 'urgent' ? ' urgent' : ''));
   b.type = 'button';
   b.dataset.key = r.key;
+  b.dataset.course = r.course || '';
   if (r.key === S.key) b.setAttribute('aria-current', 'true');
   // New or changed since the last refresh: continue the highlight where it was
   // even if the list is rebuilt mid-animation.
@@ -836,7 +959,7 @@ function listEmpty(query, match) {
   if (query) {
     box.append(el('strong', '', '没有匹配的作业'));
     const others = Object.keys(GROUPS).filter(g => g !== S.group).map(g => [g, S.records.filter(r => r.group === g && match(r)).length]).filter(([, n]) => n);
-    for (const [g, n] of others) row.append(btn(`${GROUPS[g]}中有 ${n} 项`, 'btn-sm', () => { switchGroup(g); S.sub = 'all'; renderList(); }));
+    for (const [g, n] of others) row.append(btn(`${GROUPS[g]}中有 ${n} 项`, 'btn-sm', () => transitionToGroup(g)));
     row.append(btn('清除搜索', 'btn-sm btn-ghost', () => { $('#search').value = ''; renderList(); $('#search').focus(); }));
     box.append(row);
     return box;
@@ -855,6 +978,15 @@ function userInitial(username) {
   const ch = (username || '').trim().charAt(0);
   return ch ? ch.toUpperCase() : '学';
 }
+function savedAccountsList() {
+  const raw = Array.isArray(S.auth?.accounts) ? S.auth.accounts : [];
+  return raw.filter(x => x.username || x.has_uid || x.saved_credentials || x.has_session);
+}
+function activeAccountInfo() {
+  const a = S.auth || {};
+  const list = Array.isArray(a.accounts) ? a.accounts : [];
+  return list.find(x => x.id === a.active_account_id) || list.find(x => x.active) || null;
+}
 function renderAccount() {
   const box = $('#account');
   box.replaceChildren();
@@ -862,8 +994,11 @@ function renderAccount() {
   const loggingIn = S.job.busy && S.job.action === 'login' && !S.acctRevealState;
   const checking = (loggingIn || a.state === 'checking') && !S.acctRevealState;
   const loggedIn = a.state === 'logged_in';
-  const username = a.credentials?.username?.trim();
-  const schoolLabel = a.school_name || '作业通';
+  const act = activeAccountInfo();
+  const username = (act?.username || a.credentials?.username || '').trim();
+  const alias = (act?.alias || a.account_alias || '').trim();
+  const displayName = alias || (act?.label || a.account_label || '').trim() || username;
+  const schoolLabel = act?.school_name || a.school_name || '作业通';
   const row = el('button', 'account-row'), avatar = el('div', 'avatar' + (loggedIn ? ' clay-ava' : ' off')),
     text = el('div', 'account-text');
   row.type = 'button';
@@ -878,7 +1013,7 @@ function renderAccount() {
     text.append(el('small', '', loggingIn && S.job.message !== '正在处理…' ? S.job.message : '请稍候'));
     row.disabled = true;
   } else {
-    avatar.textContent = loggedIn ? userInitial(username) : '未';
+    avatar.textContent = loggedIn ? userInitial(displayName || username) : '未';
     if (S.acctRevealState === 'hiding') {
       avatar.classList.add('ava-hide');
       text.classList.add('info-hide');
@@ -889,8 +1024,11 @@ function renderAccount() {
         setTimeout(() => { if (text.isConnected && S.acctRevealState === 'landing') text.classList.add('pop-ribbon'); }, 120);
       }
     }
-    text.append(el('strong', '', loggedIn ? (username || '作业通账号') : '登录作业通'));
-    text.append(el('small', '', loggedIn ? schoolLabel : everLoggedIn() ? '登录已失效' : '尚未登录'));
+    text.append(el('strong', '', loggedIn ? (displayName || '作业通账号') : '登录作业通'));
+    const sub = loggedIn
+      ? (alias && username && alias !== username ? `${username} · ${schoolLabel}` : schoolLabel)
+      : everLoggedIn() ? '登录已失效' : '尚未登录';
+    text.append(el('small', '', sub));
     row.onclick = e => { e.stopPropagation(); toggleAccountMenu(); };
   }
   if (!checking) row.append(icon('chevron', 'account-chevron'));
@@ -900,27 +1038,160 @@ function renderAccount() {
 }
 function renderAccountMenu() {
   const menu = $('#account-menu'), a = S.auth || {state: 'checking', sites: {}};
+  const wasOpen = !menu.hidden && menu.classList.contains('open');
   menu.hidden = !accountMenuOpen;
   if (accountMenuOpen) {
-    menu.classList.remove('open');
-    requestAnimationFrame(() => { if (accountMenuOpen && !menu.hidden) menu.classList.add('open'); });
+    if (!wasOpen) {
+      menu.classList.remove('open');
+      requestAnimationFrame(() => { if (accountMenuOpen && !menu.hidden) menu.classList.add('open'); });
+    }
   } else {
     menu.classList.remove('open');
   }
   menu.setAttribute('role', 'menu');
-  const username = a.credentials?.username?.trim();
-  $('#account-menu-name').textContent = username || (a.state === 'logged_in' ? '作业通账号' : '作业助手');
+  const act = activeAccountInfo();
+  const username = (act?.username || a.credentials?.username || '').trim();
+  const alias = (act?.alias || a.account_alias || '').trim();
+  const displayName = alias || (act?.label || a.account_label || '').trim() || username;
+  $('#account-menu-name').textContent = (alias && username && alias !== username)
+    ? `${alias} · ${username}`
+    : (displayName || (a.state === 'logged_in' ? '作业通账号' : '作业助手'));
   $('#account-menu-state').textContent = a.state === 'logged_in' ? '作业通已登录' : everLoggedIn() ? '登录已失效' : '尚未登录';
-  $('#account-login-state').textContent = a.state === 'logged_in' ? '重新登录' : '登录';
+  const meta = $('#account-manage-meta');
+  if (meta) {
+    const accounts = savedAccountsList();
+    if (accounts.length > 1) {
+      meta.textContent = `${accounts.length} 个账号 · ${a.state === 'logged_in' ? '已登录' : '待登录'}`;
+    } else if (accounts.length === 1) {
+      meta.textContent = a.state === 'logged_in' ? '已登录' : everLoggedIn() ? '登录已失效' : '点击重登';
+    } else {
+      meta.textContent = '点击登录';
+    }
+  }
+}
+async function cleanupOldHistory() {
+  try {
+    const res = await api('/api/history/cleanup', {days: 45});
+    S.historyExpanded = false;
+    S.historyCleanConfirm = false;
+    await load();
+    toast(res.removed_records ? `已清理 ${res.removed_records} 项更早历史` : '当前没有可清理的更早历史', 'ok');
+  } catch (e) {
+    toast(e.message, 'error');
+  }
+}
+function resetDraftStateForAccountSwitch() {
+  drafts.clear();
+  dirty.clear();
+  timers.forEach(t => clearTimeout(t));
+  timers.clear();
+  saving.clear();
+  saveState.clear();
+  draftChanges.clear();
+  S.key = null;
+  S.historyExpanded = false;
+  S.historyCleanConfirm = false;
+}
+async function switchAccount(id) {
+  if (!id || S.job.busy) return;
+  try {
+    closeAccountMenu();
+    closeSheet($('#login-dialog'));
+    await flushAll().catch(() => {});
+    resetDraftStateForAccountSwitch();
+    const res = await api('/api/account/switch', {id});
+    S.auth = res.auth || S.auth;
+    renderAccount();
+    const data = await load();
+    toast(`已切换到 ${res.account?.label || '选定账号'}`, 'ok');
+    if (!data?.last_success && !S.job.busy && S.online) {
+      startAction('refresh').catch(() => {});
+    }
+  } catch (e) {
+    toast(e.message, 'error');
+  }
+}
+async function renameAccount(id, label) {
+  if (!id || S.job.busy || S.accountRenameBusy) return false;
+  S.accountRenameBusy = true;
+  try {
+    const res = await api('/api/account/rename', {id, label});
+    S.auth = res.auth || S.auth;
+    S.accountRenameId = null;
+    S.accountRenameValue = '';
+    S.loginListSig = '';
+    renderAccount();
+    if ($('#login-dialog').open && loginPhase === 'form') {
+      const listPane = $('#login-body .m3-view[data-pane="list"]');
+      if (listPane) renderM3ListPane(listPane);
+    }
+    toast(res.account?.alias ? `已将备注设为「${res.account.alias}」` : '已恢复默认账号名称', 'ok');
+    return true;
+  } catch (e) {
+    toast(e.message, 'error');
+    return false;
+  } finally {
+    S.accountRenameBusy = false;
+  }
+}
+function startAccountRename(acct) {
+  if (!acct || S.job.busy) return;
+  S.accountRemoveConfirmId = null;
+  S.accountRenameId = acct.id;
+  S.accountRenameValue = acct.alias || '';
+  S.loginListSig = '';
+  const listPane = $('#login-body .m3-view[data-pane="list"]');
+  if (listPane) {
+    renderM3ListPane(listPane);
+    const inp = listPane.querySelector('.m3-rename-input');
+    if (inp) { inp.focus({preventScroll: true}); inp.select(); }
+  }
+}
+function cancelAccountRename() {
+  if (!S.accountRenameId) return;
+  S.accountRenameId = null;
+  S.accountRenameValue = '';
+  S.loginListSig = '';
+  const listPane = $('#login-body .m3-view[data-pane="list"]');
+  if (listPane) renderM3ListPane(listPane);
+}
+async function removeAccount(id) {
+  if (!id || S.job.busy) return;
+  try {
+    await flushAll().catch(() => {});
+    const res = await api('/api/account/remove', {id});
+    if (res.switched) {
+      resetDraftStateForAccountSwitch();
+    }
+    S.auth = res.auth || S.auth;
+    S.accountRenameId = null;
+    S.accountRemoveConfirmId = null;
+    S.loginListSig = '';
+    await load();
+    renderAccount();
+    if ($('#login-dialog').open && loginPhase === 'form') {
+      if (savedAccountsList().length === 0 && loginView === 'list') {
+        loginFromList = false;
+        slideM3View('form', {addMode: false, target: null});
+      } else {
+        const listPane = $('#login-body .m3-view[data-pane="list"]');
+        if (listPane) renderM3ListPane(listPane);
+      }
+    }
+    toast('已移除该账号的本机数据', 'ok');
+  } catch (e) {
+    toast(e.message, 'error');
+  }
 }
 function toggleAccountMenu() {
   if (accountMenuOpen) { closeAccountMenu(); return; }
   accountMenuOpen = true;
   renderAccount();
-  $('#account-login-button').focus({preventScroll: true});
+  $('#account-manage-button')?.focus({preventScroll: true});
 }
 function closeAccountMenu() {
   if (!accountMenuOpen) return;
+  S.accountRemoveConfirmId = null;
   const menu = $('#account-menu');
   if (menu && !menu.hidden && !REDUCED_MOTION()) {
     const r = menu.getBoundingClientRect();
@@ -947,6 +1218,138 @@ function renderReminderRow() {
   small.textContent = !r ? '读取中…' : r.enabled ? reminderNextText(r) : '已关闭';
   small.classList.toggle('off', !!r && !r.enabled);
 }
+function ensureRefreshDom(btnNode) {
+  if (!btnNode || btnNode.dataset.rfInit) return;
+  btnNode.dataset.rfInit = '1';
+  const fill = el('span', 'rf-fill');
+  const ic = el('span', 'rf-ic');
+  const tx = el('span', 'rf-tx', '刷新全部');
+  const cnt = el('span', 'rf-count');
+  btnNode.replaceChildren(fill, ic, tx, cnt);
+}
+function parseRefreshProgress() {
+  const msg = S.job.message && S.job.message !== '正在处理…' ? S.job.message : '';
+  const sec = Math.max(0, Math.floor((Date.now() - (S.jobStart || Date.now())) / 1000));
+  let m = msg.match(/^正在核对课程（(\d+)\/(\d+)）：(.+)$/);
+  if (m) {
+    const idx = Math.max(1, Number(m[1])), total = Math.max(idx, Number(m[2])), course = m[3].trim();
+    const pct = Math.max(S.refreshUi.pct || 0.14, Math.min(0.86, 0.16 + 0.64 * (idx / total)));
+    return {pct, course, label: '核对 ' + course, countText: `${idx}/${total}`};
+  }
+  m = msg.match(/^正在核对[：:](.+?)(?:\s*\/\s*(.+))?$/);
+  if (m) {
+    const course = m[1].trim();
+    const pct = Math.max(S.refreshUi.pct || 0.68, Math.min(0.95, 0.72 + Math.min(0.22, sec * 0.015)));
+    return {pct, course, label: '核对 ' + course, countText: sec + 's'};
+  }
+  const pct = Math.max(S.refreshUi.pct || 0.12, Math.min(0.42, 0.15 + sec * 0.025));
+  return {pct, course: '', label: msg || '正在连接学习通…', countText: sec > 0 ? sec + 's' : ''};
+}
+function syncScanningRows(courseName) {
+  const list = $('#assignment-list');
+  if (!list) return;
+  const target = (courseName || '').trim();
+  list.querySelectorAll('.item').forEach(node => {
+    const c = (node.dataset.course || '').trim();
+    const match = !!target && !!c && (c === target || c.includes(target) || target.includes(c));
+    node.classList.toggle('scan', match);
+  });
+}
+function renderRefreshButton(refreshing) {
+  const refresh = $('#refresh');
+  if (!refresh) return;
+  ensureRefreshDom(refresh);
+  const fill = refresh.querySelector('.rf-fill');
+  const ic = refresh.querySelector('.rf-ic');
+  const tx = refresh.querySelector('.rf-tx');
+  const cnt = refresh.querySelector('.rf-count');
+  const badge = $('#sync-badge');
+
+  if (refreshing) {
+    if (S.refreshUi.finTimer) { clearTimeout(S.refreshUi.finTimer); S.refreshUi.finTimer = null; }
+    S.refreshUi.phase = 'busy';
+    const info = parseRefreshProgress();
+    S.refreshUi.pct = info.pct;
+    S.refreshUi.course = info.course;
+    S.refreshUi.countText = info.countText;
+    refresh.classList.add('is-busy');
+    refresh.classList.remove('fin', 'fin-warn');
+    if (fill) fill.style.transform = `scaleX(${info.pct.toFixed(3)})`;
+    if (ic.dataset.icon !== 'refresh-spin') { ic.dataset.icon = 'refresh-spin'; ic.replaceChildren(icon('refresh', 'spin')); }
+    if (tx.textContent !== info.label) tx.textContent = info.label;
+    if (cnt.textContent !== info.countText) cnt.textContent = info.countText;
+    if (badge) badge.hidden = true;
+    syncScanningRows(info.course);
+    return;
+  }
+
+  syncScanningRows('');
+  if (S.refreshUi.phase === 'fin') {
+    refresh.classList.remove('is-busy');
+    refresh.classList.add('fin');
+    refresh.classList.toggle('fin-warn', S.refreshUi.finTone === 'warn');
+    if (fill) fill.style.transform = 'scaleX(1)';
+    const iconKey = S.refreshUi.finTone === 'warn' ? 'alert' : 'check';
+    if (ic.dataset.icon !== iconKey) { ic.dataset.icon = iconKey; ic.replaceChildren(icon(iconKey)); }
+    if (tx.textContent !== S.refreshUi.finLabel) tx.textContent = S.refreshUi.finLabel;
+    if (cnt.textContent !== '') cnt.textContent = '';
+    if (badge) badge.hidden = true;
+    return;
+  }
+
+  refresh.classList.remove('is-busy', 'fin', 'fin-warn');
+  S.refreshUi.pct = 0;
+  S.refreshUi.course = '';
+  if (fill) fill.style.transform = 'scaleX(0)';
+  const idleIcon = !refreshing && S.waveState === 'settle' ? 'refresh-settle' : 'refresh';
+  if (ic.dataset.icon !== idleIcon) {
+    ic.dataset.icon = idleIcon;
+    ic.replaceChildren(icon('refresh', S.waveState === 'settle' ? 'settle' : ''));
+  }
+  if (tx.textContent !== '刷新全部') tx.textContent = '刷新全部';
+  if (cnt.textContent !== '') cnt.textContent = '';
+  if (badge) badge.hidden = false;
+}
+function finishRefreshButton(label, tone = 'ok', holdMs = 1900) {
+  clearTimeout(S.refreshUi.finTimer);
+  S.refreshUi.phase = 'fin';
+  S.refreshUi.finLabel = label;
+  S.refreshUi.finTone = tone;
+  renderRefreshButton(false);
+  S.refreshUi.finTimer = setTimeout(() => {
+    if (S.refreshUi.phase === 'fin') {
+      S.refreshUi.phase = '';
+      S.refreshUi.finTimer = null;
+      renderRefreshButton(false);
+      renderSyncBadge();
+    }
+  }, holdMs);
+}
+function renderDiffRibbon() {
+  const slot = $('#diff-ribbon-slot');
+  if (!slot) return;
+  const d = S.diffRibbon;
+  if (!d) {
+    slot.classList.remove('open');
+    slot.replaceChildren();
+    return;
+  }
+  const parts = [];
+  if (d.added) parts.push(`+${d.added} 新增`);
+  if (d.deadlineChanged) parts.push(`${d.deadlineChanged} 改期`);
+  if (d.archived) parts.push(`${d.archived} 已归档`);
+  if (d.otherChanged) parts.push(`${d.otherChanged} 状态更新`);
+  if (d.partial && !parts.length) parts.push('部分课程同步受限');
+  const box = el('div', 'ribbon on' + (d.partial ? ' warn' : ''));
+  const dot = el('span', 'rib-dot');
+  const txt = el('span', 'rib-txt', (d.partial ? '部分同步 · ' : '刚刚更新 · ') + (parts.join(' · ') || '列表已同步'));
+  const close = btn('', 'rib-x', () => { S.diffRibbon = null; renderDiffRibbon(); }, 'x');
+  close.setAttribute('aria-label', '关闭更新摘要');
+  box.append(dot, txt, close);
+  slot.replaceChildren(box);
+  requestAnimationFrame(() => { if (slot.isConnected && S.diffRibbon) slot.classList.add('open'); });
+}
+
 function renderSyncLine() {
   const line = $('.sync-line');
   line.replaceChildren();
@@ -960,9 +1363,7 @@ function renderSyncLine() {
     line.append(el('span', '', S.lastSuccess ? '更新于 ' + stamp(S.lastSuccess) : '尚未更新'));
   }
   const refresh = $('#refresh'), refreshing = S.job.busy && S.job.action === 'refresh' && !S.jobKey;
-  const justFinishedRefresh = !refreshing && S.waveState === 'settle';
-  refresh.replaceChildren(icon('refresh', refreshing ? 'spin' : justFinishedRefresh ? 'settle' : ''), el('span', '', refreshing ? '刷新中…' : '刷新全部'));
-  refresh.classList.toggle('is-busy', refreshing);
+  renderRefreshButton(refreshing);
   refresh.setAttribute('aria-busy', String(refreshing));
   refresh.disabled = S.job.busy || !S.online;
   refresh.title = !S.online ? '网络不可用' : refreshing ? '正在刷新作业…' : S.job.busy ? '请等待当前操作完成' : '更新所有课程的作业列表、截止时间和提交状态';
@@ -1008,10 +1409,11 @@ function elapsedText() {
 function renderSyncBadge() {
   const badge = $('#sync-badge');
   const refreshing = S.job.busy && S.job.action === 'refresh' && !S.jobKey;
+  if (refreshing || S.refreshUi.phase === 'fin') { badge.hidden = true; return; }
+  badge.hidden = false;
   const recent = S.outcome && Date.now() - S.outcome.at < (S.outcome.latest ? 1700 : OUTCOME_MS) ? S.outcome : null;
   let tone = '', iconName = '', text = '', hint = '';
-  if (refreshing) { tone = 'busy'; text = elapsedText(); hint = '正在从学习通读取作业'; }
-  else if (!S.online) { tone = 'warn'; iconName = 'offline'; text = '网络不可用'; }
+  if (!S.online) { tone = 'warn'; iconName = 'offline'; text = '网络不可用'; }
   else if (recent) {
     tone = recent.tone;
     iconName = recent.tone === 'ok' ? 'check' : 'alert';
@@ -1034,6 +1436,7 @@ function tickElapsed() {
   document.querySelectorAll('[data-elapsed]').forEach(n => { n.textContent = '已用 ' + text; });
   document.querySelectorAll('.slow-hint').forEach(n => { n.hidden = !slow; });
   renderSyncBadge();
+  if (S.job.action === 'refresh' && !S.jobKey) renderRefreshButton(true);
 }
 
 /* ---------- Banners ---------- */
@@ -1141,7 +1544,7 @@ function renderBanners() {
     const ever = everLoggedIn();
     items.push({key: 'login', sig: String(ever), build: () => banner('login', 'lock', ever ? '登录已失效' : '尚未登录', '登录后才能读取题目和填入答案。', [btn('登录作业通', 'btn-sm btn-primary', openLogin)])});
   }
-  if (S.job.busy && S.job.action !== 'login') {
+  if (S.job.busy && S.job.action !== 'login' && S.job.action !== 'refresh') {
     items.push({key: 'busy', sig: [S.job.action, S.jobKey, S.job.message].join('|'), build: busyBanner});
   }
   const warnings = visibleUpdateWarnings();
@@ -1163,7 +1566,11 @@ function renderStatus(force = false) {
   window.HomeworkAI?.lockInputs(r);
   if (r && drafts.has(r.key)) { renderDock(r); renderReading(r); }
   else if (!S.key) renderWelcome();
-  if ($('#login-dialog').open) renderLogin();
+  if ($('#login-dialog').open) {
+    const typingInLogin = loginPhase === 'form' && $('#login-body')?.contains(document.activeElement)
+      && /^(INPUT|TEXTAREA)$/.test(document.activeElement?.tagName || '');
+    if (!typingInLogin) renderLogin();
+  }
   if ($('#fill-dialog').open && fillPhase === 'running') renderFill();
   if ($('#reminder-dialog').open && !S.reminderEditing && !$('#reminder-body').contains(document.activeElement)) renderReminder();
 }
@@ -1584,21 +1991,21 @@ function renderContentWarning(r) {
 function renderSubWatchBar(r) {
   const watch = S.watchingSub.get(r.key);
   if (!watch || r.group === 'history') return null;
-  const checking = S.job.busy && S.job.action === 'refresh' && S.jobKey === r.key;
+  const checking = S.subCheckBusyKey === r.key;
   const isWarn = watch.state === 'unsubmitted' && !checking;
   const bar = el('div', 'sub-watch' + (checking ? ' busy' : isWarn ? ' warn' : ''));
   bar.id = 'sub-watch-bar';
   if (checking) {
-    bar.append(el('span', 'pulse-dot'), el('span', 'sub-watch-text', '正在核对学习通提交状态…'));
+    bar.append(el('span', 'pulse-dot'), el('span', 'sub-watch-text', '正在后台核对提交状态…'));
   } else if (isWarn) {
     bar.append(icon('alert'), el('span', 'sub-watch-text', '未检测到提交（若已在网页保存，仍需在网页点击提交），作业仍保留在待完成'));
     const retry = btn('再检查', 'btn-sm', () => triggerSubmissionCheck(r.key), 'refresh');
-    retry.disabled = S.job.busy || !S.online;
+    retry.disabled = !S.online;
     bar.append(retry);
   } else {
-    bar.append(el('span', 'pulse-dot'), el('span', 'sub-watch-text', '已在学习通打开作业，提交后切回本窗口将自动移入历史'));
+    bar.append(el('span', 'pulse-dot'), el('span', 'sub-watch-text', '已在学习通打开作业，提交后切回本窗口将自动核对'));
     const checkNow = btn('我已提交，立即检查', 'btn-sm', () => triggerSubmissionCheck(r.key), 'check');
-    checkNow.disabled = S.job.busy || !S.online;
+    checkNow.disabled = !S.online;
     bar.append(checkNow);
   }
   return bar;
@@ -1781,7 +2188,7 @@ function watchQuestions() {
 }
 function renderReading(r) {
   const main = $('.main');
-  const reading = S.job.busy && S.job.action === 'refresh' && S.jobKey === r.key;
+  const reading = S.job.busy && S.job.action === 'refresh' && S.jobKey === r.key && !(r.questions && r.questions.length) && !S.watchingSub.has(r.key);
   let overlay = main.querySelector('.reading');
   if (!reading) { overlay?.remove(); return; }
   const detail = S.job.message && S.job.message !== '正在处理…' ? S.job.message : '读取完成后会自动更新';
@@ -2308,6 +2715,12 @@ async function startAction(name, key = null, extra = {}) {
     if (name === 'fill' || name === 'ai') return false;
   }
   try {
+    if (name === 'refresh' && !key) {
+      clearTimeout(S.refreshUi.finTimer);
+      S.refreshUi = {pct: 0.12, course: '', countText: '', phase: 'busy', finTimer: null, finLabel: '', finTone: ''};
+      S.diffRibbon = null;
+      renderDiffRibbon();
+    }
     const job = await api('/api/action', {action: name, key, ...extra});
     S.jobKey = key;
     applyJob(job);
@@ -2335,20 +2748,54 @@ function markWatchingSubmission(key) {
   const cKey = canonicalKey(key);
   const r = S.records.find(x => x.key === cKey);
   if (!r || r.group === 'history') return;
+  const now = Date.now();
   S.watchingSub.set(cKey, {
     state: 'watching',
-    readyAt: Date.now(),
+    readyAt: now,
+    nextAutoAt: now + 8000,
     blurred: document.visibilityState === 'hidden' || !document.hasFocus(),
+    blurredAt: (document.visibilityState === 'hidden' || !document.hasFocus()) ? now : 0,
   });
   if (S.key === cKey && drafts.has(cKey)) renderDetail(r, drafts.get(cKey), true);
 }
-async function triggerSubmissionCheck(key) {
+async function triggerSubmissionCheck(key, {auto = false} = {}) {
   const cKey = canonicalKey(key);
-  if (!cKey || S.job.busy || !S.online) return;
-  S.subCheckKey = cKey;
-  const ok = await startAction('refresh', cKey);
-  if (!ok) S.subCheckKey = null;
-  else if (S.key === cKey && drafts.has(cKey)) renderDetail(record(), drafts.get(cKey), true);
+  if (!cKey || !S.online || S.subCheckBusyKey) return;
+  if (auto && S.job.busy) return;
+  const seq = ++S.subCheckSeq;
+  S.subCheckBusyKey = cKey;
+  if (S.key === cKey && drafts.has(cKey)) renderDetail(record(), drafts.get(cKey), true);
+  try {
+    const res = await api('/api/submission-check', {key: cKey, auto});
+    if (S.subCheckSeq !== seq || res?.skipped) return;
+    await load();
+    const updatedKey = canonicalKey(res?.key || cKey);
+    const updated = S.records.find(x => x.key === updatedKey) || S.records.find(x => x.key === cKey);
+    if (res?.submitted || (updated && (updated.status === 'submitted' || updated.group === 'history'))) {
+      S.watchingSub.delete(cKey);
+      if (updatedKey) S.watchingSub.delete(updatedKey);
+      renderList();
+      if (updated) playSubmittedArchiveAnim(updated);
+      toast('已检测到提交，已自动移入历史', 'ok');
+    } else if (updated && S.watchingSub.has(cKey)) {
+      const now = Date.now();
+      S.watchingSub.set(cKey, {
+        state: 'unsubmitted',
+        readyAt: now,
+        nextAutoAt: now + 30000,
+        blurred: false,
+        blurredAt: 0,
+      });
+      renderList();
+      if (!auto) toast('暂未检测到提交，作业仍保留在待完成', 'warn');
+    }
+  } catch (e) {
+    if (!auto) toast('检查提交状态失败：' + e.message, 'error');
+  } finally {
+    if (S.subCheckBusyKey === cKey) S.subCheckBusyKey = null;
+    const cur = record();
+    if (cur && canonicalKey(cur.key) === cKey && drafts.has(cKey)) renderDetail(cur, drafts.get(cKey), true);
+  }
 }
 function playSubmittedArchiveAnim(r) {
   const hero = document.querySelector('#detail .hero');
@@ -2400,37 +2847,46 @@ function onJobDone(job, key) {
   }
   if (job.action === 'refresh') {
     const cKey = key ? canonicalKey(key) : null;
-    if (cKey && (S.subCheckKey === cKey || S.watchingSub.has(cKey))) {
-      S.subCheckKey = null;
+    if (cKey && S.watchingSub.has(cKey)) {
       const r = S.records.find(x => x.key === cKey);
       if (!failed && r && (r.status === 'submitted' || r.group === 'history')) {
         S.watchingSub.delete(cKey);
         renderList();
         playSubmittedArchiveAnim(r);
         return toast('已检测到提交，已自动移入历史', 'ok');
-      } else if (!failed && r && S.watchingSub.has(cKey)) {
-        S.watchingSub.set(cKey, {state: 'unsubmitted', readyAt: Date.now(), blurred: false});
-        renderList();
-        if (S.key === cKey && drafts.has(cKey)) renderDetail(r, drafts.get(cKey), true);
-        return toast('暂未检测到提交，作业仍保留在待完成', 'warn');
       }
     }
     if (!key) setOutcome(failed ? 'error' : /部分/.test(job.message || '') ? 'warn' : 'ok');
     if (failed) {
+      if (!key) { S.refreshUi.phase = ''; renderRefreshButton(false); }
       const msg = job.message || '刷新失败', named = /刷新失败/.test(msg);
       return toast(msg, 'error', {title: named ? msg : '刷新失败', detail: named ? '' : msg, action: {label: '重试', onClick: () => startAction('refresh', key)}});
     }
-    if (key) return toast('题目已重新读取', 'ok');
-    const n = S.records.filter(r => r.group === 'active').length, m = S.records.filter(r => r.group === 'review').length, d = S.diff || {added: 0, changed: 0};
+    if (key) {
+      const r = S.records.find(x => x.key === key || (cKey && x.key === cKey));
+      toast(r ? '《' + r.title + '》已同步最新' : '题目已同步最新', 'ok');
+      return;
+    }
+    const d = S.diff || {added: 0, archived: 0, deadlineChanged: 0, otherChanged: 0, changed: 0};
     const partial = /部分/.test(job.message || '');
-    if (!partial && !d.added && !d.changed) {
+    const totalDiff = (d.added || 0) + (d.archived || 0) + (d.deadlineChanged || 0) + (d.otherChanged || 0);
+    if (partial) {
+      S.diffRibbon = {...d, partial: true};
+      renderDiffRibbon();
+      finishRefreshButton('部分未更新', 'warn', 2200);
+      return;
+    }
+    if (!totalDiff) {
       S.outcome = {tone: 'ok', at: Date.now(), latest: true};
       renderSyncBadge();
       setTimeout(renderSyncBadge, 1800);
+      finishRefreshButton('已是最新', 'ok', 1600);
       return;
     }
-    const detail = [`待完成 ${n} 项`, m && `待核实 ${m} 项`, d.added && `新增 ${d.added} 项`, d.changed && `${d.changed} 项有变动`].filter(Boolean).join('，');
-    toast(job.message || '作业已更新', partial ? 'warn' : 'ok', {title: job.message || '作业已更新', detail});
+    S.diffRibbon = {...d, partial: false};
+    renderDiffRibbon();
+    finishRefreshButton(`已更新 ${totalDiff} 处`, 'ok', 2000);
+    return;
   }
 }
 function setOutcome(tone) {
@@ -2440,12 +2896,340 @@ function setOutcome(tone) {
 }
 
 /* ---------- Login ---------- */
-function openLogin() {
-  loginPhase = S.job.busy && S.job.action === 'login' ? 'running' : 'form';
+function openAccountManager() {
+  const accounts = savedAccountsList();
   loginError = '';
-  renderLogin();
+  S.accountRemoveConfirmId = null;
+  S.accountRenameId = null;
+  S.accountRenameValue = '';
+  S.loginListSig = '';
+  if (S.job.busy && S.job.action === 'login') {
+    loginPhase = 'running';
+    renderLogin();
+    openSheet($('#login-dialog'));
+    return;
+  }
+  loginPhase = 'form';
+  if (accounts.length > 0) {
+    loginView = 'list';
+    loginAddMode = false;
+    loginTarget = null;
+    loginFromList = true;
+    loginAliasDraft = '';
+  } else {
+    loginView = 'form';
+    loginAddMode = false;
+    loginTarget = null;
+    loginFromList = false;
+    loginAliasDraft = '';
+  }
+  renderLogin({rebuildForm: true});
   openSheet($('#login-dialog'));
-  $('#login-account')?.focus();
+  if (loginView === 'form') {
+    $('#login-account')?.focus({preventScroll: true});
+  } else {
+    $('#m3-add-account')?.focus({preventScroll: true});
+  }
+}
+function openLogin(opts = {}) {
+  const addMode = Boolean(opts && opts.addMode === true && typeof opts.preventDefault !== 'function');
+  const target = (!addMode && opts && opts.target) ? opts.target : (!addMode ? activeAccountInfo() : null);
+  loginError = '';
+  S.accountRemoveConfirmId = null;
+  S.accountRenameId = null;
+  S.accountRenameValue = '';
+  S.loginListSig = '';
+  if (S.job.busy && S.job.action === 'login') {
+    loginPhase = 'running';
+    renderLogin();
+    openSheet($('#login-dialog'));
+    return;
+  }
+  loginPhase = 'form';
+  loginAddMode = addMode;
+  loginTarget = target;
+  loginFromList = false;
+  loginView = 'form';
+  loginAliasDraft = addMode ? '' : (target?.alias || S.auth?.account_alias || '');
+  renderLogin({rebuildForm: true});
+  openSheet($('#login-dialog'));
+  const accEl = $('#login-account');
+  if (accEl) {
+    if (addMode) accEl.value = '';
+    accEl.focus({preventScroll: true});
+  }
+}
+function slideM3View(nextView, opts = {}) {
+  const body = $('#login-body');
+  const viewport = body?.querySelector('.m3-viewport');
+  const track = body?.querySelector('.m3-track');
+  const listPane = body?.querySelector('.m3-view[data-pane="list"]');
+  const formPane = body?.querySelector('.m3-view[data-pane="form"]');
+  loginView = nextView;
+  loginError = '';
+  S.accountRemoveConfirmId = null;
+  S.accountRenameId = null;
+  S.accountRenameValue = '';
+  if (nextView === 'form') {
+    loginAddMode = !!opts.addMode;
+    loginTarget = opts.addMode ? null : (opts.target || activeAccountInfo() || null);
+    loginFromList = savedAccountsList().length > 0;
+    loginAliasDraft = loginAddMode ? '' : (loginTarget?.alias || '');
+  }
+  if (!viewport || !track || !listPane || !formPane) {
+    renderLogin({rebuildForm: true});
+    return;
+  }
+  const fromH = viewport.offsetHeight;
+  S.loginListSig = '';
+  renderM3ListPane(listPane);
+  renderM3FormPane(formPane, {resetInputs: nextView === 'form'});
+  listPane.inert = nextView !== 'list';
+  formPane.inert = nextView !== 'form';
+  const targetPane = nextView === 'form' ? formPane : listPane;
+  const toH = targetPane.offsetHeight;
+  viewport.scrollLeft = 0;
+  if (!REDUCED_MOTION() && fromH > 0 && toH > 0 && fromH !== toH) {
+    viewport.style.height = fromH + 'px';
+    void viewport.offsetHeight;
+  }
+  requestAnimationFrame(() => {
+    track.classList.toggle('slide-form', nextView === 'form');
+    if (!REDUCED_MOTION() && toH > 0 && fromH > 0 && fromH !== toH) {
+      viewport.style.height = toH + 'px';
+    }
+  });
+  clearTimeout(viewport._m3Timer);
+  viewport._m3Timer = setTimeout(() => {
+    if (viewport.isConnected) {
+      viewport.style.height = '';
+      viewport.scrollLeft = 0;
+    }
+    if (nextView === 'form') {
+      const accEl = $('#login-account');
+      const pwEl = $('#login-password');
+      if (loginAddMode && accEl) accEl.focus({preventScroll: true});
+      else if (accEl && !accEl.value) accEl.focus({preventScroll: true});
+      else (pwEl || accEl)?.focus({preventScroll: true});
+    } else {
+      $('#m3-add-account')?.focus({preventScroll: true});
+    }
+  }, REDUCED_MOTION() ? 0 : 280);
+}
+function renderM3ListPane(pane) {
+  if (!pane) return;
+  const a = S.auth || {};
+  const accounts = savedAccountsList();
+  const sig = JSON.stringify([accounts, a.state, S.job.busy, S.accountRemoveConfirmId, S.accountRenameId, S.accountRenameBusy, loginView]);
+  if (sig === S.loginListSig) return;
+  S.loginListSig = sig;
+  pane.replaceChildren();
+  pane.append(el('div', 'sheet-eyebrow', '账号管理'));
+  pane.append(titled(loginView === 'list' ? 'login-title' : 'm3-list-title', '学习通账号'));
+  pane.append(el('p', 'm3-sub', '每个账号的作业、草稿与提醒独立隔离，互不干扰。'));
+  if (!accounts.length) {
+    pane.append(el('div', 'm3-empty', '还没有已保存的学习通账号，点击下方按钮添加。'));
+  } else {
+    const list = el('div', 'm3-list');
+    for (const acct of accounts) {
+      const isAct = !!acct.active;
+      const row = el('div', 'm3-row' + (isAct ? ' is-active' : ''));
+      const top = el('div', 'm3-row-top');
+      const displayName = (acct.alias || acct.label || acct.username || '已保存账号').trim();
+      const ava = el('div', 'm3-ava', userInitial(displayName));
+      const main = el('div', 'm3-row-main');
+      const nameLine = el('div', 'm3-name-line');
+      nameLine.append(el('strong', '', displayName));
+      if (isAct) {
+        nameLine.append(el('span', 'm3-badge ' + (a.state === 'logged_in' ? 'now' : 'warn'),
+          a.state === 'logged_in' ? '当前' : '待重登'));
+      } else if (acct.has_session) {
+        nameLine.append(el('span', 'm3-badge idle', '会话有效'));
+      } else if (acct.saved_credentials) {
+        nameLine.append(el('span', 'm3-badge idle', '已存密码'));
+      } else {
+        nameLine.append(el('span', 'm3-badge warn', '需重登'));
+      }
+      const metaParts = [];
+      if (acct.username && acct.username !== displayName) metaParts.push(acct.username);
+      if (acct.school_name) metaParts.push(acct.school_name);
+      if (acct.last_sync_at) metaParts.push('更新于 ' + stamp(acct.last_sync_at));
+      else if (!acct.school_name && !acct.username) metaParts.push('独立隔离空间');
+      main.append(nameLine);
+      if (metaParts.length) main.append(el('div', 'm3-meta', metaParts.join(' · ')));
+      top.append(ava, main);
+      row.append(top);
+      if (S.accountRenameId === acct.id) {
+        const rform = el('form', 'm3-rename-form');
+        const rinp = el('input', 'm3-rename-input');
+        rinp.type = 'text';
+        rinp.maxLength = 40;
+        rinp.placeholder = '输入备注名（留空恢复默认）';
+        rinp.value = S.accountRenameValue ?? '';
+        rinp.setAttribute('aria-label', '账号备注名');
+        rinp.oninput = () => { S.accountRenameValue = rinp.value; };
+        rinp.onkeydown = e => {
+          if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); cancelAccountRename(); }
+        };
+        const saveBtn = el('button', 'btn btn-primary btn-xs', '保存');
+        saveBtn.type = 'submit';
+        saveBtn.disabled = S.job.busy || S.accountRenameBusy;
+        const cancelBtn = btn('取消', 'btn-quiet btn-xs', cancelAccountRename);
+        cancelBtn.disabled = S.accountRenameBusy;
+        rform.onsubmit = e => {
+          e.preventDefault();
+          renameAccount(acct.id, rinp.value);
+        };
+        rform.append(rinp, saveBtn, cancelBtn);
+        row.append(rform);
+      } else {
+        const actions = el('div', 'm3-row-actions');
+        if (!isAct) {
+          const sw = btn('切换', 'btn-primary btn-xs', () => switchAccount(acct.id));
+          sw.disabled = S.job.busy;
+          actions.append(sw);
+        }
+        const relog = btn('重登', 'btn-xs', () => slideM3View('form', {addMode: false, target: acct}));
+        relog.disabled = S.job.busy;
+        const ren = btn('备注', 'btn-quiet btn-xs', () => startAccountRename(acct), 'pen');
+        ren.disabled = S.job.busy;
+        actions.append(relog, ren);
+        const delWrap = el('div', 'm3-row-del-wrap');
+        if (S.accountRemoveConfirmId === acct.id) {
+          const yes = btn('确认移除', 'btn-quiet btn-xs danger', () => {
+            S.accountRemoveConfirmId = null;
+            removeAccount(acct.id);
+          });
+          yes.disabled = S.job.busy;
+          const no = btn('取消', 'btn-quiet btn-xs', () => {
+            S.accountRemoveConfirmId = null;
+            renderM3ListPane(pane);
+          });
+          delWrap.append(yes, no);
+        } else {
+          const del = btn('移除', 'btn-quiet btn-xs', () => {
+            S.accountRemoveConfirmId = acct.id;
+            renderM3ListPane(pane);
+          });
+          del.disabled = S.job.busy;
+          delWrap.append(del);
+        }
+        actions.append(delWrap);
+        row.append(actions);
+      }
+      list.append(row);
+    }
+    pane.append(list);
+  }
+  const addBtn = el('button', 'm3-add-bar');
+  addBtn.id = 'm3-add-account';
+  addBtn.type = 'button';
+  addBtn.disabled = S.job.busy;
+  addBtn.append(icon('plus'), el('span', '', '添加其他学习通账号'));
+  addBtn.onclick = () => slideM3View('form', {addMode: true, target: null});
+  pane.append(addBtn);
+}
+function renderM3FormPane(pane, opts = {}) {
+  if (!pane) return;
+  const dialog = $('#login-dialog');
+  const a = S.auth || {};
+  const accounts = savedAccountsList();
+  const hasSavedList = accounts.length > 0;
+  const expectedSavedUser = loginAddMode ? '' : (loginTarget?.username || a.credentials?.username || '');
+  const account = opts.resetInputs ? expectedSavedUser : ($('#login-account')?.value ?? expectedSavedUser);
+  const aliasVal = opts.resetInputs ? (loginAliasDraft ?? '') : ($('#login-alias')?.value ?? loginAliasDraft ?? '');
+  const hasSavedCreds = !loginAddMode && (loginTarget ? !!loginTarget.saved_credentials : !!a.credentials?.saved);
+  pane.replaceChildren();
+  if (hasSavedList) {
+    const back = btn('返回账号列表', 'btn-ghost btn-sm m3-back-btn', () => slideM3View('list'), 'back');
+    back.id = 'm3-back-list';
+    pane.append(back);
+  }
+  const inner = el('div', 'login-pane');
+  inner.append(el('div', 'sheet-eyebrow', '作业通'));
+  inner.append(titled(loginView === 'form' ? 'login-title' : 'm3-form-title',
+    loginAddMode ? '添加学习通账号' : (loginTarget || a.state === 'logged_in' ? '重新登录账号' : '登录作业通')));
+  if (loginAddMode) {
+    inner.append(notice('soft', 'info', '', ['将新建独立本机数据空间，不覆盖其他账号的作业与草稿。']));
+  } else if (loginTarget || a.state === 'logged_in') {
+    inner.append(notice('soft', 'info', '', ['更新此账号的登录状态，原有待办、备注与草稿均会保留。']));
+  }
+  const form = el('form');
+  form.autocomplete = 'on';
+  const f1 = el('label', 'form-field' + (loginError ? ' shake' : '')), user = el('input', 'input');
+  user.id = 'login-account'; user.name = 'username'; user.autocomplete = 'username'; user.required = true; user.value = account;
+  f1.append(el('span', '', '账号'), user);
+  const f2 = el('label', 'form-field' + (loginError ? ' shake' : '')), wrap = el('div', 'pw-wrap'), pw = el('input', 'input');
+  const savedPassword = hasSavedCreds && !!expectedSavedUser && account === expectedSavedUser;
+  pw.id = 'login-password'; pw.name = 'password'; pw.type = 'password'; pw.autocomplete = 'current-password';
+  pw.required = !savedPassword;
+  if (savedPassword) pw.placeholder = '已保存，留空继续使用';
+  const eye = btn('', 'btn-quiet icon-only pw-toggle', () => { pw.type = pw.type === 'password' ? 'text' : 'password'; eye.setAttribute('aria-pressed', String(pw.type === 'text')); }, 'eye');
+  eye.setAttribute('aria-label', '显示或隐藏密码');
+  wrap.append(pw, eye);
+  f2.append(el('span', '', '密码'), wrap);
+  const f3 = el('label', 'form-field'), aliasInp = el('input', 'input');
+  aliasInp.id = 'login-alias';
+  aliasInp.name = 'alias';
+  aliasInp.type = 'text';
+  aliasInp.maxLength = 40;
+  aliasInp.placeholder = '例如：大号 / 辅修号（选填，可留空）';
+  aliasInp.value = aliasVal;
+  aliasInp.oninput = () => { loginAliasDraft = aliasInp.value; };
+  f3.append(el('span', '', '备注名（选填）'), aliasInp);
+  user.oninput = () => {
+    const matchSaved = hasSavedCreds && !!expectedSavedUser && user.value.trim() === expectedSavedUser;
+    pw.required = !matchSaved;
+    pw.placeholder = matchSaved ? '已保存，留空继续使用' : '';
+  };
+  form.append(f1, f2, f3);
+  if (loginError) form.append(el('div', 'form-error', loginError));
+  const hint = el('div', 'form-hint');
+  hint.append(icon('lock'), el('span', '', savedPassword ? '登录信息与备注仅加密保存在这台电脑上。' : '账号密码只加密保存在这台电脑上。'));
+  form.append(hint);
+  const actions = el('div', 'sheet-actions'), submit = el('button', 'btn btn-primary login-submit', '登录作业通');
+  submit.type = 'submit';
+  submit.disabled = S.job.busy || !S.online;
+  actions.append(btn('取消', '', () => closeSheet(dialog)), submit);
+  form.append(actions);
+  if (S.job.busy) form.append(el('p', 'sheet-text', '当前有其他操作在进行，完成后才能登录。'));
+  else if (!S.online) form.append(el('p', 'sheet-text', '网络不可用，联网后才能登录。'));
+  form.onsubmit = e => {
+    e.preventDefault();
+    const username = user.value.trim(), password = pw.value, alias = aliasInp.value.trim();
+    const reuseSaved = hasSavedCreds && !!expectedSavedUser && username === expectedSavedUser && !password;
+    if (!username || (!password && !reuseSaved)) {
+      loginError = '请输入账号和密码';
+      renderM3FormPane(pane, {resetInputs: false});
+      const acc = $('#login-account');
+      if (acc) acc.value = username;
+      return;
+    }
+    loginAliasDraft = alias;
+    pw.value = '';
+    submit.disabled = true;
+    const backBtn = $('#m3-back-list');
+    if (backBtn) backBtn.disabled = true;
+    actions.classList.add('morphing');
+    submit.classList.add('morphb');
+    submit.replaceChildren(icon('loader'));
+    const req = startAction('login', null, {username, password, alias, saved: reuseSaved, add_account: loginAddMode});
+    setTimeout(() => inner.classList.add('out'), 160);
+    setTimeout(async () => {
+      const ok = await req;
+      if (ok) { if (loginPhase === 'form') { loginPhase = 'running'; renderLogin(); } }
+      else {
+        inner.classList.remove('out');
+        if (backBtn) backBtn.disabled = false;
+        actions.classList.remove('morphing');
+        submit.classList.remove('morphb');
+        submit.textContent = '登录作业通';
+        submit.disabled = false;
+      }
+    }, 260);
+  };
+  inner.append(form);
+  pane.append(inner);
 }
 function titled(id, text) { const h = el('h2', 'sheet-title', text); h.id = id; return h; }
 function closeButton(dialog) {
@@ -2511,14 +3295,15 @@ function buildLoginOrb(titleText = '正在登录作业通') {
   wrap.append(title, halo, roll, school);
   return wrap;
 }
-function renderLogin() {
+function renderLogin(opts = {}) {
   const body = $('#login-body'), dialog = $('#login-dialog');
   dialog.classList.remove('a4-to-circle');
   if (loginPhase === 'running' && !(S.job.busy && S.job.action === 'login')) return;
-  const savedAccount = S.auth?.credentials?.username || '';
-  const account = $('#login-account')?.value || savedAccount;
+  const savedAccount = loginAddMode ? '' : (loginTarget?.username || S.auth?.credentials?.username || '');
+  const account = $('#login-account')?.value ?? savedAccount;
   const a = S.auth || {};
   if (loginPhase === 'running') {
+    dialog.classList.remove('m3-mode');
     dialog.classList.add('login-running');
     if (document.getElementById('login-orb')) {
       const {raw, offset, schoolName} = loginProgressState();
@@ -2538,8 +3323,11 @@ function renderLogin() {
   }
   dialog.classList.remove('login-running');
   $('#assignment-list')?.classList.remove('login-ghost');
-  body.replaceChildren(closeButton(dialog));
-  if (loginPhase === 'success' || loginPhase === 'failed') body.append(el('div', 'sheet-eyebrow', '作业通'));
+  if (loginPhase === 'success' || loginPhase === 'failed') {
+    dialog.classList.remove('m3-mode');
+    body.replaceChildren(closeButton(dialog));
+    body.append(el('div', 'sheet-eyebrow', '作业通'));
+  }
   if (loginPhase === 'success') {
     const hero = el('div', 'result-hero'), ic = el('div', 'result-icon ok');
     ic.append(icon('check'));
@@ -2563,73 +3351,59 @@ function renderLogin() {
     if (loginError) body.append(el('div', 'form-error', loginError));
     body.append(siteList(a.sites, false));
     const actions = el('div', 'sheet-actions');
-    actions.append(btn('关闭', '', () => closeSheet(dialog)), btn('重新输入', 'btn-primary', () => { loginPhase = 'form'; loginError = ''; renderLogin(); $('#login-account').value = account; $('#login-password').focus(); }));
+    actions.append(btn('关闭', '', () => closeSheet(dialog)), btn('重新输入', 'btn-primary', () => {
+      loginPhase = 'form';
+      loginView = 'form';
+      loginError = '';
+      renderLogin({rebuildForm: true});
+      const acc = $('#login-account');
+      if (acc) acc.value = account;
+      const aliasEl = $('#login-alias');
+      if (aliasEl && loginAliasDraft) aliasEl.value = loginAliasDraft;
+      $('#login-password')?.focus({preventScroll: true});
+    }));
     body.append(actions);
     return;
   }
-  const pane = el('div', 'login-pane');
-  pane.append(el('div', 'sheet-eyebrow', '作业通'));
-  pane.append(titled('login-title', a.state === 'logged_in' ? '重新登录作业通' : '登录作业通'));
-  if (a.state === 'logged_in') pane.append(notice('soft', 'info', '', ['重新登录将替换已保存的账号。']));
-  const form = el('form');
-  form.autocomplete = 'on';
-  const f1 = el('label', 'form-field' + (loginError ? ' shake' : '')), user = el('input', 'input');
-  user.id = 'login-account'; user.name = 'username'; user.autocomplete = 'username'; user.required = true; user.value = account;
-  f1.append(el('span', '', '账号'), user);
-  const f2 = el('label', 'form-field' + (loginError ? ' shake' : '')), wrap = el('div', 'pw-wrap'), pw = el('input', 'input');
-  const savedPassword = !!a.credentials?.saved && account === savedAccount;
-  pw.id = 'login-password'; pw.name = 'password'; pw.type = 'password'; pw.autocomplete = 'current-password';
-  pw.required = !savedPassword;
-  if (savedPassword) pw.placeholder = '已保存，留空继续使用';
-  const eye = btn('', 'btn-quiet icon-only pw-toggle', () => { pw.type = pw.type === 'password' ? 'text' : 'password'; eye.setAttribute('aria-pressed', String(pw.type === 'text')); }, 'eye');
-  eye.setAttribute('aria-label', '显示或隐藏密码');
-  wrap.append(pw, eye);
-  f2.append(el('span', '', '密码'), wrap);
-  form.append(f1, f2);
-  if (loginError) form.append(el('div', 'form-error', loginError));
-  const hint = el('div', 'form-hint');
-  hint.append(icon('lock'), el('span', '', savedPassword ? '登录信息已加密保存在这台电脑上。' : '账号密码只加密保存在这台电脑上。'));
-  form.append(hint);
-  const actions = el('div', 'sheet-actions'), submit = el('button', 'btn btn-primary login-submit', '登录作业通');
-  submit.type = 'submit';
-  submit.disabled = S.job.busy || !S.online;
-  actions.append(btn('取消', '', () => closeSheet(dialog)), submit);
-  form.append(actions);
-  if (S.job.busy) form.append(el('p', 'sheet-text', '当前有其他操作在进行，完成后才能登录。'));
-  else if (!S.online) form.append(el('p', 'sheet-text', '网络不可用，联网后才能登录。'));
-  form.onsubmit = e => {
-    e.preventDefault();
-    const username = user.value.trim(), password = pw.value;
-    const reuseSaved = !!a.credentials?.saved && username === savedAccount && !password;
-    if (!username || (!password && !reuseSaved)) { loginError = '请输入账号和密码'; renderLogin(); $('#login-account').value = username; return; }
-    pw.value = '';
-    submit.disabled = true;
-    actions.classList.add('morphing');
-    submit.classList.add('morphb');
-    submit.replaceChildren(icon('loader'));
-    const req = startAction('login', null, {username, password, saved: reuseSaved});
-    setTimeout(() => pane.classList.add('out'), 160);
-    setTimeout(async () => {
-      const ok = await req;
-      if (ok) { if (loginPhase === 'form') { loginPhase = 'running'; renderLogin(); } }
-      else {
-        pane.classList.remove('out');
-        actions.classList.remove('morphing');
-        submit.classList.remove('morphb');
-        submit.textContent = '登录作业通';
-        submit.disabled = false;
-      }
-    }, 260);
-  };
-  pane.append(form);
-  body.append(pane);
+  dialog.classList.add('m3-mode');
+  let viewport = body.querySelector('.m3-viewport');
+  let track = viewport?.querySelector('.m3-track');
+  let listPane = track?.querySelector('.m3-view[data-pane="list"]');
+  let formPane = track?.querySelector('.m3-view[data-pane="form"]');
+  let fresh = false;
+  if (!viewport || !track || !listPane || !formPane) {
+    fresh = true;
+    S.loginListSig = '';
+    viewport = el('div', 'm3-viewport');
+    track = el('div', 'm3-track');
+    listPane = el('section', 'm3-view');
+    listPane.dataset.pane = 'list';
+    formPane = el('section', 'm3-view');
+    formPane.dataset.pane = 'form';
+    track.append(listPane, formPane);
+    viewport.append(track);
+    body.replaceChildren(closeButton(dialog), viewport);
+  }
+  track.classList.toggle('slide-form', loginView === 'form');
+  listPane.inert = loginView !== 'list';
+  formPane.inert = loginView !== 'form';
+  renderM3ListPane(listPane);
+  if (fresh || opts.rebuildForm) {
+    renderM3FormPane(formPane, {resetInputs: !!opts.rebuildForm});
+  } else {
+    const subBtn = formPane.querySelector('.login-submit');
+    if (subBtn) subBtn.disabled = S.job.busy || !S.online;
+  }
 }
 function playLoginA4Ending() {
   const dialog = $('#login-dialog'), body = $('#login-body');
   if (!dialog.open) return;
-  const username = S.auth?.credentials?.username?.trim() || '';
-  const initial = userInitial(username);
-  const schoolName = S.auth?.school_name || '作业通';
+  dialog.classList.remove('m3-mode');
+  const act = activeAccountInfo();
+  const username = (act?.username || S.auth?.credentials?.username || '').trim();
+  const displayName = (act?.alias || act?.label || S.auth?.account_label || username).trim();
+  const initial = userInitial(displayName || username);
+  const schoolName = act?.school_name || S.auth?.school_name || '作业通';
   S.acctRevealState = 'hiding';
   $('#assignment-list')?.classList.add('login-ghost');
   renderAccount();
@@ -2880,16 +3654,61 @@ function fillDone(job, key) {
   openSheet($('#fill-dialog'));
 }
 
-/* ---------- Reminder & exit ---------- */
+/* ---------- Reminder (S1 Cards + 3-Step Wizard + Elevated 24h Dial) & exit ---------- */
+const DEFAULT_REM_RULE = () => ({
+  days: [1, 2, 3, 4, 5, 6, 7],
+  skip_complete: true,
+  quiet: '',
+  lead_hours: [24],
+  auto_refresh: false,
+  notify_style: 'center',
+});
+const WEEK_NAMES = ['一', '二', '三', '四', '五', '六', '日'];
+function normClientRule(raw) {
+  const base = DEFAULT_REM_RULE();
+  if (!raw || typeof raw !== 'object') return base;
+  const days = Array.isArray(raw.days) && raw.days.length
+    ? [...new Set(raw.days.map(Number).filter(n => n >= 1 && n <= 7))].sort((a, b) => a - b)
+    : base.days;
+  const leads = Array.isArray(raw.lead_hours)
+    ? [...new Set(raw.lead_hours.map(Number).filter(h => h === 24 || h === 6 || h === 2))].sort((a, b) => b - a)
+    : base.lead_hours;
+  return {
+    days: days.length ? days : base.days,
+    skip_complete: raw.skip_complete !== false,
+    quiet: typeof raw.quiet === 'string' ? raw.quiet : '',
+    lead_hours: leads,
+    auto_refresh: !!raw.auto_refresh,
+    notify_style: raw.notify_style === 'banner' ? 'banner' : 'center',
+  };
+}
+function formatDaysSummary(days) {
+  const d = [...new Set(days || [1, 2, 3, 4, 5, 6, 7])].sort((a, b) => a - b);
+  if (d.length === 7) return '每天';
+  if (d.length === 5 && d.join(',') === '1,2,3,4,5') return '工作日';
+  if (d.length === 2 && d.join(',') === '6,7') return '周末';
+  return '周' + d.map(n => WEEK_NAMES[n - 1]).join('·');
+}
 function reminderSlots(r) {
   const now = new Date();
-  return (r?.times || []).map(value => {
+  const rules = r?.rules || {};
+  const list = [];
+  for (const value of (r?.times || [])) {
     const [hour, minute] = value.split(':').map(Number);
-    const target = new Date(now);
-    target.setHours(hour, minute, 0, 0);
-    if (target <= now) target.setDate(target.getDate() + 1);
-    return {value, target, day: dayLabel(target)};
-  }).sort((a, b) => a.target - b.target);
+    const rule = rules[value] ? normClientRule(rules[value]) : null;
+    const allowedDays = new Set(rule ? rule.days : [1, 2, 3, 4, 5, 6, 7]);
+    for (let offset = 0; offset < 8; offset++) {
+      const target = new Date(now);
+      target.setDate(target.getDate() + offset);
+      target.setHours(hour, minute, 0, 0);
+      const isoDay = target.getDay() === 0 ? 7 : target.getDay();
+      if (target > now && allowedDays.has(isoDay)) {
+        list.push({value, target, day: dayLabel(target)});
+        break;
+      }
+    }
+  }
+  return list.sort((a, b) => a.target - b.target);
 }
 function reminderNextText(r) {
   const slots = reminderSlots(r);
@@ -2919,27 +3738,36 @@ async function saveReminder(next) {
     if ($('#reminder-dialog').open) renderReminder();
   }
 }
-const TIME_WHEEL_ROW = 40;
-let reminderWheelCleanup = [];
-function clearReminderWheel() {
-  reminderWheelCleanup.splice(0).forEach(dispose => dispose());
-}
+function clearReminderWheel() {}
 function reminderDraftTime(draft) {
   return `${String(draft.hour).padStart(2, '0')}:${String(draft.minute).padStart(2, '0')}`;
 }
 function focusReminderTime(value) {
   if (!$('#reminder-dialog').open) return;
-  const target = [...document.querySelectorAll('#reminder-body .rem-time')].find(button => button.dataset.time === value);
+  const target = [...document.querySelectorAll('#reminder-body .tcard-main')].find(button => button.dataset.time === value);
   (target || $('#reminder-add'))?.focus({preventScroll: true});
 }
-function openReminderEditor(originalValue = null) {
-  if (S.reminderSaving || !S.reminder?.enabled) return;
-  const [hour, minute] = (originalValue || '08:00').split(':').map(Number);
-  S.reminderEditing = {originalValue, hour, minute, focusColumn: 'hour'};
+function openReminderWizard(originalValue = null) {
+  if (S.reminderSaving) return;
+  if (!S.reminder?.enabled && originalValue === null) return;
+  const [hour, minute] = (originalValue || '08:15').split(':').map(Number);
+  const rule = normClientRule(originalValue ? S.reminder?.rules?.[originalValue] : null);
+  S.reminderEditing = {
+    originalValue,
+    step: 1,
+    dialMode: 'hour',
+    hour,
+    minute,
+    days: [...rule.days],
+    skip_complete: rule.skip_complete,
+    quiet: rule.quiet,
+    lead_hours: [...rule.lead_hours],
+    auto_refresh: rule.auto_refresh,
+    notify_style: rule.notify_style,
+  };
   S.reminderError = '';
   renderReminder();
   $('#reminder-hour')?.focus({preventScroll: true});
-  $('.tw-editor')?.scrollIntoView({block: 'nearest'});
 }
 function cancelReminderEditor() {
   if (S.reminderSaving) return;
@@ -2949,175 +3777,481 @@ function cancelReminderEditor() {
   renderReminder();
   focusReminderTime(originalValue);
 }
-function renderReminderEditor(draft) {
-  const form = el('form', 'tw-editor'); form.id = 'reminder-time-editor';
-  form.setAttribute('aria-label', draft.originalValue ? '调整提醒时间' : '新的提醒时间');
-  const head = el('div', 'tw-head'), preview = el('output', 'tw-value', reminderDraftTime(draft));
-  head.append(el('strong', '', draft.originalValue ? '调整提醒时间' : '新的提醒时间'), preview);
-  const wheels = el('div', 'tw'), columns = {}, presets = el('div', 'rem-chips');
-  const error = el('p', 'rem-error', S.reminderError || ''); error.setAttribute('role', 'alert');
-  const update = () => {
-    const nextVal = reminderDraftTime(draft);
-    if (preview.textContent && preview.textContent !== nextVal) restartAnim(preview, 'bump');
-    preview.textContent = nextVal;
-    presets.querySelectorAll('button').forEach(chip => chip.setAttribute('aria-pressed', String(chip.dataset.time === preview.textContent)));
-  };
-  const editable = () => S.reminderEditing === draft && !S.reminderSaving && S.reminder?.enabled;
-  for (const [field, label, maximum] of [['hour', '小时', 23], ['minute', '分钟', 59]]) {
-    const group = el('div', 'tw-group'), window = el('div', 'tw-window'), column = el('div', 'tw-column');
-    column.id = `reminder-${field}`; column.dataset.column = field;
-    column.tabIndex = S.reminderSaving ? -1 : 0;
-    column.setAttribute('role', 'spinbutton'); column.setAttribute('aria-label', label);
-    column.setAttribute('aria-valuemin', '0'); column.setAttribute('aria-valuemax', String(maximum));
-    column.setAttribute('aria-disabled', String(!!S.reminderSaving));
-    column.setAttribute('aria-describedby', 'reminder-wheel-hint');
-    const options = [];
-    for (let value = 0; value <= maximum; value++) {
-      const option = el('div', 'tw-option', String(value).padStart(2, '0'));
-      option.dataset.value = value; option.setAttribute('aria-hidden', 'true');
-      options.push(option); column.append(option);
+async function commitReminderWizard(draft) {
+  if (S.reminderSaving) return;
+  const value = reminderDraftTime(draft), current = S.reminder || {times: [], rules: {}, enabled: true};
+  const times = [...(current.times || [])];
+  const rules = {...(current.rules || {})};
+  const index = draft.originalValue === null ? -1 : times.indexOf(draft.originalValue);
+  if (draft.originalValue !== null && index < 0) {
+    S.reminderError = '原提醒时间已更改，请返回重新选择。';
+    renderReminder();
+    return;
+  }
+  if (times.some((time, i) => time === value && i !== index)) {
+    S.reminderError = `${value} 这个时间已经添加过了。`;
+    renderReminder();
+    ($('#reminder-hour') || $('#rem-quick-save') || $('#rem-save-btn'))?.focus({preventScroll: true});
+    return;
+  }
+  if (index >= 0) {
+    times[index] = value;
+    if (draft.originalValue !== value) delete rules[draft.originalValue];
+  } else {
+    times.push(value);
+  }
+  times.sort();
+  rules[value] = normClientRule({
+    days: draft.days,
+    skip_complete: draft.skip_complete,
+    quiet: draft.quiet,
+    lead_hours: draft.lead_hours,
+    auto_refresh: draft.auto_refresh,
+    notify_style: draft.notify_style,
+  });
+  S.reminderError = '';
+  const ok = await saveReminder({enabled: true, times, rules});
+  if (ok) {
+    S.reminderEditing = null;
+    if ($('#reminder-dialog').open) { renderReminder(); focusReminderTime(value); }
+  } else if ($('#reminder-dialog').open && S.reminderEditing === draft) {
+    ($('#rem-quick-save') || $('#rem-save-btn') || $('#reminder-hour'))?.focus({preventScroll: true});
+  }
+}
+
+function buildDialTicksSvg() {
+  const ns = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(ns, 'svg');
+  svg.setAttribute('viewBox', '0 0 268 268');
+  svg.setAttribute('class', 'gc-ticks');
+  svg.setAttribute('aria-hidden', 'true');
+  for (let i = 0; i < 60; i++) {
+    const major = i % 5 === 0, quarter = i % 15 === 0;
+    const ang = (i * 6 - 90) * Math.PI / 180;
+    const r1 = quarter ? 120.5 : major ? 122 : 124.5;
+    const r2 = 128;
+    const line = document.createElementNS(ns, 'line');
+    line.setAttribute('x1', (134 + r1 * Math.cos(ang)).toFixed(2));
+    line.setAttribute('y1', (134 + r1 * Math.sin(ang)).toFixed(2));
+    line.setAttribute('x2', (134 + r2 * Math.cos(ang)).toFixed(2));
+    line.setAttribute('y2', (134 + r2 * Math.sin(ang)).toFixed(2));
+    line.setAttribute('class', quarter ? 't-q' : major ? 't-m' : 't-s');
+    svg.append(line);
+  }
+  return svg;
+}
+
+function renderReminderWizard(draft) {
+  const wrap = el('div', 'rem-wiz');
+  const top = el('div', 'wiz-top');
+  const back = btn('时间卡', 'btn-ghost btn-sm', cancelReminderEditor, 'back');
+  back.disabled = !!S.reminderSaving;
+  const sub = el('span', 'wiz-sub', draft.originalValue ? `调整 ${draft.originalValue}` : '新建提醒时间');
+  top.append(back, sub);
+
+  const stepper = el('div', 'wiz-steps');
+  stepper.setAttribute('role', 'tablist');
+  for (const [n, label] of [[1, '选择时间'], [2, '周期与免打扰'], [3, '加急与通知']]) {
+    const active = draft.step === n, done = draft.step > n;
+    const b = el('button', 'wiz-step' + (active ? ' on' : '') + (done ? ' done' : ''));
+    b.type = 'button';
+    b.setAttribute('role', 'tab');
+    b.setAttribute('aria-selected', String(active));
+    b.disabled = !!S.reminderSaving;
+    const num = el('i', '', done ? '' : String(n));
+    if (done) num.append(icon('check'));
+    b.append(num, el('span', '', label));
+    b.onclick = () => { draft.step = n; S.reminderError = ''; renderReminder(); };
+    stepper.append(b);
+  }
+  wrap.append(top, stepper);
+
+  const stage = el('div', 'wiz-stage');
+  const errorEl = el('p', 'rem-error', S.reminderError || '');
+  errorEl.setAttribute('role', 'alert');
+
+  if (draft.step === 1) {
+    const sec = el('div', 'wiz-pane s1');
+    const readout = el('div', 'clk-readout');
+    const hBtn = el('button', 'clk-seg' + (draft.dialMode === 'hour' ? ' on' : ''), pad(draft.hour));
+    hBtn.type = 'button'; hBtn.id = 'reminder-hour';
+    hBtn.setAttribute('role', 'spinbutton'); hBtn.setAttribute('aria-label', '小时');
+    hBtn.setAttribute('aria-valuemin', '0'); hBtn.setAttribute('aria-valuemax', '23');
+    hBtn.setAttribute('aria-valuenow', String(draft.hour));
+    hBtn.disabled = !!S.reminderSaving;
+
+    const mBtn = el('button', 'clk-seg' + (draft.dialMode === 'minute' ? ' on' : ''), pad(draft.minute));
+    mBtn.type = 'button'; mBtn.id = 'reminder-minute';
+    mBtn.setAttribute('role', 'spinbutton'); mBtn.setAttribute('aria-label', '分钟');
+    mBtn.setAttribute('aria-valuemin', '0'); mBtn.setAttribute('aria-valuemax', '59');
+    mBtn.setAttribute('aria-valuenow', String(draft.minute));
+    mBtn.disabled = !!S.reminderSaving;
+
+    const meta = el('div', 'clk-meta');
+    const periodBadge = el('span', 'clk-period', reminderPeriod(reminderDraftTime(draft)));
+    const modeHint = el('span', 'clk-mode-hint', draft.dialMode === 'hour' ? '外圈 1–12 · 内圈 13–00' : '外圈 00–55 · 支持拖拽微调');
+    meta.append(periodBadge, modeHint);
+
+    const nums = el('div', 'clk-nums');
+    nums.append(hBtn, el('span', 'clk-sep', ':'), mBtn);
+    readout.append(nums, meta);
+
+    // Build Google Clock 24h Two-Ring Dial
+    const dialWrap = el('div', 'gc-dial-wrap');
+    const dial = el('div', 'gc-dial');
+    dial.id = 'gc-dial';
+    const track = el('div', 'gc-inner-track');
+    const ticks = buildDialTicksSvg();
+    const hand = el('div', 'gc-hand');
+    const handLine = el('div', 'gc-hand-line');
+    const knob = el('div', 'gc-knob');
+    hand.append(handLine, knob);
+    const center = el('div', 'gc-center');
+
+    const hourLayer = el('div', 'gc-layer hours' + (draft.dialMode === 'hour' ? ' on' : ''));
+    const hourButtons = new Map();
+    for (let i = 0; i < 12; i++) {
+      const ang = i * 30;
+      const rad = ang * Math.PI / 180;
+      const hOut = i === 0 ? 12 : i;
+      const bOut = el('button', 'gc-num', String(hOut));
+      bOut.type = 'button'; bOut.dataset.hour = String(hOut);
+      bOut.setAttribute('aria-label', `${hOut} 时`);
+      bOut.style.left = (50 + 38.4 * Math.sin(rad)).toFixed(2) + '%';
+      bOut.style.top = (50 - 38.4 * Math.cos(rad)).toFixed(2) + '%';
+      bOut.onclick = e => {
+        if (e.detail === 0 && !S.reminderSaving) {
+          draft.hour = hOut; S.reminderError = ''; errorEl.textContent = ''; paintDial(true);
+        }
+      };
+      hourButtons.set(hOut, bOut);
+      hourLayer.append(bOut);
+
+      const hIn = i === 0 ? 0 : i + 12;
+      const bIn = el('button', 'gc-num inner', i === 0 ? '00' : String(hIn));
+      bIn.type = 'button'; bIn.dataset.hour = String(hIn);
+      bIn.setAttribute('aria-label', `${hIn} 时`);
+      bIn.style.left = (50 + 24.4 * Math.sin(rad)).toFixed(2) + '%';
+      bIn.style.top = (50 - 24.4 * Math.cos(rad)).toFixed(2) + '%';
+      bIn.onclick = e => {
+        if (e.detail === 0 && !S.reminderSaving) {
+          draft.hour = hIn; S.reminderError = ''; errorEl.textContent = ''; paintDial(true);
+        }
+      };
+      hourButtons.set(hIn, bIn);
+      hourLayer.append(bIn);
     }
-    let snapTimer, frame, disposed = false, touching = false, wheelDelta = 0, wheelStamp = 0;
-    let drag = null, suppressDragClick = false;
-    const paint = () => {
-      column.setAttribute('aria-valuenow', String(draft[field]));
-      column.setAttribute('aria-valuetext', `${String(draft[field]).padStart(2, '0')} ${label}`);
-      options.forEach((option, value) => {
-        option.classList.toggle('selected', value === draft[field]);
-        option.classList.toggle('near', Math.abs(value - draft[field]) === 1);
+
+    const minLayer = el('div', 'gc-layer minutes' + (draft.dialMode === 'minute' ? ' on' : ''));
+    const minButtons = new Map();
+    for (let i = 0; i < 12; i++) {
+      const mVal = i * 5;
+      const rad = (i * 30) * Math.PI / 180;
+      const bMin = el('button', 'gc-num', pad(mVal));
+      bMin.type = 'button'; bMin.dataset.minute = String(mVal);
+      bMin.setAttribute('aria-label', `${pad(mVal)} 分`);
+      bMin.style.left = (50 + 38.4 * Math.sin(rad)).toFixed(2) + '%';
+      bMin.style.top = (50 - 38.4 * Math.cos(rad)).toFixed(2) + '%';
+      bMin.onclick = e => {
+        if (e.detail === 0 && !S.reminderSaving) {
+          draft.minute = mVal; S.reminderError = ''; errorEl.textContent = ''; paintDial(false);
+        }
+      };
+      minButtons.set(mVal, bMin);
+      minLayer.append(bMin);
+    }
+
+    dial.append(track, ticks, hand, center, hourLayer, minLayer);
+    dialWrap.append(dial);
+
+    const presets = el('div', 'rem-chips');
+    for (const [val, lbl] of [['08:00', '早八'], ['12:30', '午间'], ['18:30', '傍晚'], ['21:30', '晚间']]) {
+      const c = btn(`${val} ${lbl}`, 'chip rem-preset-chip', () => {
+        const [ph, pm] = val.split(':').map(Number);
+        draft.hour = ph; draft.minute = pm;
+        S.reminderError = ''; errorEl.textContent = '';
+        paintDial(false);
       });
-    };
-    const choose = (value, align = true) => {
-      if (!editable() || disposed) return;
-      draft[field] = Math.max(0, Math.min(maximum, value));
-      S.reminderError = ''; error.textContent = '';
-      paint(); update();
-      if (align) { clearTimeout(snapTimer); column.scrollTop = draft[field] * TIME_WHEEL_ROW; }
-    };
-    columns[field] = {column, choose};
-    column.addEventListener('focus', () => { draft.focusColumn = field; });
-    const finishDrag = () => {
-      if (!drag) return;
-      const {id, active} = drag; drag = null;
-      if (active) {
-        suppressDragClick = true;
-        choose(Math.round(column.scrollTop / TIME_WHEEL_ROW));
+      c.type = 'button'; c.dataset.time = val; c.disabled = !!S.reminderSaving;
+      presets.append(c);
+    }
+
+    let autoMinTimer = null;
+    const paintDial = (animateSwitch = false) => {
+      const h = draft.hour, m = draft.minute, mode = draft.dialMode;
+      hBtn.textContent = pad(h);
+      hBtn.setAttribute('aria-valuenow', String(h));
+      hBtn.classList.toggle('on', mode === 'hour');
+      mBtn.textContent = pad(m);
+      mBtn.setAttribute('aria-valuenow', String(m));
+      mBtn.classList.toggle('on', mode === 'minute');
+      periodBadge.textContent = `${reminderPeriod(reminderDraftTime(draft))} · ${reminderDraftTime(draft)}`;
+      modeHint.textContent = mode === 'hour' ? '外圈 1–12 · 内圈 13–00' : '外圈 00–55 · 支持拖拽微调';
+      hourLayer.classList.toggle('on', mode === 'hour');
+      minLayer.classList.toggle('on', mode === 'minute');
+      if (mode === 'hour') {
+        const isInner = h === 0 || h >= 13;
+        const deg = (h % 12) * 30;
+        hand.style.transform = `rotate(${deg}deg)`;
+        hand.style.height = isInner ? '24.4%' : '38.4%';
+        knob.style.transform = `translate(-50%, -50%) rotate(${-deg}deg)`;
+        knob.textContent = h === 0 ? '00' : String(h);
+        knob.classList.remove('dot');
+      } else {
+        const deg = m * 6;
+        hand.style.transform = `rotate(${deg}deg)`;
+        hand.style.height = '38.4%';
+        knob.style.transform = `translate(-50%, -50%) rotate(${-deg}deg)`;
+        if (m % 5 === 0) {
+          knob.textContent = pad(m);
+          knob.classList.remove('dot');
+        } else {
+          knob.textContent = '';
+          knob.classList.add('dot');
+        }
       }
-      column.classList.remove('dragging');
-      if (column.hasPointerCapture(id)) column.releasePointerCapture(id);
-    };
-    column.addEventListener('pointerdown', e => {
-      if (e.pointerType !== 'mouse' || e.button !== 0 || !editable()) return;
-      suppressDragClick = false; wheelDelta = 0;
-      drag = {id: e.pointerId, startY: e.clientY, startTop: column.scrollTop, active: false};
-      column.focus({preventScroll: true});
-    });
-    column.addEventListener('pointermove', e => {
-      if (!drag || drag.id !== e.pointerId || !editable()) return;
-      if (!(e.buttons & 1)) { finishDrag(); return; }
-      const distance = drag.startY - e.clientY;
-      if (!drag.active && Math.abs(distance) < 4) return;
-      if (!drag.active) {
-        drag.active = true;
-        clearTimeout(snapTimer);
-        column.classList.add('dragging');
-        column.setPointerCapture(e.pointerId);
+      hourButtons.forEach((b, val) => b.classList.toggle('sel', mode === 'hour' && val === h));
+      minButtons.forEach((b, val) => b.classList.toggle('sel', mode === 'minute' && val === m));
+      const fullVal = reminderDraftTime(draft);
+      presets.querySelectorAll('button').forEach(chip => chip.setAttribute('aria-pressed', String(chip.dataset.time === fullVal)));
+      if (animateSwitch) {
+        clearTimeout(autoMinTimer);
+        autoMinTimer = setTimeout(() => {
+          if (S.reminderEditing === draft && draft.step === 1 && draft.dialMode === 'hour') {
+            draft.dialMode = 'minute';
+            paintDial(false);
+          }
+        }, 240);
       }
-      e.preventDefault();
-      column.scrollTop = Math.max(0, Math.min(maximum * TIME_WHEEL_ROW, drag.startTop + distance));
-      choose(Math.round(column.scrollTop / TIME_WHEEL_ROW), false);
-    });
-    for (const event of ['pointerup', 'pointercancel', 'lostpointercapture']) column.addEventListener(event, e => {
-      if (drag?.id === e.pointerId) finishDrag();
-    });
-    column.addEventListener('pointerleave', () => { if (drag && !drag.active) drag = null; });
-    column.addEventListener('wheel', e => {
-      e.preventDefault();
-      if (!editable() || drag?.active || !e.deltaY) return;
-      column.focus({preventScroll: true});
-      const delta = e.deltaY * (e.deltaMode === 1 ? TIME_WHEEL_ROW : e.deltaMode === 2 ? column.clientHeight : 1);
-      const now = performance.now();
-      if (now - wheelStamp > 180 || Math.sign(delta) !== Math.sign(wheelDelta)) wheelDelta = 0;
-      wheelStamp = now; wheelDelta += delta;
-      if (Math.abs(wheelDelta) >= TIME_WHEEL_ROW) {
-        const direction = Math.sign(wheelDelta);
-        // A mouse notch moves one row; tiny trackpad events accumulate first.
-        wheelDelta = Math.abs(delta) >= TIME_WHEEL_ROW ? 0 : wheelDelta - direction * TIME_WHEEL_ROW;
-        choose(draft[field] + direction);
-      }
-    }, {passive: false});
-    column.addEventListener('click', e => {
-      // A mouse drag can emit a click on release; it must not select a different row.
-      if (suppressDragClick && e.detail > 0) { suppressDragClick = false; e.preventDefault(); return; }
-      const option = e.target.closest('.tw-option');
-      if (option && editable()) { column.focus({preventScroll: true}); choose(Number(option.dataset.value)); }
-    });
-    column.addEventListener('keydown', e => {
-      if (!editable()) return;
-      const values = {ArrowUp: draft[field] + 1, ArrowDown: draft[field] - 1, Home: 0, End: maximum};
-      if (e.key in values) { e.preventDefault(); choose(values[e.key]); }
-      else if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
-        e.preventDefault(); columns[field === 'hour' ? 'minute' : 'hour'].column.focus({preventScroll: true});
-      } else if (e.key === 'Enter') { e.preventDefault(); form.requestSubmit(); }
-    });
-    const scheduleSnap = () => {
-      clearTimeout(snapTimer);
-      if (!touching && !drag?.active) snapTimer = setTimeout(() => {
-        if (editable() && !disposed) column.scrollTop = draft[field] * TIME_WHEEL_ROW;
-      }, 120);
     };
-    column.addEventListener('touchstart', () => { touching = true; clearTimeout(snapTimer); }, {passive: true});
-    for (const event of ['touchend', 'touchcancel']) column.addEventListener(event, () => { touching = false; scheduleSnap(); }, {passive: true});
-    column.addEventListener('scroll', () => {
-      if (!editable() || disposed) return;
-      const value = Math.round(column.scrollTop / TIME_WHEEL_ROW);
-      if (value !== draft[field]) choose(value, false);
-      scheduleSnap();
-    }, {passive: true});
-    paint();
-    frame = requestAnimationFrame(() => { if (!disposed) column.scrollTop = draft[field] * TIME_WHEEL_ROW; });
-    reminderWheelCleanup.push(() => {
-      disposed = true; clearTimeout(snapTimer); cancelAnimationFrame(frame);
-      finishDrag();
+
+    const pickByPointer = (e, commit = false) => {
+      if (S.reminderSaving) return;
+      const rect = dial.getBoundingClientRect();
+      const cx = rect.left + rect.width / 2, cy = rect.top + rect.height / 2;
+      const dx = e.clientX - cx, dy = e.clientY - cy;
+      let deg = Math.atan2(dx, -dy) * 180 / Math.PI;
+      if (deg < 0) deg += 360;
+      if (draft.dialMode === 'hour') {
+        const distRatio = Math.hypot(dx, dy) / (rect.width / 2);
+        const step12 = Math.round(deg / 30) % 12;
+        const inner = distRatio < 0.62;
+        draft.hour = inner ? (step12 === 0 ? 0 : step12 + 12) : (step12 === 0 ? 12 : step12);
+        S.reminderError = ''; errorEl.textContent = '';
+        paintDial(commit);
+      } else {
+        const min = Math.round(deg / 6) % 60;
+        draft.minute = min;
+        S.reminderError = ''; errorEl.textContent = '';
+        paintDial(false);
+      }
+    };
+
+    let dragging = false, activePointer = null, moved = false, startX = 0, startY = 0, hitNum = null;
+    dial.addEventListener('pointerdown', e => {
+      if (e.button !== 0 || S.reminderSaving) return;
+      clearTimeout(autoMinTimer);
+      dragging = true;
+      moved = false;
+      hitNum = null;
+      startX = e.clientX; startY = e.clientY;
+      activePointer = e.pointerId;
+      dial.classList.add('dragging');
+      dial.setPointerCapture?.(e.pointerId);
+      const nb = e.target.closest('.gc-num');
+      if (nb && draft.dialMode === 'hour' && nb.dataset.hour !== undefined) {
+        hitNum = {mode: 'hour', val: Number(nb.dataset.hour)};
+        draft.hour = hitNum.val;
+        S.reminderError = ''; errorEl.textContent = '';
+        paintDial(false);
+      } else if (nb && draft.dialMode === 'minute' && nb.dataset.minute !== undefined) {
+        hitNum = {mode: 'minute', val: Number(nb.dataset.minute)};
+        draft.minute = hitNum.val;
+        S.reminderError = ''; errorEl.textContent = '';
+        paintDial(false);
+      } else {
+        pickByPointer(e, false);
+      }
     });
-    window.append(column); group.append(el('span', 'tw-label', label), window); wheels.append(group);
+    dial.addEventListener('pointermove', e => {
+      if (!dragging || e.pointerId !== activePointer) return;
+      if (!moved && Math.hypot(e.clientX - startX, e.clientY - startY) >= 5) moved = true;
+      if (moved || !hitNum) pickByPointer(e, false);
+    });
+    const endDialDrag = e => {
+      if (!dragging || (e.pointerId !== undefined && e.pointerId !== activePointer)) return;
+      dragging = false;
+      activePointer = null;
+      dial.classList.remove('dragging');
+      if (e.type === 'pointerup') {
+        if (!moved && hitNum) {
+          if (hitNum.mode === 'hour') { draft.hour = hitNum.val; paintDial(true); }
+          else { draft.minute = hitNum.val; paintDial(false); }
+        } else {
+          pickByPointer(e, draft.dialMode === 'hour');
+        }
+      }
+      hitNum = null;
+    };
+    for (const ev of ['pointerup', 'pointercancel']) dial.addEventListener(ev, endDialDrag);
+
+    hBtn.onclick = () => { clearTimeout(autoMinTimer); draft.dialMode = 'hour'; paintDial(false); };
+    mBtn.onclick = () => { clearTimeout(autoMinTimer); draft.dialMode = 'minute'; paintDial(false); };
+    hBtn.onkeydown = e => {
+      if (S.reminderSaving) return;
+      if (e.key === 'ArrowUp') { e.preventDefault(); draft.hour = (draft.hour + 1) % 24; paintDial(false); }
+      else if (e.key === 'ArrowDown') { e.preventDefault(); draft.hour = (draft.hour + 23) % 24; paintDial(false); }
+      else if (e.key === 'Home') { e.preventDefault(); draft.hour = 0; paintDial(false); }
+      else if (e.key === 'End') { e.preventDefault(); draft.hour = 23; paintDial(false); }
+      else if (e.key === 'ArrowRight') { e.preventDefault(); mBtn.focus(); draft.dialMode = 'minute'; paintDial(false); }
+    };
+    mBtn.onkeydown = e => {
+      if (S.reminderSaving) return;
+      if (e.key === 'ArrowUp') { e.preventDefault(); draft.minute = (draft.minute + 1) % 60; paintDial(false); }
+      else if (e.key === 'ArrowDown') { e.preventDefault(); draft.minute = (draft.minute + 59) % 60; paintDial(false); }
+      else if (e.key === 'Home') { e.preventDefault(); draft.minute = 0; paintDial(false); }
+      else if (e.key === 'End') { e.preventDefault(); draft.minute = 59; paintDial(false); }
+      else if (e.key === 'ArrowLeft') { e.preventDefault(); hBtn.focus(); draft.dialMode = 'hour'; paintDial(false); }
+    };
+
+    paintDial(false);
+    sec.append(readout, dialWrap, presets, errorEl);
+
+    const foot = el('div', 'wiz-foot');
+    const cancelBtn = btn('取消', 'btn-quiet', cancelReminderEditor);
+    const quickSave = btn('直接保存', 'btn', () => commitReminderWizard(draft));
+    const nextBtn = btn('下一步 · 周期设置', 'btn-primary', () => { draft.step = 2; S.reminderError = ''; renderReminder(); }, 'arrow');
+    quickSave.id = 'rem-quick-save';
+    nextBtn.id = 'rem-next-btn';
+    cancelBtn.disabled = quickSave.disabled = nextBtn.disabled = !!S.reminderSaving;
+    foot.append(cancelBtn, quickSave, nextBtn);
+    stage.append(sec, foot);
+  } else if (draft.step === 2) {
+    const sec = el('div', 'wiz-pane s2');
+    const g1 = el('div', 'wiz-card');
+    g1.append(el('div', 'wiz-lbl', '重复周期'));
+    const presetRow = el('div', 'wiz-chips');
+    const curDays = [...draft.days].sort((a, b) => a - b).join(',');
+    for (const [lbl, arr] of [['每天', [1,2,3,4,5,6,7]], ['工作日', [1,2,3,4,5]], ['周末', [6,7]]]) {
+      const c = btn(lbl, 'chip', () => { draft.days = [...arr]; renderReminder(); });
+      c.type = 'button';
+      c.setAttribute('aria-pressed', String(curDays === arr.join(',')));
+      presetRow.append(c);
+    }
+    const dayRow = el('div', 'day-pills');
+    for (let d = 1; d <= 7; d++) {
+      const on = draft.days.includes(d);
+      const b = btn(WEEK_NAMES[d - 1], 'day-pill' + (on ? ' on' : ''), () => {
+        if (on && draft.days.length <= 1) return;
+        draft.days = on ? draft.days.filter(x => x !== d) : [...draft.days, d].sort((a, b) => a - b);
+        renderReminder();
+      });
+      b.type = 'button'; b.setAttribute('aria-pressed', String(on));
+      b.setAttribute('aria-label', `周${WEEK_NAMES[d - 1]}`);
+      dayRow.append(b);
+    }
+    g1.append(presetRow, dayRow);
+
+    const g2 = el('div', 'switch-row wiz-switch');
+    const g2txt = el('div', 'sr-text');
+    g2txt.append(el('strong', '', '本机已写完时不打扰'), el('small', '', '待提交作业在本地均已有完整草稿时跳过此次提醒'));
+    const g2sw = el('button', 'switch');
+    g2sw.type = 'button'; g2sw.setAttribute('role', 'switch');
+    g2sw.setAttribute('aria-checked', String(!!draft.skip_complete));
+    g2sw.setAttribute('aria-label', '本机已写完时不打扰');
+    g2sw.onclick = () => { draft.skip_complete = !draft.skip_complete; renderReminder(); };
+    g2.append(g2txt, g2sw);
+
+    const g3 = el('div', 'wiz-card');
+    g3.append(el('div', 'wiz-lbl', '免打扰时段（此期间不弹提醒）'));
+    const qRow = el('div', 'wiz-chips');
+    for (const [val, lbl] of [['', '不限制'], ['23:00-07:30', '深夜 23:00–07:30'], ['22:30-07:00', '休息 22:30–07:00'], ['12:30-14:00', '午休 12:30–14:00']]) {
+      const c = btn(lbl, 'chip', () => { draft.quiet = val; renderReminder(); });
+      c.type = 'button'; c.setAttribute('aria-pressed', String(draft.quiet === val));
+      qRow.append(c);
+    }
+    g3.append(qRow);
+    sec.append(g1, g2, g3);
+
+    const foot = el('div', 'wiz-foot');
+    const prevBtn = btn('上一步', 'btn-quiet', () => { draft.step = 1; renderReminder(); });
+    const nextBtn = btn('下一步 · 加急与通知', 'btn-primary', () => { draft.step = 3; renderReminder(); }, 'arrow');
+    foot.append(prevBtn, nextBtn);
+    stage.append(sec, foot);
+  } else {
+    const sec = el('div', 'wiz-pane s3');
+    const g1 = el('div', 'wiz-card');
+    g1.append(el('div', 'wiz-lbl', '截止前加急提醒（独立追加通知，可多选）'));
+    const leadRow = el('div', 'wiz-chips');
+    for (const [h, lbl] of [[24, '截止前 24 小时'], [6, '截止前 6 小时'], [2, '截止前 2 小时']]) {
+      const on = draft.lead_hours.includes(h);
+      const c = btn(lbl, 'chip', () => {
+        draft.lead_hours = on ? draft.lead_hours.filter(x => x !== h) : [...draft.lead_hours, h].sort((a, b) => b - a);
+        renderReminder();
+      });
+      c.type = 'button'; c.setAttribute('aria-pressed', String(on));
+      leadRow.append(c);
+    }
+    g1.append(leadRow);
+
+    const g2 = el('div', 'switch-row wiz-switch');
+    const g2txt = el('div', 'sr-text');
+    g2txt.append(el('strong', '', '提醒前先静默刷新一次'), el('small', '', '确保最新截止时间和提交状态已从学习通同步'));
+    const g2sw = el('button', 'switch');
+    g2sw.type = 'button'; g2sw.setAttribute('role', 'switch');
+    g2sw.setAttribute('aria-checked', String(!!draft.auto_refresh));
+    g2sw.setAttribute('aria-label', '提醒前先静默刷新一次');
+    g2sw.onclick = () => { draft.auto_refresh = !draft.auto_refresh; renderReminder(); };
+    g2.append(g2txt, g2sw);
+
+    const g3 = el('div', 'wiz-card');
+    g3.append(el('div', 'wiz-lbl', '通知样式'));
+    const seg = el('div', 'style-seg');
+    for (const [val, title, subText] of [['center', '通知中心静默留存', '进入系统通知中心，不常驻遮挡屏幕'], ['banner', '桌面横幅提醒', '屏幕右下角短暂浮现并自动收起']]) {
+      const on = draft.notify_style === val;
+      const b = el('button', 'style-opt' + (on ? ' on' : ''));
+      b.type = 'button'; b.setAttribute('aria-pressed', String(on));
+      b.append(el('strong', '', title), el('small', '', subText));
+      b.onclick = () => { draft.notify_style = val; renderReminder(); };
+      seg.append(b);
+    }
+    g3.append(seg);
+
+    const activePending = (S.records || []).filter(rec => rec.group === 'active' && (!draft.skip_complete || progressFor(rec).state !== 'complete'));
+    const pv = el('div', 'rem-preview-box');
+    const pvHead = el('div', 'rem-pv-head');
+    pvHead.append(icon('bell'), el('strong', '', `通知预览 · ${reminderDraftTime(draft)}`), el('span', 'rem-pv-style', draft.notify_style === 'banner' ? '桌面横幅' : '通知中心'));
+    const pvBody = el('div', 'rem-pv-body');
+    if (activePending.length) {
+      pvBody.append(el('div', 'rem-pv-sum', `${activePending.length} 项待提交 · ${formatDaysSummary(draft.days)}提醒`));
+      for (const rec of activePending.slice(0, 2)) {
+        pvBody.append(el('div', 'rem-pv-item', `${rec.course || '课程'} · ${rec.title || '作业'}`));
+      }
+    } else if ((S.records || []).some(rec => rec.group === 'active')) {
+      pvBody.append(el('div', 'rem-pv-sum', '当前待办本机已全部写完（按规则将自动跳过本次打扰）'));
+    } else {
+      pvBody.append(el('div', 'rem-pv-sum', '示例：3 项待提交 · 今天 23:59 截止（1 项未作答）'));
+    }
+    pv.append(pvHead, pvBody);
+
+    sec.append(g1, g2, g3, pv, errorEl);
+
+    const foot = el('div', 'wiz-foot');
+    const prevBtn = btn('上一步', 'btn-quiet', () => { draft.step = 2; renderReminder(); });
+    const saveBtn = btn(draft.originalValue ? '保存更改' : '完成并保存', 'btn-primary', () => commitReminderWizard(draft), 'check');
+    saveBtn.id = 'rem-save-btn';
+    prevBtn.disabled = saveBtn.disabled = !!S.reminderSaving;
+    foot.append(prevBtn, saveBtn);
+    stage.append(sec, foot);
   }
-  for (const [value, label] of [['08:00', '早间'], ['12:30', '午间'], ['18:30', '傍晚'], ['21:30', '晚间']]) {
-    const chip = btn(`${value} ${label}`, 'chip rem-preset-chip', () => {
-      const [hour, minute] = value.split(':').map(Number);
-      columns.hour.choose(hour); columns.minute.choose(minute);
-    });
-    chip.type = 'button'; chip.dataset.time = value; chip.disabled = !!S.reminderSaving; presets.append(chip);
-  }
-  const hint = el('p', 'tw-hint', '拖动、滚动或点击选择，确认后生效'); hint.id = 'reminder-wheel-hint';
-  const actions = el('div', 'rem-add-actions'), cancel = btn('取消', 'btn-quiet', cancelReminderEditor);
-  const confirm = btn(draft.originalValue ? '保存时间' : '添加', 'btn-primary');
-  cancel.type = 'button'; confirm.type = 'submit'; cancel.disabled = confirm.disabled = !!S.reminderSaving;
-  actions.append(cancel, confirm); form.append(head, wheels, hint, presets, error, actions); update();
-  form.onsubmit = async e => {
-    e.preventDefault();
-    if (!editable()) return;
-    const value = reminderDraftTime(draft), current = S.reminder, times = [...(current.times || [])];
-    const index = draft.originalValue === null ? -1 : times.indexOf(draft.originalValue);
-    const fail = message => { S.reminderError = message; error.textContent = message; };
-    if (draft.originalValue !== null && index < 0) { fail('原提醒时间已更改，请取消后重新选择。'); return; }
-    if (times.some((time, i) => time === value && i !== index)) { fail('这个时间已经添加过了。'); return; }
-    if (index < 0 && times.length >= (current.max_times || 12)) { fail(`提醒时间最多设置 ${current.max_times || 12} 个。`); return; }
-    if (index < 0) times.push(value); else times[index] = value;
-    if (value === draft.originalValue) { cancelReminderEditor(); return; }
-    const saved = await saveReminder({enabled: true, times});
-    // A closed/reopened dialog belongs to a new editing session.
-    if (S.reminderEditing !== draft || !$('#reminder-dialog').open) return;
-    if (saved) { S.reminderEditing = null; renderReminder(); focusReminderTime(value); }
-    else $(`#reminder-${draft.focusColumn}`)?.focus({preventScroll: true});
-  };
-  return form;
+
+  wrap.append(stage);
+  return wrap;
 }
 
 function renderReminder() {
   const body = $('#reminder-body'), dialog = $('#reminder-dialog'), r = S.reminder;
   const scrollTop = body.scrollTop;
-  clearReminderWheel();
   body.replaceChildren(closeButton(dialog), el('div', 'sheet-eyebrow', '本机提醒'));
   const head = el('div', 'rem-title-row');
   head.append(titled('reminder-title', '作业提醒'));
@@ -3128,21 +4262,29 @@ function renderReminder() {
     head.append(saved);
   }
   body.append(head);
-  body.append(el('p', 'rem-description', '每天定时提醒未提交的作业。'));
   if (!r) { body.append(el('p', 'sheet-text', '正在读取…')); return; }
+
+  if (S.reminderEditing) {
+    body.append(renderReminderWizard(S.reminderEditing));
+    body.scrollTop = 0;
+    return;
+  }
+
+  body.append(el('p', 'rem-description', '卡片式管理每日定时提醒，添加时通过双圈表盘和向导配置策略。'));
 
   const slots = reminderSlots(r), next = slots[0], todayCount = slots.filter(slot => slot.day === '今天').length;
   const card = el('div', 'rem-status' + (r.enabled ? '' : ' off')), mark = el('span', 'rem-bell' + (r.enabled && Date.now() < S.bellRingUntil ? ' ringing' : '')), text = el('div', 'rem-status-text');
   mark.append(icon('bell'));
   if (!r.enabled) {
-    text.append(el('small', '', '提醒已关闭'), el('strong', '', '不会再弹出提醒'), el('span', '', '时间已保留，开启后恢复'));
+    text.append(el('small', '', '提醒已关闭'), el('strong', '', '不会再弹出提醒'), el('span', '', '时间卡已保留，开启后恢复'));
   } else if (!next) {
-    text.append(el('small', '', '下次提醒'), el('strong', '', '尚未设置'), el('span', '', '添加时间后生效'));
+    text.append(el('small', '', '下次提醒'), el('strong', '', '尚未设置'), el('span', '', '添加时间卡后生效'));
   } else {
     text.append(el('small', '', '下次提醒'), el('strong', '', `${next.day} ${next.value}`),
       el('span', '', `${left(next.target - Date.now())}${todayCount ? ` · 今天还有 ${todayCount} 次` : ''}`));
   }
   const sw = el('button', 'switch');
+  sw.id = 'reminder-switch';
   sw.type = 'button';
   sw.setAttribute('role', 'switch');
   sw.setAttribute('aria-checked', String(r.enabled));
@@ -3152,71 +4294,96 @@ function renderReminder() {
     const turningOn = !S.reminder.enabled;
     if (turningOn) S.bellRingUntil = Date.now() + 700;
     S.reminderEditing = null;
-    await saveReminder({enabled: turningOn, times: S.reminder.times});
-    if (dialog.open) $('#reminder-body .switch')?.focus({preventScroll: true});
+    await saveReminder({enabled: turningOn, times: S.reminder.times, rules: S.reminder.rules});
+    if (dialog.open) $('#reminder-switch')?.focus({preventScroll: true});
   };
   card.append(mark, text, sw);
   body.append(card);
 
-  const editKey = S.reminderEditing && r.enabled ? (S.reminderEditing.originalValue ?? '__new__') : null;
-  if (!editKey) S.remOpenedKey = null;
-  const buildRemSlot = draft => {
-    const slot = el('div', 'rem-slot'), inner = el('div');
-    inner.append(renderReminderEditor(draft));
-    slot.append(inner);
-    if (S.remOpenedKey === editKey || REDUCED_MOTION()) slot.classList.add('open');
-    else {
-      S.remOpenedKey = editKey;
-      requestAnimationFrame(() => { if (slot.isConnected) slot.classList.add('open'); });
-    }
-    return slot;
-  };
   const wrap = el('div', 'rem-body' + (r.enabled ? '' : ' off'));
   const schedule = el('section', 'rem-section'), count = el('div', 'rem-head');
-  count.append(el('strong', '', '提醒时间'), el('span', 'rem-count', `${(r.times || []).length} / ${r.max_times || 12}`));
+  const addTop = btn('添加提醒', 'btn-primary btn-sm', () => openReminderWizard(null), 'plus');
+  addTop.id = 'reminder-add';
+  addTop.disabled = !r.enabled || !!S.reminderSaving || (r.times || []).length >= (r.max_times || 12);
+  count.append(el('strong', '', '时间卡片'), el('span', 'rem-count', `${(r.times || []).length} / ${r.max_times || 12}`), addTop);
   schedule.append(count);
-  const list = el('div', 'reminder-time-list');
+
+  const list = el('div', 'tcards');
+  list.id = 'reminder-time-list';
   (r.times || []).forEach((value, index) => {
-    const editing = S.reminderEditing?.originalValue === value;
-    const entry = el('div', 'rem-time-entry' + (editing ? ' editing' : ''));
-    const item = el('div', 'reminder-time-item'), trigger = btn(value, 'rem-time', () => openReminderEditor(value));
-    trigger.dataset.time = value; trigger.disabled = !r.enabled || !!S.reminderSaving;
-    trigger.setAttribute('aria-label', `提醒时间 ${index + 1}，${value}`);
-    trigger.setAttribute('aria-expanded', String(editing));
-    if (editing) trigger.setAttribute('aria-controls', 'reminder-time-editor');
-    trigger.append(icon('chevron')); trigger.title = '修改提醒时间';
+    const rule = normClientRule(r.rules?.[value]);
     const slot = slots.find(s => s.value === value);
-    const meta = el('span', 'reminder-time-meta', `${r.enabled && slot ? `${slot.day} · ` : '每天 · '}${reminderPeriod(value)}`);
-    const remove = btn('', 'btn-quiet icon-only', async () => {
-      S.reminderEditing = null;
-      await saveReminder({enabled: true, times: S.reminder.times.filter(time => time !== value)});
-      focusReminderTime(value);
+    const tc = el('div', 'tcard');
+    const tcTop = el('div', 'tcard-top');
+    const mainBtn = el('button', 'tcard-main');
+    mainBtn.type = 'button';
+    mainBtn.dataset.time = value;
+    mainBtn.disabled = !r.enabled || !!S.reminderSaving;
+    mainBtn.setAttribute('aria-label', `提醒时间 ${index + 1}，${value}`);
+    const tTime = el('span', 'tcard-time', value);
+    const tMeta = el('div', 'tcard-meta');
+    tMeta.append(el('strong', '', `${formatDaysSummary(rule.days)} · ${reminderPeriod(value)}`),
+      el('small', '', r.enabled && slot ? `下次 ${slot.day} ${slot.value}` : '已关闭'));
+    mainBtn.append(tTime, tMeta);
+    mainBtn.onclick = () => openReminderWizard(value);
+
+    const ops = el('div', 'tcard-ops');
+    const editBtn = btn('编辑', 'btn-sm btn-ghost', () => openReminderWizard(value));
+    editBtn.setAttribute('aria-label', `编辑 ${value}`);
+    editBtn.disabled = !r.enabled || !!S.reminderSaving;
+    const removeBtn = btn('', 'btn-quiet btn-sm icon-only', async e => {
+      e.stopPropagation();
+      const nextTimes = S.reminder.times.filter(time => time !== value);
+      const nextRules = {...(S.reminder.rules || {})};
+      delete nextRules[value];
+      await saveReminder({enabled: true, times: nextTimes, rules: nextRules});
+      focusReminderTime(nextTimes[0]);
     }, 'trash');
-    remove.setAttribute('aria-label', `删除 ${value}`);
-    remove.disabled = !r.enabled || !!S.reminderSaving;
-    item.append(trigger, meta, remove); entry.append(item);
-    if (editing && r.enabled) entry.append(buildRemSlot(S.reminderEditing));
-    list.append(entry);
+    removeBtn.setAttribute('aria-label', `删除 ${value}`);
+    removeBtn.disabled = !r.enabled || !!S.reminderSaving;
+    ops.append(editBtn, removeBtn);
+    tcTop.append(mainBtn, ops);
+
+    const tags = el('div', 'tcard-tags');
+    if (rule.skip_complete) tags.append(el('span', 'tcard-tag ok', '写完不打扰'));
+    if (rule.quiet) tags.append(el('span', 'tcard-tag', `免打扰 ${rule.quiet}`));
+    if (rule.lead_hours?.length) tags.append(el('span', 'tcard-tag warn', `截止前 ${rule.lead_hours.join('/')}h 加急`));
+    if (rule.auto_refresh) tags.append(el('span', 'tcard-tag', '前先刷新'));
+    tags.append(el('span', 'tcard-tag muted', rule.notify_style === 'banner' ? '桌面横幅' : '通知中心'));
+
+    tc.append(tcTop, tags);
+    list.append(tc);
   });
-  if (!(r.times || []).length) list.append(el('p', 'reminder-empty', '还没有提醒时间，点下方「添加时间」设置第一个。'));
+
+  if (!(r.times || []).length) {
+    const empty = el('div', 'reminder-empty');
+    empty.append(icon('clock'), el('strong', '', '还没有提醒时间卡'), el('span', '', '点击上方「添加提醒」，使用谷歌时钟双圈表盘设定提醒时间与免打扰策略。'));
+    list.append(empty);
+  }
   schedule.append(list);
 
-  if (S.reminderEditing?.originalValue === null && r.enabled) {
-    schedule.append(buildRemSlot(S.reminderEditing));
-  } else {
-    const add = btn('添加时间', 'btn-sm rem-add-btn', () => openReminderEditor(), 'plus');
-    add.id = 'reminder-add';
-    add.disabled = !r.enabled || !!S.reminderSaving || (r.times || []).length >= (r.max_times || 12);
-    schedule.append(add);
-  }
-  if (S.reminderError && !S.reminderEditing) {
+  if (S.reminderError) {
     const error = el('p', 'rem-error', S.reminderError); error.setAttribute('role', 'alert'); schedule.append(error);
   }
   wrap.append(schedule);
   body.append(wrap);
 
-  const foot = el('p', 'rem-foot');
-  foot.append(icon('info'), el('span', '', '助手运行时生效，关闭网页仍会提醒。'));
+  const foot = el('div', 'rem-foot rem-foot-bar');
+  const infoWrap = el('span', 'rem-foot-info');
+  infoWrap.append(icon('info'), el('span', '', '助手运行时生效，关闭网页仍会提醒。'));
+  const testBtn = btn('发测试通知', 'btn-sm btn-ghost', async () => {
+    testBtn.disabled = true;
+    try {
+      const res = await api('/api/reminder/test', {});
+      toast(res.native ? '测试通知已发送，请查看系统通知中心' : '系统未允许弹出原生通知，可在助手内查看', res.native ? 'ok' : 'warn');
+    } catch (e) {
+      toast('发送测试通知失败：' + e.message, 'error');
+    } finally {
+      testBtn.disabled = false;
+    }
+  }, 'bell');
+  testBtn.id = 'reminder-test';
+  foot.append(infoWrap, testBtn);
   body.append(foot);
   body.scrollTop = scrollTop;
 }
@@ -3253,6 +4420,7 @@ async function load({diff = false} = {}) {
   // After a refresh, remember which records are new or changed so the list can show it.
   const before = diff && S.loaded ? new Map(S.records.map(r => [r.key, recordSig(r)])) : null;
   const beforeDeadlines = diff && S.loaded ? new Map(S.records.map(r => [r.key, r.deadline || ''])) : null;
+  const beforeGroups = diff && S.loaded ? new Map(S.records.map(r => [r.key, r.group || ''])) : null;
   const flipRects = diff && S.loaded ? new Map([...document.querySelectorAll('#assignment-list .item[data-key]')].map(n => [n.dataset.key, n.getBoundingClientRect().top])) : null;
   const nextKeys = new Set((data.assignments || []).map(r => r.key));
   const removedKeys = before ? [...before.keys()].filter(k => !nextKeys.has(k)) : [];
@@ -3262,7 +4430,13 @@ async function load({diff = false} = {}) {
     S.fresh = new Map();
     S.addedKeys = new Map();
     S.deadlineChangedKeys = new Map();
-    S.diff = {added: 0, changed: 0};
+    S.diff = {
+      added: 0,
+      archived: removedKeys.filter(k => beforeGroups?.get(k) !== 'history').length,
+      deadlineChanged: 0,
+      otherChanged: 0,
+      changed: 0,
+    };
     for (const r of S.records) {
       const was = before.get(r.key);
       if (was === recordSig(r)) continue;
@@ -3271,7 +4445,13 @@ async function load({diff = false} = {}) {
         S.addedKeys.set(r.key, now);
       } else {
         S.diff.changed++;
-        if (beforeDeadlines && beforeDeadlines.get(r.key) !== (r.deadline || '')) {
+        const prevGroup = beforeGroups ? beforeGroups.get(r.key) : '';
+        const movedToHistory = prevGroup !== 'history' && r.group === 'history';
+        const dueChanged = beforeDeadlines && beforeDeadlines.get(r.key) !== (r.deadline || '');
+        if (movedToHistory) S.diff.archived++;
+        else if (dueChanged) S.diff.deadlineChanged++;
+        else S.diff.otherChanged++;
+        if (dueChanged) {
           S.deadlineChangedKeys.set(r.key, now);
         }
       }
@@ -3283,15 +4463,29 @@ async function load({diff = false} = {}) {
   S.lastSuccess = data.last_success;
   S.lastCheck = data.last_check;
   S.warnings = data.last_stats?.warnings || [];
+  const prevAcctId = S.auth?.active_account_id;
   S.loaded = true;
   S.loadError = null;
   applyJob(data.job);
+  const nextAcctId = S.auth?.active_account_id;
+  const accountSwitched = !!(prevAcctId && nextAcctId && prevAcctId !== nextAcctId);
   const prev = S.key;
   S.key = S.key ? canonicalKey(S.key) : null;
-  for (const k of [...drafts.keys()]) if (!dirty.has(k) && !saving.has(k) && !(k === S.key && k === prev)) drafts.delete(k);
-  if (removedKeys.length) animateRemovedItems(removedKeys);
+  if (accountSwitched) {
+    drafts.clear();
+    dirty.clear();
+    saving.clear();
+    saveState.clear();
+    draftChanges.clear();
+    S.historyExpanded = false;
+    S.historyCleanConfirm = false;
+    if (S.key && !nextKeys.has(S.key)) S.key = null;
+  } else {
+    for (const k of [...drafts.keys()]) if (!dirty.has(k) && !saving.has(k) && !(k === S.key && k === prev)) drafts.delete(k);
+  }
+  if (removedKeys.length && !accountSwitched) animateRemovedItems(removedKeys);
   renderList();
-  if (flipRects && flipRects.size) {
+  if (!accountSwitched && flipRects && flipRects.size) {
     for (const node of document.querySelectorAll('#assignment-list .item[data-key]')) {
       const oldTop = flipRects.get(node.dataset.key);
       if (oldTop === undefined) continue;
@@ -3362,11 +4556,7 @@ async function boot() {
 /* ---------- Wiring ---------- */
 document.querySelectorAll('[data-icon]').forEach(n => n.replaceWith(icon(n.dataset.icon)));
 $('#image-close').append(icon('x'));
-document.querySelectorAll('.tab').forEach(t => t.onclick = () => {
-  const next = t.dataset.group;
-  if (next !== S.group) snapshotListOut((GROUP_IDX[next] ?? 0) > (GROUP_IDX[S.group] ?? 0) ? 1 : -1);
-  switchGroup(next); S.sub = 'all'; S.progressFilter = S.dueFilter = 'all'; renderList();
-});
+document.querySelectorAll('.tab').forEach(t => t.onclick = () => transitionToGroup(t.dataset.group));
 $('#home').onclick = goHome;
 $('#home-top').onclick = goHome;
 $('#progress-filter').onchange = e => { S.progressFilter = e.target.value; S.filterEnter = true; renderList(); };
@@ -3375,7 +4565,7 @@ $('#search').oninput = () => { S.filterEnter = true; renderList(); };
 $('#search').onkeydown = e => { if (e.key === 'Escape' && e.target.value) { e.target.value = ''; S.filterEnter = true; renderList(); } };
 $('#refresh').onclick = () => startAction('refresh');
 $('#back').onclick = () => setView('list');
-$('#account-login-button').onclick = () => { closeAccountMenu(); openLogin(); };
+$('#account-manage-button').onclick = () => { closeAccountMenu(); openAccountManager(); };
 $('#reminder-button').onclick = () => {
   closeAccountMenu();
   S.reminderEditing = null; S.reminderError = ''; S.remOpenedKey = null;
@@ -3469,7 +4659,27 @@ $('#image-dialog').addEventListener('cancel', e => { e.preventDefault(); closeIm
 $('.viewer-stage').onclick = e => { if (e.target.tagName === 'IMG') e.currentTarget.classList.toggle('actual'); else closeImageViewer(); };
 document.querySelectorAll('dialog.sheet').forEach(dlg => {
   dlg.addEventListener('click', e => { if (e.target === dlg) closeSheet(dlg); });
-  if (dlg.id !== 'reminder-dialog') dlg.addEventListener('cancel', e => { e.preventDefault(); closeSheet(dlg); });
+  if (dlg.id !== 'reminder-dialog' && dlg.id !== 'login-dialog') {
+    dlg.addEventListener('cancel', e => { e.preventDefault(); closeSheet(dlg); });
+  }
+});
+$('#login-dialog').addEventListener('cancel', e => {
+  e.preventDefault();
+  if (S.accountRenameId) { cancelAccountRename(); return; }
+  if (loginPhase === 'form' && loginView === 'form' && loginFromList && savedAccountsList().length > 0) {
+    slideM3View('list');
+    return;
+  }
+  closeSheet($('#login-dialog'));
+});
+$('#login-dialog').addEventListener('close', () => {
+  S.accountRemoveConfirmId = null;
+  S.accountRenameId = null;
+  S.accountRenameValue = '';
+  S.loginListSig = '';
+  loginTarget = null;
+  loginFromList = false;
+  loginAliasDraft = '';
 });
 $('#detail').addEventListener('click', e => {
   const act = e.target.closest('[data-act]');
@@ -3507,20 +4717,27 @@ window.addEventListener('pagehide', () => {
   }
 });
 function onWindowAway() {
-  for (const w of S.watchingSub.values()) w.blurred = true;
+  const now = Date.now();
+  for (const w of S.watchingSub.values()) {
+    if (!w.blurred) w.blurredAt = now;
+    w.blurred = true;
+  }
 }
 function onWindowReturn() {
-  if (S.exited || S.job.busy || !S.online || !S.watchingSub.size) return;
+  if (S.exited || S.job.busy || S.subCheckBusyKey || !S.online || !S.watchingSub.size) return;
   const now = Date.now();
   const candidates = [S.key, ...S.watchingSub.keys()].filter(Boolean);
   for (const k of candidates) {
     const w = S.watchingSub.get(k);
     const r = S.records.find(x => x.key === k);
     if (!w || !r || r.group === 'history') { S.watchingSub.delete(k); continue; }
-    if (w.blurred && now - w.readyAt >= 2500) {
+    const awayMs = now - (w.blurredAt || w.readyAt);
+    const ready = now >= (w.nextAutoAt || 0);
+    if (w.blurred && ready && awayMs >= 6000) {
       w.blurred = false;
       w.readyAt = now;
-      triggerSubmissionCheck(k);
+      w.nextAutoAt = now + 30000;
+      triggerSubmissionCheck(k, {auto: true});
       break;
     }
   }

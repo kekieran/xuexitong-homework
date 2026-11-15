@@ -10,6 +10,7 @@ import math
 from pathlib import Path
 import re
 import threading
+import time
 import uuid
 import urllib.error
 import urllib.parse
@@ -513,7 +514,9 @@ def apply_template(key, qid, adopt):
 
 def test_connection():
     profile = _profile()
+    started = time.perf_counter()
     response = request_answers(profile, [{'id': 'connection-test', 'type': 'blank', 'text': '填写大写 OK', 'blank_count': 1, 'options': [], 'images': []}])
+    latency_ms = max(1, round((time.perf_counter() - started) * 1000))
     if not any(isinstance(a, dict) and a.get('id') == 'connection-test' and a.get('values') == ['OK'] for a in response):
         raise AIError('已连接，但模型未返回预期格式')
-    return {'message': '连接成功'}
+    return {'message': '连接成功', 'latency_ms': latency_ms, 'vision': bool(profile.get('vision'))}

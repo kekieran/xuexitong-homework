@@ -5,10 +5,12 @@ public course.js getCourseList(); no course or report write route is used.
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import re
 from urllib.parse import parse_qs, urljoin, urlsplit
 
 import homework_dom as dom
+import homework_http as http_pool
 from homework_lab import dispose_response
 import homework_school as school
 
@@ -48,6 +50,15 @@ def _active_endpoints():
 
 def _read(context, url, form=None):
     _, _, catalog_url, _ = _active_endpoints()
+    if form is None and hasattr(context, 'cached_response'):
+        cached = context.cached_response(url, max_age=15.0)
+        if isinstance(cached, bytes) and len(cached) <= 4_000_000:
+            try:
+                markup = cached.decode('utf-8')
+                if not dom.is_login(markup, url):
+                    return markup
+            except Exception:
+                pass
     response = None
     try:
         try:
@@ -200,14 +211,40 @@ def discover_courses(context):
     except (RuntimeError, ValueError) as exc:
         return [], [str(exc)]
     pending = ['0']
-    while pending and len(seen) < _MAX_FOLDERS:
-        folder = pending.pop(0)
-        if folder in seen:
-            continue
-        seen.add(folder)
+    concurrent = http_pool.supports_concurrency(context)
+
+    def fetch_folder(folder_id):
         try:
-            markup = _read(context, list_url, dict(form, courseFolderId=folder))
-            courses, folders, messages = _parse_list(markup)
+            markup = _read(context, list_url, dict(form, courseFolderId=folder_id))
+            return _parse_list(markup), ''
+        except (RuntimeError, ValueError) as exc:
+            return None, str(exc)
+
+    while pending and len(seen) < _MAX_FOLDERS:
+        remaining_slots = _MAX_FOLDERS - len(seen)
+        batch = []
+        while pending and len(batch) < remaining_slots:
+            folder = pending.pop(0)
+            if folder not in seen:
+                seen.add(folder)
+                batch.append(folder)
+            if not concurrent:
+                break
+        if not batch:
+            break
+        if concurrent and len(batch) > 1:
+            with ThreadPoolExecutor(max_workers=min(4, len(batch))) as pool:
+                results = list(pool.map(fetch_folder, batch))
+        else:
+            results = [fetch_folder(folder) for folder in batch]
+        stop_login = False
+        for parsed, err in results:
+            if err:
+                warnings.append(err)
+                if err == LOGIN_REQUIRED:
+                    stop_login = True
+                continue
+            courses, folders, messages = parsed
             warnings.extend(messages)
             for target in courses:
                 if target['course_id'] in targets:
@@ -216,11 +253,11 @@ def discover_courses(context):
                     warnings.append(LIMIT_WARNING)
                     break
                 targets[target['course_id']] = target
-            pending.extend(value for value in folders if value not in seen and value not in pending)
-        except (RuntimeError, ValueError) as exc:
-            warnings.append(str(exc))
-            if str(exc) == LOGIN_REQUIRED:
-                break
+            for value in folders:
+                if value not in seen and value not in pending:
+                    pending.append(value)
+        if stop_login:
+            break
     if pending:
         warnings.append(LIMIT_WARNING)
     return list(targets.values()), list(dict.fromkeys(warnings))

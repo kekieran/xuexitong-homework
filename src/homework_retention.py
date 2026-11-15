@@ -270,3 +270,85 @@ def cleanup_history():
         return {'history_count': plan['history_count'], 'draft_count': plan['draft_count'],
                 'deleted_files': deleted, 'pending_files': len(remaining),
                 'shared_files': plan['shared_files']}
+
+
+def _history_reference_time(record):
+    """Return the most meaningful timestamp to evaluate a history record's age."""
+    for field in ('deadline', 'start', 'notice_sent', 'status_checked_at', 'metadata_checked_at', 'history_cleaned_at'):
+        dt = engine.parse_datetime(record.get(field))
+        if dt is not None:
+            return dt
+    return None
+
+
+def _draft_has_user_work(draft):
+    if isinstance(draft, str):
+        return bool(draft.strip())
+    if not isinstance(draft, dict):
+        return False
+    return bool(draft.get('answers') or draft.get('legacy_text') or draft.get('attachments'))
+
+
+def cleanup_old_history(days=45):
+    """Prune aged history records (>days) without active deadlines or user drafts."""
+    from datetime import datetime, timedelta
+    try:
+        days = max(1, int(days))
+    except (TypeError, ValueError):
+        days = 45
+    now = datetime.now()
+    cutoff = now - timedelta(days=days)
+    removed_records = 0
+    deleted_files = 0
+    with engine.browser_operation(), engine.STATE_LOCK, engine.draft_transaction():
+        state = engine.read_json(engine.STATE_FILE, {})
+        if not isinstance(state, dict) or not isinstance(state.get('assignments'), dict):
+            return {'removed_records': 0, 'deleted_files': 0}
+        drafts = engine.read_json(engine.DRAFTS_FILE, {})
+        if not isinstance(drafts, dict):
+            drafts = {}
+        overrides = engine.local_overrides()
+        next_state = deepcopy(state)
+        next_drafts = deepcopy(drafts)
+        assignments = next_state.get('assignments') or {}
+        removed_objs = []
+        removed_keys = set()
+
+        for key, record in list(assignments.items()):
+            eff = engine.effective_record(record, overrides)
+            group = engine.record_group(eff)
+            dl = engine.parse_datetime(eff.get('deadline')) or engine.parse_datetime(record.get('deadline'))
+            draft = next_drafts.get(key)
+            if group != 'history' or (dl is not None and dl > now) or _draft_has_user_work(draft):
+                continue
+            ref = _history_reference_time(record)
+            if ref is not None and ref < cutoff:
+                removed_objs.append(assignments.pop(key))
+                removed_keys.add(key)
+                removed_records += 1
+                if key in next_drafts and not _draft_has_user_work(next_drafts.get(key)):
+                    next_drafts.pop(key, None)
+
+        if not removed_records:
+            return {'removed_records': 0, 'deleted_files': 0}
+
+        aliases = next_state.get('record_aliases')
+        if isinstance(aliases, dict):
+            for ak in [k for k, v in aliases.items() if k in removed_keys or v in removed_keys]:
+                aliases.pop(ak, None)
+
+        engine.save_state(next_state)
+        if next_drafts != drafts:
+            engine.write_json(engine.DRAFTS_FILE, next_drafts)
+
+        candidates = references(removed_objs)
+        protected = references([next_state, next_drafts])
+        for path in candidates - protected:
+            try:
+                if safe_file(path) != path:
+                    continue
+                path.unlink()
+                deleted_files += 1
+            except OSError:
+                pass
+    return {'removed_records': removed_records, 'deleted_files': deleted_files}

@@ -16,6 +16,7 @@ from datetime import datetime
 from pathlib import Path
 
 import homework_dom as dom
+import homework_runtime as runtime
 import homework_shared as shared
 
 
@@ -499,7 +500,7 @@ def _fill_platform_choice(root, question, expected, allowed):
 
 def _read_only_url(url):
     path = url.split('?', 1)[0].lower().rstrip('/')
-    return bool(re.search(r'/work/view(?:report)?(?:/|$)', path) or any(part in path for part in ('viewwork', 'workreport', 'viewanswer')))
+    return bool(re.search(r'/work/view(?:report)?(?:/|$)', path) or any(part in path for part in ('viewwork', 'workreport', 'viewanswer', 'selectworkquestion')))
 
 
 def fill_page(page, questions, answers, progress=None):
@@ -668,13 +669,13 @@ def _open_fill_context(playwright, backend, timeout=12):
         except Exception:
             if time.monotonic() >= deadline:
                 raise RuntimeError('尚未连接到专用学习通窗口，请重新打开后再填入。')
-            time.sleep(.25)
+            time.sleep(0.05)
             continue
         backend.runtime.verify_browser_profile(browser)
         if not browser.contexts:
             if time.monotonic() >= deadline:
                 raise RuntimeError('专用学习通窗口尚未就绪，请重新打开后再填入。')
-            time.sleep(.25)
+            time.sleep(0.05)
             continue
         context = browser.contexts[0]
         state = backend.read_json(backend.DATA_DIR / 'browser_session.json', {})
@@ -740,6 +741,16 @@ def _wait_for_answer_editors(page, questions, answers):
         return False
 
 
+def _activate_page(backend, context, page):
+    """Bring `page` cleanly to the front across Chrome, Edge, and unit mocks."""
+    runtime = getattr(backend, 'runtime', None)
+    activate = getattr(runtime, 'activate_page', None)
+    if callable(activate):
+        activate(context, page)
+    elif hasattr(page, 'bring_to_front'):
+        page.bring_to_front()
+
+
 def open_assignment(key):
     b = _backend()
     with b.browser_operation():
@@ -747,18 +758,31 @@ def open_assignment(key):
         if record.get('source_kind') == 'lab_report':
             from homework_lab_fill import open_assignment as open_lab
             return open_lab(key)
+        if record.get('source_kind') == 'renwu_task' and record.get('answer_url') and dom.platform_url(record['answer_url']):
+            b.ensure_chrome(record['answer_url'], app=False)
+            return {'message': '已打开学习通分组/实践任务页面'}
         entry = _entry(record)
-        from playwright.sync_api import sync_playwright
         from homework_navigation import resolve_work_page
         final, error = None, None
-        with sync_playwright() as p:
-            context = b.open_context(p, headless=False)
+        open_fast = getattr(b, '_open_fast_or_browser_context', None)
+        fast_ctx = open_fast(True) if callable(open_fast) else None
+        if fast_ctx is not None:
             try:
-                _, final = resolve_work_page(context, record, b.fetch_html)
-            except Exception as exc:
-                error = exc
+                _, final = resolve_work_page(fast_ctx, record, b.fetch_html)
+            except Exception:
+                final = None
             finally:
-                b.close_context(context)
+                fast_ctx.close()
+        if final is None:
+            from playwright.sync_api import sync_playwright
+            with sync_playwright() as p:
+                context = b.open_context(p, headless=False)
+                try:
+                    _, final = resolve_work_page(context, record, b.fetch_html)
+                except Exception as exc:
+                    error = exc
+                finally:
+                    b.close_context(context)
         # Exactly one window: the verified do-homework page. The stored entry
         # usually lands on a notice, list or redirect page, so opening it first
         # left a second, wrong window behind on every click.
@@ -799,6 +823,10 @@ def _fill_assignment(key):
     record = _record(key)
     if b.effective_record(record).get('local_settings', {}).get('completed'):
         return {'filled': [], 'skipped': [], 'message': '此作业已在本机标记完成，请先撤销该标记再填入。'}
+    if record.get('source_kind') == 'renwu_task' and record.get('answer_url') and dom.platform_url(record['answer_url']):
+        b.ensure_chrome(record['answer_url'], app=False)
+        skipped = [str(q.get('id')) for q in record.get('questions', []) if q.get('id')]
+        return {'filled': [], 'skipped': skipped, 'message': '已打开学习通分组/实践任务页面，请在网页中填写或上传附件后提交。'}
     draft = b.load_draft(key)
     answers = draft.get('answers') or {}
     if not isinstance(answers, dict) or not any(isinstance(v, dict) and (v.get('value') not in (None, '', []) or v.get('files')) for v in answers.values()):
@@ -807,115 +835,159 @@ def _fill_assignment(key):
     if not dom.record_identities(record):
         return {'filled': [], 'skipped': [], 'message': '作业身份尚未核实，请先刷新。'}
     has_attachments = any(isinstance(v, dict) and v.get('files') for v in answers.values())
+    from homework_navigation import resolve_work_page
     from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
     progress = getattr(b, 'PROGRESS', lambda message: None)
     progress('正在连接学习通窗口…')
     # Resolve and validate first; opening the notice/list here would load the
     # same assignment twice and race the later page lookup during redirects.
     b.ensure_chrome(app=False)
-    with sync_playwright() as p:
-        context = None
-        phase = 'connect'
-        try:
-            context = _open_fill_context(p, b)
-            # Never create a disposable browser whose closure would discard the
-            # filled answers. The dedicated Chrome must remain connected via CDP.
-            if b.CONNECTED_BROWSER is None:
-                return {'filled': [], 'skipped': [], 'message': '尚未连接到专用学习通窗口，请重新打开后再填入。'}
-            # Fresh detail metadata is checked before any answer operation. A
-            # cached pending status/deadline is insufficient if the teacher closed
-            # the assignment since the assistant's last refresh.
-            from homework_navigation import resolve_work_page
-            progress('正在核实作业状态…')
-            phase = 'verify'
-            detail, detail_final = resolve_work_page(context, record, b.fetch_html)
-            url = detail_final
-            if not _identity_matches(record, detail, detail_final):
-                return {'filled': [], 'skipped': [], 'message': '作业详情身份不一致，已停止填入。'}
-            if _read_only_url(detail_final):
-                return {'filled': [], 'skipped': [], 'message': '作业详情为只读查看页面，未填入。'}
-            b.update_metadata(record, detail, detail_final)
-            reason = _deadline_reason(record, defer_missing=has_attachments)
-            if reason:
-                return {'filled': [], 'skipped': [], 'message': reason}
-            matches = [existing for existing in context.pages if existing.url == url]
-            page = matches[-1] if matches else context.new_page()
-            progress('正在加载学习通作答页…')
-            phase = 'page'
-            if not matches:
-                page.goto(url, wait_until='domcontentloaded', timeout=PAGE_LOAD_TIMEOUT_MS)
-            else:
-                # Do not reload a page that may already contain the user's work.
-                page.wait_for_load_state('domcontentloaded', timeout=PAGE_LOAD_TIMEOUT_MS)
-            phase = 'verify'
-            page.bring_to_front()
-            markup = page.content()
-            if dom.is_login(markup, page.url):
-                return {'filled': [], 'skipped': [], 'message': '学习通登录已失效，请在打开的窗口登录，再重试填入。'}
-            if not _identity_matches(record, markup, page.url):
-                return {'filled': [], 'skipped': [], 'message': '作业身份与已保存答案不一致，已停止填入。'}
-            b.update_metadata(record, markup, page.url)
-            reason = _deadline_reason(record, defer_missing=has_attachments)
-            if reason:
-                return {'filled': [], 'skipped': [], 'message': reason}
-            # A report/review page must never receive answer writes.
-            root = dom.parse(markup)
-            displayed_status = ' '.join(dom.clean_text(n) for n in root.all() if set(n.attrs.get('class', '').split()) & {'workStatus', 'status', 'statusText'})
-            if _read_only_url(page.url) or dom.explicit_status(displayed_status) == 'submitted':
-                return {'filled': [], 'skipped': [], 'message': '网页显示此作业已提交或处于查看模式，未填入。'}
-            questions = dom.parse_questions(markup, page.url)
-            if not questions:
-                entry = dom.phone_entry(markup, page.url)
-                if entry and dom.platform_url(entry):
-                    phase = 'page'
-                    page.goto(entry, wait_until='domcontentloaded', timeout=PAGE_LOAD_TIMEOUT_MS)
-                    phase = 'verify'
-                    markup = page.content()
-                    if dom.is_login(markup, page.url) or _read_only_url(page.url) or not _identity_matches(record, markup, page.url):
-                        return {'filled': [], 'skipped': [], 'message': '作答页面的登录或作业身份校验未通过，未填入。'}
-                    b.update_metadata(record, markup, page.url)
-                    reason = _deadline_reason(record, defer_missing=has_attachments)
-                    if reason:
-                        return {'filled': [], 'skipped': [], 'message': reason}
-                    questions = dom.parse_questions(markup, page.url)
-            if not questions:
-                return {'filled': [], 'skipped': [], 'message': '未识别到可填写的题目，已保留原网页供你处理。'}
-            diagnostics = dom.question_diagnostics(markup, questions)
-            if len({q['id'] for q in questions}) != len(questions):
-                return {'filled': [], 'skipped': [], 'message': '页面题目编号重复，已停止填入。'}
-            progress('正在准备答案控件…')
-            _wait_for_answer_editors(page, questions, answers)
-            # Page scripts can randomize option order during editor startup.
-            # Reparse the actual displayed question immediately before matching.
-            markup = page.content()
-            questions = dom.parse_questions(markup, page.url)
-            # Deferring the missing date only opens the page. It does not grant
-            # permission to write until this exact attachment editor is ready.
-            reason = _deadline_reason(record)
-            if reason and not (has_attachments and _deadline_reason(record, defer_missing=True) is None and
-                               _attachment_page_editable(page, questions, answers)):
-                return {'filled': [], 'skipped': [], 'message': reason}
-            # Keep the persisted draft format unchanged.  The extra local file
-            # paths only live for this fill operation and are never returned to
-            # the UI or written back to disk.
-            fill_answers = {}
-            for qid, saved in answers.items():
-                if isinstance(saved, dict) and saved.get('files'):
-                    saved = dict(saved)
-                    saved['_local_files'] = _local_attachment_files(b, saved.get('files'))
-                fill_answers[qid] = saved
-            progress('正在填入答案…')
-            result = fill_page(page, questions, fill_answers, progress=progress)
-            result['message'] = f"已填入 {len(result['filled'])} 题，跳过 {len(result['skipped'])} 题。"
-            if not diagnostics['complete']:
-                result['message'] += ' 当前页面未确认包含全部题目，其他页未自动填入。'
-            return result
-        except PlaywrightTimeoutError as exc:
-            if phase == 'page':
-                return {'filled': [], 'skipped': [], 'message': '学习通作答页加载超时，尚未填入答案。已保留网页，请待页面加载完成后重试。'}
-            return {'filled': [], 'skipped': [], 'message': '打开或填入失败：' + b.safe_error(exc)}
-        except Exception as exc:
-            return {'filled': [], 'skipped': [], 'message': '打开或填入失败：' + b.safe_error(exc)}
-        finally:
-            if context is not None:
-                b.close_context(context)
+    prefetch_executor = None
+    prefetch_future = None
+    open_fast = getattr(b, '_open_fast_or_browser_context', None)
+    if callable(open_fast):
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _prefetch_resolve():
+            fast_ctx = open_fast(True)
+            if fast_ctx is None:
+                return None
+            rec_copy = dict(record)
+            try:
+                resolved_detail, resolved_final = resolve_work_page(fast_ctx, rec_copy, b.fetch_html)
+                return resolved_detail, resolved_final, rec_copy
+            finally:
+                fast_ctx.close()
+
+        prefetch_executor = ThreadPoolExecutor(max_workers=1)
+        prefetch_future = prefetch_executor.submit(_prefetch_resolve)
+    try:
+        with sync_playwright() as p:
+            context = None
+            phase = 'connect'
+            try:
+                context = _open_fill_context(p, b)
+                # Never create a disposable browser whose closure would discard the
+                # filled answers. The dedicated Chrome must remain connected via CDP.
+                if b.CONNECTED_BROWSER is None:
+                    return {'filled': [], 'skipped': [], 'message': '尚未连接到专用学习通窗口，请重新打开后再填入。'}
+                # Fresh detail metadata is checked before any answer operation. A
+                # cached pending status/deadline is insufficient if the teacher closed
+                # the assignment since the assistant's last refresh.
+                progress('正在核实作业状态…')
+                phase = 'verify'
+                if prefetch_future is not None and not prefetch_future.done():
+                    for existing in context.pages:
+                        if runtime.is_blank_or_loading_url(getattr(existing, 'url', '')):
+                            runtime.show_loading_splash(existing, record.get('title'))
+                resolved = None
+                if prefetch_future is not None:
+                    try:
+                        resolved = prefetch_future.result()
+                    except Exception:
+                        resolved = None
+                if resolved is not None:
+                    detail, detail_final, resolved_rec = resolved
+                    for field in ('identities', 'title'):
+                        if resolved_rec.get(field):
+                            record[field] = resolved_rec[field]
+                else:
+                    detail, detail_final = resolve_work_page(context, record, b.fetch_html)
+                url = detail_final
+                if not _identity_matches(record, detail, detail_final):
+                    return {'filled': [], 'skipped': [], 'message': '作业详情身份不一致，已停止填入。'}
+                if _read_only_url(detail_final):
+                    return {'filled': [], 'skipped': [], 'message': '作业详情为只读查看页面，未填入。'}
+                b.update_metadata(record, detail, detail_final)
+                reason = _deadline_reason(record, defer_missing=has_attachments)
+                if reason:
+                    return {'filled': [], 'skipped': [], 'message': reason}
+                matches = [existing for existing in context.pages if existing.url == url]
+                blanks = [existing for existing in context.pages if runtime.is_blank_or_loading_url(getattr(existing, 'url', ''))]
+                page = matches[-1] if matches else (blanks[-1] if blanks else context.new_page())
+                if not matches:
+                    runtime.show_loading_splash(page, record.get('title'))
+                _activate_page(b, context, page)
+                progress('正在加载学习通作答页…')
+                phase = 'page'
+                if not matches:
+                    page.goto(url, wait_until='domcontentloaded', timeout=PAGE_LOAD_TIMEOUT_MS)
+                else:
+                    # Do not reload a page that may already contain the user's work.
+                    page.wait_for_load_state('domcontentloaded', timeout=PAGE_LOAD_TIMEOUT_MS)
+                phase = 'verify'
+                markup = page.content()
+                if dom.is_login(markup, page.url):
+                    return {'filled': [], 'skipped': [], 'message': '学习通登录已失效，请在打开的窗口登录，再重试填入。'}
+                if not _identity_matches(record, markup, page.url):
+                    return {'filled': [], 'skipped': [], 'message': '作业身份与已保存答案不一致，已停止填入。'}
+                b.update_metadata(record, markup, page.url)
+                reason = _deadline_reason(record, defer_missing=has_attachments)
+                if reason:
+                    return {'filled': [], 'skipped': [], 'message': reason}
+                # A report/review page must never receive answer writes.
+                root = dom.parse(markup)
+                displayed_status = ' '.join(dom.clean_text(n) for n in root.all() if set(n.attrs.get('class', '').split()) & {'workStatus', 'status', 'statusText'})
+                if _read_only_url(page.url) or dom.explicit_status(displayed_status) == 'submitted':
+                    return {'filled': [], 'skipped': [], 'message': '网页显示此作业已提交或处于查看模式，未填入。'}
+                questions = dom.parse_questions(markup, page.url)
+                if not questions:
+                    entry = dom.phone_entry(markup, page.url)
+                    if entry and dom.platform_url(entry):
+                        phase = 'page'
+                        page.goto(entry, wait_until='domcontentloaded', timeout=PAGE_LOAD_TIMEOUT_MS)
+                        phase = 'verify'
+                        markup = page.content()
+                        if dom.is_login(markup, page.url) or _read_only_url(page.url) or not _identity_matches(record, markup, page.url):
+                            return {'filled': [], 'skipped': [], 'message': '作答页面的登录或作业身份校验未通过，未填入。'}
+                        b.update_metadata(record, markup, page.url)
+                        reason = _deadline_reason(record, defer_missing=has_attachments)
+                        if reason:
+                            return {'filled': [], 'skipped': [], 'message': reason}
+                        questions = dom.parse_questions(markup, page.url)
+                if not questions:
+                    return {'filled': [], 'skipped': [], 'message': '未识别到可填写的题目，已保留原网页供你处理。'}
+                diagnostics = dom.question_diagnostics(markup, questions)
+                if len({q['id'] for q in questions}) != len(questions):
+                    return {'filled': [], 'skipped': [], 'message': '页面题目编号重复，已停止填入。'}
+                progress('正在准备答案控件…')
+                _wait_for_answer_editors(page, questions, answers)
+                # Page scripts can randomize option order during editor startup.
+                # Reparse the actual displayed question immediately before matching.
+                markup = page.content()
+                questions = dom.parse_questions(markup, page.url)
+                # Deferring the missing date only opens the page. It does not grant
+                # permission to write until this exact attachment editor is ready.
+                reason = _deadline_reason(record)
+                if reason and not (has_attachments and _deadline_reason(record, defer_missing=True) is None and
+                                   _attachment_page_editable(page, questions, answers)):
+                    return {'filled': [], 'skipped': [], 'message': reason}
+                # Keep the persisted draft format unchanged.  The extra local file
+                # paths only live for this fill operation and are never returned to
+                # the UI or written back to disk.
+                fill_answers = {}
+                for qid, saved in answers.items():
+                    if isinstance(saved, dict) and saved.get('files'):
+                        saved = dict(saved)
+                        saved['_local_files'] = _local_attachment_files(b, saved.get('files'))
+                    fill_answers[qid] = saved
+                progress('正在填入答案…')
+                result = fill_page(page, questions, fill_answers, progress=progress)
+                result['message'] = f"已填入 {len(result['filled'])} 题，跳过 {len(result['skipped'])} 题。"
+                if not diagnostics['complete']:
+                    result['message'] += ' 当前页面未确认包含全部题目，其他页未自动填入。'
+                return result
+            except PlaywrightTimeoutError as exc:
+                if phase == 'page':
+                    return {'filled': [], 'skipped': [], 'message': '学习通作答页加载超时，尚未填入答案。已保留网页，请待页面加载完成后重试。'}
+                return {'filled': [], 'skipped': [], 'message': '打开或填入失败：' + b.safe_error(exc)}
+            except Exception as exc:
+                return {'filled': [], 'skipped': [], 'message': '打开或填入失败：' + b.safe_error(exc)}
+            finally:
+                if context is not None:
+                    b.close_context(context)
+    finally:
+        if prefetch_future is not None:
+            prefetch_future.cancel()
+        if prefetch_executor is not None:
+            prefetch_executor.shutdown(wait=False)

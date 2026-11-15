@@ -13,6 +13,7 @@ import time
 from urllib.parse import parse_qs, urlsplit
 
 import homework_lab as lab
+import homework_runtime as runtime
 
 
 _FIELDS = {
@@ -246,7 +247,7 @@ def open_assignment(key):
         try:
             context = standard._open_fill_context(playwright, backend)
             authenticated = authenticated_record(context, record)
-            _open_original(context, authenticated)
+            _open_original(context, authenticated, backend=backend)
             return {'message': '已打开作业'}
         except Exception as exc:
             # A failed SSO must not silently open the unauthenticated stored URL
@@ -279,12 +280,12 @@ def fill_assignment(key):
                 context = standard._open_fill_context(playwright, backend)
                 record = authenticated_record(context, record)
                 if not _supported(record):
-                    _open_original(context, record)
+                    _open_original(context, record, backend=backend)
                     return {'filled': [], 'skipped': [], 'message': '当前填写方式尚未验证，已打开原网页供你完成。'}
                 patch = lab.read_report(context, record)
                 fresh = dict(record, **patch)
                 if not _supported(fresh):
-                    _open_original(context, fresh)
+                    _open_original(context, fresh, backend=backend)
                     return {'filled': [], 'skipped': [], 'message': '网页填写方式已变化，请在打开的原网页完成。'}
                 reason = _fresh_reason(patch)
                 if reason:
@@ -292,10 +293,13 @@ def fill_assignment(key):
                 matches = [page for page in context.pages if _page_matches(fresh, page.url)]
                 if len(matches) > 1:
                     return {'filled': [], 'skipped': [], 'message': '打开了多个相同作业页面，请保留一个后重试。'}
-                page = matches[0] if matches else context.new_page()
+                blanks = [page for page in context.pages if runtime.is_blank_or_loading_url(getattr(page, 'url', ''))]
+                page = matches[0] if matches else (blanks[-1] if blanks else context.new_page())
+                if not matches:
+                    runtime.show_loading_splash(page, fresh.get('title') or record.get('title'))
+                standard._activate_page(backend, context, page)
                 if not matches:
                     page.goto(entry_url(fresh), wait_until='domcontentloaded', timeout=25000)
-                page.bring_to_front()
                 page.locator('.el-form-item input[type="file"][name="files"]').first.wait_for(state='attached', timeout=10000)
                 # Recheck current server state after asynchronous editor loading.
                 patch = lab.read_report(context, fresh)
@@ -315,11 +319,15 @@ def fill_assignment(key):
                     backend.close_context(context)
 
 
-def _open_original(context, record):
+def _open_original(context, record, backend=None):
     """Open the canonical individual/group route without touching form controls."""
     entry = entry_url(record)
     matches = [page for page in context.pages if page.url == entry]
-    page = matches[-1] if matches else context.new_page()
+    blanks = [page for page in context.pages if runtime.is_blank_or_loading_url(getattr(page, 'url', ''))]
+    page = matches[-1] if matches else (blanks[-1] if blanks else context.new_page())
+    if not matches:
+        runtime.show_loading_splash(page, record.get('title'))
+    import homework_fill as standard
+    standard._activate_page(backend or standard._backend(), context, page)
     if not matches:
         page.goto(entry, wait_until='domcontentloaded', timeout=25000)
-    page.bring_to_front()
