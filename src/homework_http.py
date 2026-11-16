@@ -24,6 +24,17 @@ _USER_AGENT = (
 )
 _REDIRECT_CODES = {301, 302, 303, 307, 308}
 _POOL_IDLE_SEC = 25.0
+_SSL_CONTEXT_LOCK = threading.Lock()
+_SHARED_SSL_CONTEXT: ssl.SSLContext | None = None
+
+
+def _shared_ssl_context() -> ssl.SSLContext:
+    global _SHARED_SSL_CONTEXT
+    if _SHARED_SSL_CONTEXT is None:
+        with _SSL_CONTEXT_LOCK:
+            if _SHARED_SSL_CONTEXT is None:
+                _SHARED_SSL_CONTEXT = ssl.create_default_context()
+    return _SHARED_SSL_CONTEXT
 
 
 class _HeaderAdapter:
@@ -149,7 +160,7 @@ class FastCookieContext:
         self._origins: list = []
         self._dirty = False
         self._get_cache: dict[str, tuple[float, int, str, bytes]] = {}
-        self._ssl_ctx = ssl.create_default_context()
+        self._ssl_ctx = _shared_ssl_context()
         self.request = _RequestNamespace(self)
         if state is not None:
             self._load_state_dict(state)

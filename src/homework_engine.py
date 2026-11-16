@@ -969,37 +969,59 @@ def collect_lab_reports(context, state, stats, only=None, *, _snapshot=None, _si
                     record['content_error'] = reason
 
 
+def _known_targets_for_only(records_view, only):
+    """Resolve `(host, cid, clazz) -> course_name` from local records for single-course refresh."""
+    targets = {}
+    for r in records_view.values():
+        if course_ids(r) != only:
+            continue
+        for name in ('list_url', 'work_url', 'answer_url', 'entry_url'):
+            raw = r.get(name) or ''
+            u = urlsplit(raw)
+            host = u.hostname or ''
+            if not host or 'notice.' in host or 'passport' in host:
+                continue
+            if host == 'mooc1.chaoxing.com' or host == 'mooc.istudy.szpu.edu.cn' or school.is_school_host(host):
+                targets[(host, only[0], only[1])] = r.get('course', '') or targets.get((host, only[0], only[1]), '')
+                break
+    return targets
+
+
 def collect_course_rows(context, state, stats, only=None, *, _snapshot=None, _sink=None, _meta_out=None):
     """Read course task lists; `only` restricts it to one (courseId, classId)."""
     records_view = _snapshot if _snapshot is not None else state['assignments']
-    try:
-        markup, _ = fetch_html(context, COURSES_URL)
-        courses = dom.parse(markup).all('li', attr='courseid')
-    except Exception:
-        # A one-course refresh may target a school-hosted course; that write
-        # must not depend on the separate chaoxing course list.
-        if only is None:
-            raise
-        courses = []
-    if not courses and only is None:
-        raise RuntimeError('课程列表结构无法识别，请检查登录状态')
-    targets = {}
-    for course in courses:
-        cid, clazz = course.attrs.get('courseid'), course.attrs.get('clazzid')
-        if cid and clazz:
-            targets[('mooc1.chaoxing.com', cid, clazz)] = dom.clean_text(course.first('dt') or course)
-    # School-hosted courses have a separate login and are absent from the main list.
-    # Every stored link is inspected: a record's entry may be a notice URL while
-    # its work page is the school host, and only the latter carries the ids.
-    for r in records_view.values():
-        if record_group(r) == 'history':
-            continue
-        for name in ('entry_url', 'work_url', 'list_url', 'answer_url'):
-            raw = r.get(name) or ''
-            u = urlsplit(raw)
-            course, clazz = dom.course_class_pair(raw)
-            if (u.hostname == 'mooc.istudy.szpu.edu.cn' or school.is_school_host(u.hostname)) and course and clazz:
-                targets[(u.hostname, course, clazz)] = r.get('course', '')
+    known_only = _known_targets_for_only(records_view, only) if only is not None else {}
+    if known_only:
+        targets = known_only
+    else:
+        try:
+            markup, _ = fetch_html(context, COURSES_URL)
+            courses = dom.parse(markup).all('li', attr='courseid')
+        except Exception:
+            # A one-course refresh may target a school-hosted course; that write
+            # must not depend on the separate chaoxing course list.
+            if only is None:
+                raise
+            courses = []
+        if not courses and only is None:
+            raise RuntimeError('课程列表结构无法识别，请检查登录状态')
+        targets = {}
+        for course in courses:
+            cid, clazz = course.attrs.get('courseid'), course.attrs.get('clazzid')
+            if cid and clazz:
+                targets[('mooc1.chaoxing.com', cid, clazz)] = dom.clean_text(course.first('dt') or course)
+        # School-hosted courses have a separate login and are absent from the main list.
+        # Every stored link is inspected: a record's entry may be a notice URL while
+        # its work page is the school host, and only the latter carries the ids.
+        for r in records_view.values():
+            if record_group(r) == 'history':
+                continue
+            for name in ('entry_url', 'work_url', 'list_url', 'answer_url'):
+                raw = r.get(name) or ''
+                u = urlsplit(raw)
+                course, clazz = dom.course_class_pair(raw)
+                if (u.hostname == 'mooc.istudy.szpu.edu.cn' or school.is_school_host(u.hostname)) and course and clazz:
+                    targets[(u.hostname, course, clazz)] = r.get('course', '')
 
     now = datetime.now()
     draft_keys = _nonempty_draft_keys()
@@ -1408,6 +1430,7 @@ def check_submission(key, on_auth=None, wait=True):
 _DEFAULT_COLLECT_NOTICES = collect_notices
 _DEFAULT_COLLECT_COURSE_ROWS = collect_course_rows
 _DEFAULT_COLLECT_LAB_REPORTS = collect_lab_reports
+_DEFAULT_READ_CONTENT = read_content
 
 
 def _replay_collectors(state, notice_items, course_items, lab_sink):
@@ -1590,6 +1613,225 @@ def _open_fast_or_browser_context(headless):
     return http_pool.FastCookieContext(DATA_DIR / 'browser_session.json', run_in_browser=_run_in_browser)
 
 
+def _is_auth_warning_or_error(text):
+    value = str(text or '')
+    return 'LOGIN_REQUIRED' in value or '登录' in value or '请先登录' in value
+
+
+def _run_single_refresh_pass(context, state, stats, force_key, verified_sites):
+    """Refresh a single assignment, running task-list status and detail read in parallel when safe."""
+    selected = state['assignments'].get(force_key) or {}
+    if selected.get('source_kind') == lab.SOURCE_KIND:
+        collect_lab_reports(context, state, stats, only=force_key)
+        reconcile_aliases(state)
+    else:
+        ids = course_ids(selected)
+        can_parallel = (
+            http_pool.supports_concurrency(context)
+            and bool(ids)
+            and bool(selected)
+            and selected.get('status') != 'submitted'
+            and collect_course_rows is _DEFAULT_COLLECT_COURSE_ROWS
+            and read_content is _DEFAULT_READ_CONTENT
+            and bool(selected.get('entry_url') or selected.get('list_url') or selected.get('work_url'))
+        )
+        if can_parallel:
+            snapshot = copy.deepcopy(state['assignments'])
+            rows_sink, meta_out = [], {}
+            course_stats = {'notice_pages': 0, 'course_lists': 0, 'details': 0, 'cache_hits': 0, 'warnings': []}
+            read_stats = {'details': 0, 'warnings': []}
+            rec_copy = copy.deepcopy(selected)
+            rec_copy['content_attempted_at'] = now_iso()
+
+            def _do_course():
+                try:
+                    collect_course_rows(context, state, course_stats, only=ids, _snapshot=snapshot, _sink=rows_sink, _meta_out=meta_out)
+                    return None
+                except Exception as exc:
+                    return exc
+
+            def _do_read():
+                try:
+                    read_content(context, rec_copy, read_stats)
+                    return None
+                except Exception as exc:
+                    return exc
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                fut_course = pool.submit(_do_course)
+                fut_read = pool.submit(_do_read)
+                course_err = fut_course.result()
+                read_err = fut_read.result()
+
+            stats['course_lists'] += course_stats['course_lists']
+            stats['warnings'].extend(course_stats['warnings'])
+            stats['details'] += read_stats['details']
+            stats['warnings'].extend(read_stats['warnings'])
+            if meta_out:
+                state.setdefault('course_meta', {}).update(meta_out)
+            for candidate in rows_sink:
+                merge_record(state['assignments'], candidate)
+            if course_err is not None:
+                stats['warnings'].append(safe_error(course_err))
+            reconcile_aliases(state)
+            merged_key = resolve_alias(state.get('record_aliases') or {}, force_key)
+            record = state['assignments'].get(merged_key)
+            if record is not None:
+                if record.get('status') == 'submitted':
+                    stats['cache_hits'] += 1
+                    return
+                if read_err is None:
+                    list_url = record.get('list_url')
+                    row_checked_at = record.get('status_checked_at')
+                    record.update(rec_copy)
+                    if list_url and not record.get('list_url'):
+                        record['list_url'] = list_url
+                    if row_checked_at:
+                        record['status_checked_at'] = row_checked_at
+                    record.pop('content_error', None)
+                    reconcile_aliases(state)
+                    final_key = resolve_alias(state.get('record_aliases') or {}, merged_key)
+                    final_rec = state['assignments'].get(final_key)
+                    if final_rec and needs_entry_upgrade(final_rec):
+                        read_content(context, final_rec, stats)
+                        final_rec.pop('content_error', None)
+                        reconcile_aliases(state)
+                else:
+                    _handle_read_error(state, record, merged_key, read_err, verified_sites, stats)
+            return
+
+        if ids:
+            try:
+                collect_course_rows(context, state, stats, only=ids)
+            except Exception as exc:
+                stats['warnings'].append(safe_error(exc))
+        reconcile_aliases(state)
+
+    eligible = _collect_eligible_records(state, stats, force_key=force_key)
+    _read_eligible_records(context, state, stats, eligible, verified_sites)
+
+
+def _collect_eligible_records(state, stats, force_key=None):
+    eligible = []
+    for key, record in list(state['assignments'].items()):
+        if key not in state['assignments']:
+            continue
+        if force_key and key != force_key:
+            continue
+        if force_key and record.get('status') == 'submitted':
+            # The course row just proved it is submitted; its detail
+            # page is read-only now and would only add a warning.
+            stats['cache_hits'] += 1
+            continue
+        if record.get('source_kind') == lab.SOURCE_KIND and record_group(record) == 'history':
+            # List metadata can reopen an extended/redo assignment;
+            # an expired or submitted one never needs its old body.
+            stats['cache_hits'] += 1
+            continue
+        identity_probe = record.get('source_kind') != lab.SOURCE_KIND and needs_identity_probe(record, state['assignments'])
+        entry_upgrade = record.get('source_kind') != lab.SOURCE_KIND and needs_entry_upgrade(record)
+        if record_group(record) == 'history' and key != force_key and not record.get('metadata_needs_check') and not identity_probe:
+            continue
+        attempted = parse_datetime(record.get('content_attempted_at'))
+        valid = record.get('content_version') == CONTENT_VERSION and bool(record.get('questions'))
+        checked = parse_datetime(record.get('content_last_read') if record.get('source_kind') == lab.SOURCE_KIND
+                                 else record.get('metadata_checked_at'))
+        due = record.get('metadata_needs_check') or not checked or datetime.now() - checked > METADATA_MAX_AGE
+        if (record.get('content_error') == '网页作业标识与目标不一致，已停止读取'
+                and not record.get('alias_retry_done')):
+            record['alias_retry_done'] = True
+            attempted = None
+        if (record.get('content_complete') is False
+                and '当前为手机分页题目，尚未核实作业全部题数' in (record.get('content_warnings') or [])
+                and not record.get('phone_paging_verified')):
+            record['phone_paging_verified'] = True
+            due = True
+        if skipped_by_cache(record, force_key=bool(force_key), valid=valid, due=due,
+                            attempted=attempted, identity_probe=identity_probe,
+                            entry_upgrade=entry_upgrade):
+            stats['cache_hits'] += 1
+            continue
+        if not record.get('entry_url') and not record.get('list_url') and not record.get('work_url'):
+            continue
+        eligible.append((key, record, identity_probe))
+    return eligible
+
+
+def _read_eligible_records(context, state, stats, eligible, verified_sites):
+    if http_pool.supports_concurrency(context) and len(eligible) > 1:
+        PROGRESS(f'正在并发读取 {len(eligible)} 份作业详情…')
+        work_copies = []
+        for key, record, identity_probe in eligible:
+            log(f'正在核对：{record.get("course")} / {record.get("title")}')
+            record['content_attempted_at'] = now_iso()
+            work_copies.append((key, copy.deepcopy(record), identity_probe))
+
+        def _read_one(item):
+            key, rec_copy, id_probe = item
+            local_stats = {'details': 0, 'warnings': []}
+            try:
+                read_content(context, rec_copy, local_stats)
+                return key, rec_copy, id_probe, local_stats, None
+            except Exception as exc:
+                return key, rec_copy, id_probe, local_stats, exc
+
+        with ThreadPoolExecutor(max_workers=min(6, len(work_copies))) as pool:
+            read_results = list(pool.map(_read_one, work_copies))
+
+        for key, updated, identity_probe, local_stats, err in read_results:
+            stats['details'] += local_stats['details']
+            stats['warnings'].extend(local_stats['warnings'])
+            record = state['assignments'].get(key)
+            if not record:
+                continue
+            if err is None:
+                record.clear()
+                record.update(updated)
+                if identity_probe:
+                    record['identity_probe_done'] = True
+                record.pop('content_error', None)
+            else:
+                _handle_read_error(state, record, key, err, verified_sites, stats)
+        reconcile_aliases(state)
+        upgraded = set()
+        for key, _, _ in eligible:
+            merged_key = resolve_alias(state.get('record_aliases') or {}, key)
+            if merged_key in upgraded:
+                continue
+            upgraded.add(merged_key)
+            merged = state['assignments'].get(merged_key)
+            if merged and needs_entry_upgrade(merged):
+                try:
+                    read_content(context, merged, stats)
+                    merged.pop('content_error', None)
+                    reconcile_aliases(state)
+                except Exception as exc:
+                    _handle_read_error(state, merged, merged_key, exc, verified_sites, stats)
+    else:
+        for key, record, identity_probe in eligible:
+            if key not in state['assignments']:
+                continue
+            log(f'正在核对：{record.get("course")} / {record.get("title")}')
+            record['content_attempted_at'] = now_iso()
+            try:
+                read_content(context, record, stats)
+                if identity_probe:
+                    record['identity_probe_done'] = True
+                record.pop('content_error', None)
+                reconcile_aliases(state)
+                # A proven alias may reveal a better PC entry only after
+                # the legacy mobile content was read earlier in this pass.
+                # Walk the full chain: a record can be merged more than once.
+                merged_key = resolve_alias(state.get('record_aliases') or {}, key)
+                merged = state['assignments'].get(merged_key)
+                if merged and needs_entry_upgrade(merged):
+                    read_content(context, merged, stats)
+                    merged.pop('content_error', None)
+                    reconcile_aliases(state)
+            except Exception as exc:
+                _handle_read_error(state, record, key, exc, verified_sites, stats)
+
+
 def _check_once(headless=True, force_key=None, on_auth=None):
     state = load_state()
     stats = {'notice_pages': 0, 'course_lists': 0, 'details': 0, 'cache_hits': 0, 'warnings': []}
@@ -1602,7 +1844,8 @@ def _check_once(headless=True, force_key=None, on_auth=None):
                 context = open_context(playwright, headless)
             stack.callback(close_context, context)
             verified_sites = {'chaoxing': True, 'school': True}
-            if headless:
+            fast_single = bool(headless and force_key and getattr(context, 'is_fast_http_context', False) is True)
+            if headless and not fast_single:
                 import homework_auth
                 auth = homework_auth.status(restore=True, context=context, progress=PROGRESS, on_state=on_auth)
                 verified_sites = dict(auth.get('sites') or {})
@@ -1626,137 +1869,29 @@ def _check_once(headless=True, force_key=None, on_auth=None):
                             connected = True
                         except Exception as exc:
                             stats['warnings'].append(safe_error(exc))
+                reconcile_aliases(state)
+                eligible = _collect_eligible_records(state, stats, force_key=None)
+                _read_eligible_records(context, state, stats, eligible, verified_sites)
             else:
                 connected = True
-                # A single-assignment refresh must still read this course's
-                # task-list row: after submitting, that row is the page that
-                # says 已提交/待批阅, while the detail page may keep showing
-                # the pending form and never archive the assignment.
-                selected = state['assignments'].get(force_key) or {}
-                if selected.get('source_kind') == lab.SOURCE_KIND:
-                    collect_lab_reports(context, state, stats, only=force_key)
-                ids = None if selected.get('source_kind') == lab.SOURCE_KIND else course_ids(selected)
-                if ids:
-                    try:
-                        collect_course_rows(context, state, stats, only=ids)
-                    except Exception as exc:
-                        stats['warnings'].append(safe_error(exc))
-            reconcile_aliases(state)
-            eligible = []
-            for key, record in list(state['assignments'].items()):
-                if key not in state['assignments']:
-                    continue
-                if force_key and key != force_key:
-                    continue
-                if force_key and record.get('status') == 'submitted':
-                    # The course row just proved it is submitted; its detail
-                    # page is read-only now and would only add a warning.
-                    stats['cache_hits'] += 1
-                    continue
-                if record.get('source_kind') == lab.SOURCE_KIND and record_group(record) == 'history':
-                    # List metadata can reopen an extended/redo assignment;
-                    # an expired or submitted one never needs its old body.
-                    stats['cache_hits'] += 1
-                    continue
-                identity_probe = record.get('source_kind') != lab.SOURCE_KIND and needs_identity_probe(record, state['assignments'])
-                entry_upgrade = record.get('source_kind') != lab.SOURCE_KIND and needs_entry_upgrade(record)
-                if record_group(record) == 'history' and key != force_key and not record.get('metadata_needs_check') and not identity_probe:
-                    continue
-                attempted = parse_datetime(record.get('content_attempted_at'))
-                valid = record.get('content_version') == CONTENT_VERSION and bool(record.get('questions'))
-                checked = parse_datetime(record.get('content_last_read') if record.get('source_kind') == lab.SOURCE_KIND
-                                         else record.get('metadata_checked_at'))
-                due = record.get('metadata_needs_check') or not checked or datetime.now() - checked > METADATA_MAX_AGE
-                if (record.get('content_error') == '网页作业标识与目标不一致，已停止读取'
-                        and not record.get('alias_retry_done')):
-                    record['alias_retry_done'] = True
-                    attempted = None
-                if (record.get('content_complete') is False
-                        and '当前为手机分页题目，尚未核实作业全部题数' in (record.get('content_warnings') or [])
-                        and not record.get('phone_paging_verified')):
-                    record['phone_paging_verified'] = True
-                    due = True
-                if skipped_by_cache(record, force_key=bool(force_key), valid=valid, due=due,
-                                    attempted=attempted, identity_probe=identity_probe,
-                                    entry_upgrade=entry_upgrade):
-                    stats['cache_hits'] += 1
-                    continue
-                if not record.get('entry_url') and not record.get('list_url') and not record.get('work_url'):
-                    continue
-                eligible.append((key, record, identity_probe))
-
-            if http_pool.supports_concurrency(context) and len(eligible) > 1:
-                PROGRESS(f'正在并发读取 {len(eligible)} 份作业详情…')
-                work_copies = []
-                for key, record, identity_probe in eligible:
-                    log(f'正在核对：{record.get("course")} / {record.get("title")}')
-                    record['content_attempted_at'] = now_iso()
-                    work_copies.append((key, copy.deepcopy(record), identity_probe))
-
-                def _read_one(item):
-                    key, rec_copy, id_probe = item
-                    local_stats = {'details': 0, 'warnings': []}
-                    try:
-                        read_content(context, rec_copy, local_stats)
-                        return key, rec_copy, id_probe, local_stats, None
-                    except Exception as exc:
-                        return key, rec_copy, id_probe, local_stats, exc
-
-                with ThreadPoolExecutor(max_workers=min(6, len(work_copies))) as pool:
-                    read_results = list(pool.map(_read_one, work_copies))
-
-                for key, updated, identity_probe, local_stats, err in read_results:
-                    stats['details'] += local_stats['details']
-                    stats['warnings'].extend(local_stats['warnings'])
-                    record = state['assignments'].get(key)
-                    if not record:
-                        continue
-                    if err is None:
-                        record.clear()
-                        record.update(updated)
-                        if identity_probe:
-                            record['identity_probe_done'] = True
-                        record.pop('content_error', None)
-                    else:
-                        _handle_read_error(state, record, key, err, verified_sites, stats)
-                reconcile_aliases(state)
-                upgraded = set()
-                for key, _, _ in eligible:
-                    merged_key = resolve_alias(state.get('record_aliases') or {}, key)
-                    if merged_key in upgraded:
-                        continue
-                    upgraded.add(merged_key)
-                    merged = state['assignments'].get(merged_key)
-                    if merged and needs_entry_upgrade(merged):
-                        try:
-                            read_content(context, merged, stats)
-                            merged.pop('content_error', None)
-                            reconcile_aliases(state)
-                        except Exception as exc:
-                            _handle_read_error(state, merged, merged_key, exc, verified_sites, stats)
-            else:
-                for key, record, identity_probe in eligible:
-                    if key not in state['assignments']:
-                        continue
-                    log(f'正在核对：{record.get("course")} / {record.get("title")}')
-                    record['content_attempted_at'] = now_iso()
-                    try:
-                        read_content(context, record, stats)
-                        if identity_probe:
-                            record['identity_probe_done'] = True
-                        record.pop('content_error', None)
-                        reconcile_aliases(state)
-                        # A proven alias may reveal a better PC entry only after
-                        # the legacy mobile content was read earlier in this pass.
-                        # Walk the full chain: a record can be merged more than once.
-                        merged_key = resolve_alias(state.get('record_aliases') or {}, key)
-                        merged = state['assignments'].get(merged_key)
-                        if merged and needs_entry_upgrade(merged):
-                            read_content(context, merged, stats)
-                            merged.pop('content_error', None)
-                            reconcile_aliases(state)
-                    except Exception as exc:
-                        _handle_read_error(state, record, key, exc, verified_sites, stats)
+                _run_single_refresh_pass(context, state, stats, force_key, verified_sites)
+                target_rec = state['assignments'].get(resolve_alias(state.get('record_aliases') or {}, force_key)) or {}
+                need_auth_retry = fast_single and (
+                    any(_is_auth_warning_or_error(w) for w in stats['warnings'])
+                    or _is_auth_warning_or_error(target_rec.get('content_error'))
+                )
+                if need_auth_retry:
+                    import homework_auth
+                    stats['warnings'] = [w for w in stats['warnings'] if not _is_auth_warning_or_error(w)]
+                    if isinstance(target_rec, dict) and _is_auth_warning_or_error(target_rec.get('content_error')):
+                        target_rec.pop('content_error', None)
+                    auth = homework_auth.status(restore=True, context=context, progress=PROGRESS, on_state=on_auth)
+                    verified_sites = dict(auth.get('sites') or {})
+                    if not any(auth['sites'].values()):
+                        raise RuntimeError('请先登录作业通')
+                    if not auth['logged_in']:
+                        stats['warnings'].append('部分站点尚未登录')
+                    _run_single_refresh_pass(context, state, stats, force_key, verified_sites)
     except Exception as exc:
         stats['warnings'].append(safe_error(exc))
     state['last_check'] = now_iso()

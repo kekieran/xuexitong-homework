@@ -109,12 +109,12 @@ def find_browser():
     if custom:
         path = Path(os.path.expandvars(custom)).expanduser()
         candidates.append(path if path.is_absolute() else APP_DIR / path)
-    # Controlled work prefers Chrome. If it is absent, use a compatible
-    # default browser; an incompatible default is silently bypassed for Edge.
-    candidates.extend(_installed_browser_paths('chrome.exe'))
+    # Prefer the user's compatible system default browser first; an
+    # incompatible default is silently bypassed for Chrome or Edge.
     default = default_browser_path()
     if default:
         candidates.append(default)
+    candidates.extend(_installed_browser_paths('chrome.exe'))
     candidates.extend(_installed_browser_paths('msedge.exe'))
     for executable in ('brave.exe', 'vivaldi.exe', 'chromium.exe', 'opera.exe'):
         candidates.extend(_installed_browser_paths(executable))
